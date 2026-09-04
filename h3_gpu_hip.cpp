@@ -1425,6 +1425,7 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_scalar_kernel(
 /* gfx12 executes wave32. One wave handles a query/head pair and keeps four
  * output dimensions per lane for the production D=128 shape. This removes the
  * two block-wide barriers at every reduction step in the scalar oracle. */
+template <bool fixed_d128>
 __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         const hip_bfloat16 *query, const hip_bfloat16 *key,
         const hip_bfloat16 *value, hip_bfloat16 *output,
@@ -1439,19 +1440,58 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
     size_t inner = static_cast<size_t>(heads) * head_dim;
     size_t query_base = static_cast<size_t>(query_row) * inner +
                         static_cast<size_t>(head) * head_dim;
-    float accumulators[8];
+    constexpr uint32_t accumulator_count = fixed_d128 ? 4 : 8;
+    float accumulators[accumulator_count];
 #pragma unroll
-    for (uint32_t slot = 0; slot < 8; slot++) accumulators[slot] = 0.0f;
+    for (uint32_t slot = 0; slot < accumulator_count; slot++)
+        accumulators[slot] = 0.0f;
     float running_max = -INFINITY;
     float running_sum = 0.0f;
+    int restrict_video_keys =
+        query_row >= video_start && query_row < video_end;
+    uint32_t window_start = video_start;
+    uint32_t window_end = video_end;
+    if (restrict_video_keys) {
+        uint32_t query_frame =
+            (query_row - video_start) / tokens_per_frame;
+        if (anchor_both &&
+            (query_frame == 0 || query_frame + 1 == frames)) {
+            restrict_video_keys = 0;
+        } else {
+            uint32_t lower;
+            uint32_t upper;
+            if (chunk) {
+                uint32_t query_chunk = query_frame / chunk;
+                uint32_t lower_chunk = query_chunk > radius ?
+                    query_chunk - radius : 0;
+                uint64_t upper_wide =
+                    (static_cast<uint64_t>(query_chunk) + radius + 1) *
+                    chunk;
+                lower = lower_chunk * chunk;
+                upper = upper_wide >= frames ? frames - 1 :
+                    static_cast<uint32_t>(upper_wide - 1);
+            } else {
+                lower = query_frame > radius ? query_frame - radius : 0;
+                uint64_t upper_wide =
+                    static_cast<uint64_t>(query_frame) + radius;
+                upper = upper_wide >= frames ? frames - 1 :
+                    static_cast<uint32_t>(upper_wide);
+            }
+            window_start = video_start + lower * tokens_per_frame;
+            window_end = video_start + (upper + 1) * tokens_per_frame;
+        }
+    }
     for (uint32_t key_row = 0; key_row < sequence; key_row++) {
-        if (!h3_hip_vdn_key_allowed(query_row, key_row, video_start,
-                video_end, frames, tokens_per_frame, radius, chunk,
-                anchor_both)) continue;
+        if (restrict_video_keys && key_row >= video_start &&
+            key_row < video_end &&
+            (key_row < window_start || key_row >= window_end) &&
+            (!anchor_both ||
+             (key_row >= video_start + tokens_per_frame &&
+              key_row < video_end - tokens_per_frame))) continue;
         size_t key_base = static_cast<size_t>(key_row) * inner +
                           static_cast<size_t>(head) * head_dim;
         float partial = 0.0f;
-        if (head_dim == 128) {
+        if constexpr (fixed_d128) {
             float product0 = fmaf(
                 static_cast<float>(query[query_base + lane]),
                 static_cast<float>(key[key_base + lane]), 0.0f);
@@ -1466,6 +1506,20 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
                 static_cast<float>(key[key_base + lane + 96]), 0.0f);
             /* Match the scalar 256-thread reduction tree exactly: its first
              * non-zero steps pair d+64, then d+32/d+96. */
+            partial = (product0 + product64) + (product32 + product96);
+        } else if (head_dim == 128) {
+            float product0 = fmaf(
+                static_cast<float>(query[query_base + lane]),
+                static_cast<float>(key[key_base + lane]), 0.0f);
+            float product32 = fmaf(
+                static_cast<float>(query[query_base + lane + 32]),
+                static_cast<float>(key[key_base + lane + 32]), 0.0f);
+            float product64 = fmaf(
+                static_cast<float>(query[query_base + lane + 64]),
+                static_cast<float>(key[key_base + lane + 64]), 0.0f);
+            float product96 = fmaf(
+                static_cast<float>(query[query_base + lane + 96]),
+                static_cast<float>(key[key_base + lane + 96]), 0.0f);
             partial = (product0 + product64) + (product32 + product96);
         } else {
             for (uint32_t dimension = lane; dimension < head_dim;
@@ -1490,18 +1544,53 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         }
         old_scale = __shfl(old_scale, 0, 32);
         new_scale = __shfl(new_scale, 0, 32);
+        if constexpr (fixed_d128) {
+#pragma unroll
+            for (uint32_t slot = 0; slot < 4; slot++) {
+                uint32_t dimension = lane + slot * 32;
+                accumulators[slot] = accumulators[slot] * old_scale +
+                    new_scale *
+                    static_cast<float>(value[key_base + dimension]);
+            }
+        } else {
+            uint32_t slot = 0;
+            for (uint32_t dimension = lane; dimension < head_dim;
+                 dimension += 32, slot++)
+                accumulators[slot] = accumulators[slot] * old_scale +
+                    new_scale *
+                    static_cast<float>(value[key_base + dimension]);
+        }
+    }
+    float denominator = __shfl(running_sum, 0, 32);
+    if constexpr (fixed_d128) {
+#pragma unroll
+        for (uint32_t slot = 0; slot < 4; slot++) {
+            uint32_t dimension = lane + slot * 32;
+            output[query_base + dimension] =
+                hip_bfloat16(accumulators[slot] / denominator);
+        }
+    } else {
         uint32_t slot = 0;
         for (uint32_t dimension = lane; dimension < head_dim;
              dimension += 32, slot++)
-            accumulators[slot] = accumulators[slot] * old_scale +
-                new_scale * static_cast<float>(value[key_base + dimension]);
+            output[query_base + dimension] =
+                hip_bfloat16(accumulators[slot] / denominator);
     }
-    float denominator = __shfl(running_sum, 0, 32);
-    uint32_t slot = 0;
-    for (uint32_t dimension = lane; dimension < head_dim;
-         dimension += 32, slot++)
-        output[query_base + dimension] =
-            hip_bfloat16(accumulators[slot] / denominator);
+}
+
+template <bool fixed_d128>
+static void h3_hip_launch_vdn_window_sdpa_bf16_wave32(
+        hipStream_t stream, const hip_bfloat16 *query,
+        const hip_bfloat16 *key, const hip_bfloat16 *value,
+        hip_bfloat16 *output, uint32_t sequence, uint32_t heads,
+        uint32_t head_dim, uint32_t video_start, uint32_t video_end,
+        uint32_t frames, uint32_t tokens_per_frame, uint32_t radius,
+        uint32_t chunk, int anchor_both, float scale) {
+    hipLaunchKernelGGL(
+        (h3_hip_vdn_window_sdpa_bf16_wave32_kernel<fixed_d128>),
+        dim3(sequence, heads), dim3(32), 0, stream, query, key, value, output,
+        sequence, heads, head_dim, video_start, video_end, frames,
+        tokens_per_frame, radius, chunk, anchor_both, scale);
 }
 
 __global__ static void h3_hip_vdn_softmax_gate_bf16_kernel(
@@ -3633,14 +3722,25 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
     int use_wave32 = gpu->warp_size == 32 && head_dim <= 256 &&
         !(scalar_value && *scalar_value && std::strcmp(scalar_value, "0"));
     if (use_wave32) {
-        hipLaunchKernelGGL(h3_hip_vdn_window_sdpa_bf16_wave32_kernel,
-                           dim3(sequence, heads), dim3(32), 0, gpu->stream,
-                           static_cast<const hip_bfloat16 *>(query->data),
-                           static_cast<const hip_bfloat16 *>(key->data),
-                           static_cast<const hip_bfloat16 *>(value->data),
-                           static_cast<hip_bfloat16 *>(output->data), sequence,
-                           heads, head_dim, video_start, video_end, frames,
-                           tokens_per_frame, radius, chunk, anchor_both, scale);
+        const hip_bfloat16 *query_data =
+            static_cast<const hip_bfloat16 *>(query->data);
+        const hip_bfloat16 *key_data =
+            static_cast<const hip_bfloat16 *>(key->data);
+        const hip_bfloat16 *value_data =
+            static_cast<const hip_bfloat16 *>(value->data);
+        hip_bfloat16 *output_data =
+            static_cast<hip_bfloat16 *>(output->data);
+        if (head_dim == 128) {
+            h3_hip_launch_vdn_window_sdpa_bf16_wave32<true>(
+                gpu->stream, query_data, key_data, value_data, output_data,
+                sequence, heads, head_dim, video_start, video_end, frames,
+                tokens_per_frame, radius, chunk, anchor_both, scale);
+        } else {
+            h3_hip_launch_vdn_window_sdpa_bf16_wave32<false>(
+                gpu->stream, query_data, key_data, value_data, output_data,
+                sequence, heads, head_dim, video_start, video_end, frames,
+                tokens_per_frame, radius, chunk, anchor_both, scale);
+        }
     } else {
         size_t shared_bytes = (H3_HIP_THREADS + 3) * sizeof(float);
         hipLaunchKernelGGL(h3_hip_vdn_window_sdpa_bf16_scalar_kernel,

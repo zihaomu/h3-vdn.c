@@ -122,6 +122,57 @@ acceptance baseline by about 43.8%. Maximum host RSS increased from roughly
 652 MiB to 660 MiB, matching one retained staging buffer. The MP4 SHA-256 and
 stream metadata remained identical.
 
+### REJECT: per-context weight FD cache
+
+A bounded, thread-safe cache retained descriptors for the weight shards and
+exposed `H3_HIP_FD_CACHE=0` for same-binary comparison. It recorded 2,563 hits
+in 2,580 opens (17 shard misses), but open/close was not a meaningful part of
+the remaining load time. Three crossed samples without the cache were 12.01,
+13.08, and 13.93 seconds (median 13.08); with the cache they were 12.97, 13.97,
+and 12.97 seconds (median 12.97), only 0.8% apart and well inside run-to-run
+noise. All six runs retained both output hashes and used about 658 MiB maximum
+RSS. The candidate code and opt-out were removed.
+
+### Production-shape full-forward baseline
+
+The forward smoke test accepts `VDN_SMOKE_FRAMES`,
+`VDN_SMOKE_LATENT_H`, `VDN_SMOKE_LATENT_W`, and
+`VDN_SMOKE_AUDIO_LATENTS`, while retaining its original small defaults. One
+profile at the real 512x512/56-frame token geometry completed all 50 layers at
+sequence 5338 in 53.48 seconds with a 4.969 GiB device-allocation peak. The
+measured GPU classes totaled 39.595 seconds: SDPA 35.546 (89.8%), linear 3.587,
+solve 0.358, and scan 0.104 seconds. Weight read and upload took 4.603 and 4.058
+seconds for the unchanged 66.818 GiB payload. The full output hashes are video
+`b3d3500676d3fb12` and audio `5fbd7afb3d78a277`.
+
+### REJECT: multiple query waves per block
+
+Packing 2, 4, or 8 query waves into each block was bitwise identical but did
+not improve K/V locality enough to offset the larger block. Production-shape
+averages for 1, 2, 4, and 8 waves were 0.8146, 0.8293, 0.8277, and 0.8343
+seconds. The kernel remains one query/head wave per block.
+
+### KEEP: precomputed window mask and specialized D=128 SDPA
+
+The wave32 kernel now computes each query's video window once, replacing the
+hot-loop frame divisions with ordered row-range comparisons. A same-binary
+crossed A/B reduced the production-shape median from 0.8297 to 0.8038 seconds
+(-3.1%). A compile-time D=128 path then removes the unused D<=256 accumulator
+slots and dynamic value loop. Its crossed median was 0.6542 seconds versus
+0.8024 for the generic path (-18.5%); code-object metadata shows 24 versus 29
+VGPRs with no spills. Combined with the earlier 0.8280 production median, the
+new 0.6542 median is 21.0% faster. Every result retained BF16 hash
+`3d65eea81de34693`; other dimensions still use the generic wave32 path, and
+`H3_VDN_SCALAR_SDPA=1` remains the oracle.
+
+On the complete production-token 50-layer profile, wall time fell from 53.48
+to 37.42 seconds (-30.0%) and measured SDPA time from 35.546 to 20.884 seconds
+(-41.2%). Peak allocation stayed at 4.969 GiB, weight traffic was unchanged,
+and both complete output hashes matched the pre-optimization baseline exactly.
+The small-shape native 8-NFE VAE/mux acceptance completed in 92.66 seconds
+versus 95.95 seconds before this change and reproduced the exact 73,528-byte
+MP4 SHA-256 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -145,6 +196,15 @@ HIP_VISIBLE_DEVICES=0 VDN_SMOKE_COMPARE_SDPA=1 \
 # 512x512 / 56-frame attention geometry; add H3_VDN_SCALAR_SDPA=1 for oracle
 make BACKEND=hip h3_vdn_sdpa_bench
 HIP_VISIBLE_DEVICES=0 ./h3_vdn_sdpa_bench
+
+# One complete 50-layer production-token profile (one NFE, no VAE/mux)
+HIP_VISIBLE_DEVICES=0 H3_PROFILE=1 \
+  VDN_SMOKE_FRAMES=17 VDN_SMOKE_LATENT_H=32 \
+  VDN_SMOKE_LATENT_W=32 VDN_SMOKE_AUDIO_LATENTS=93 \
+  ./h3_vdn_forward_smoke_tests \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/prompts/example_0.safetensors
 ```
 
 For timing, alternate scalar and wave32 runs rather than executing all samples
@@ -153,16 +213,16 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
 ## Next priorities
 
-1. Profile production sequence lengths; determine when scalar, wave, or a tiled
-   matrix-instruction kernel wins.
+1. Evaluate a tiled/matrix-instruction production SDPA kernel against the new
+   0.6542-second wave32 baseline, preserving the scalar oracle.
 2. Replace per-block activation allocation with an explicit block workspace
    only if allocation count and wall time both improve without increasing peak
    memory; a transparent 3 GiB allocation pool has already been rejected.
-3. Extend the retained fixed-size staging cache with an FD cache only if a
-   separate A/B shows benefit. Do not revive per-tensor events or page-lock the
-   entire streamed model.
+3. Do not add an FD-only cache: its crossed A/B improved the median by just
+   0.8%. Further I/O work must reduce the 66.8 GiB payload itself. Do not revive
+   per-tensor events or page-lock the entire streamed model.
 4. Fuse the bidirectional scan launches, preserving the CPU oracle.
 5. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
    perceptual output gates before making reduced precision the default.
-6. Add topology-aware multi-GPU layer sharding after the single-GPU kernels and
-   streaming lifetime are stable.
+6. Add topology-aware multi-GPU layer sharding and persistent per-device block
+   weights to remove the repeated 66.8 GiB read/upload payload from each NFE.

@@ -3,6 +3,8 @@
 #include "h3_vdn_prompt.h"
 #include "h3_vdn_weights.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,13 +12,31 @@
 #include <string.h>
 
 enum {
-    FRAMES = 17,
-    LATENT_H = 2,
-    LATENT_W = 4,
-    AUDIO_LATENTS = 3,
+    DEFAULT_FRAMES = 17,
+    DEFAULT_LATENT_H = 2,
+    DEFAULT_LATENT_W = 4,
+    DEFAULT_AUDIO_LATENTS = 3,
     VIDEO_PATCH = 96,
     AUDIO_WIDTH = 32
 };
+
+static int env_u32(const char *name, uint32_t fallback, uint32_t *value,
+                   char *error, size_t error_size) {
+    const char *text = getenv(name);
+    if (!text || !*text) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (errno || !end || *end || !parsed || parsed > UINT32_MAX) {
+        snprintf(error, error_size, "invalid %s=%s", name, text);
+        return 0;
+    }
+    *value = (uint32_t)parsed;
+    return 1;
+}
 
 static uint64_t hash_f32(const float *values, size_t count) {
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -63,9 +83,21 @@ int main(int argc, char **argv) {
     float *video_host = NULL, *audio_host = NULL;
     float *video_output = NULL, *audio_output = NULL;
     float *video_compare = NULL, *audio_compare = NULL;
+    uint32_t frames = DEFAULT_FRAMES;
+    uint32_t latent_h = DEFAULT_LATENT_H;
+    uint32_t latent_w = DEFAULT_LATENT_W;
+    uint32_t audio_latents = DEFAULT_AUDIO_LATENTS;
     int denoise = getenv("VDN_SMOKE_DENOISE") != NULL;
     int compare_sdpa = !denoise &&
         getenv("VDN_SMOKE_COMPARE_SDPA") != NULL;
+    if (!env_u32("VDN_SMOKE_FRAMES", frames, &frames,
+                 error, sizeof(error)) ||
+        !env_u32("VDN_SMOKE_LATENT_H", latent_h, &latent_h,
+                 error, sizeof(error)) ||
+        !env_u32("VDN_SMOKE_LATENT_W", latent_w, &latent_w,
+                 error, sizeof(error)) ||
+        !env_u32("VDN_SMOKE_AUDIO_LATENTS", audio_latents, &audio_latents,
+                 error, sizeof(error))) goto failed;
     if (!gpu) goto failed;
     store = h3_vdn_weight_store_open(argv[1], argv[2], 1,
                                      error, sizeof(error));
@@ -76,7 +108,7 @@ int main(int argc, char **argv) {
     refined = h3_vdn_refine_prompt(gpu, &model, &prompt,
                                    error, sizeof(error));
     if (!refined || !h3_vdn_layout_build(
-            &prompt, FRAMES, LATENT_H, LATENT_W, AUDIO_LATENTS,
+            &prompt, frames, latent_h, latent_w, audio_latents,
             &layout, error, sizeof(error))) goto failed;
     size_t video_elements = (size_t)layout.video_rows * VIDEO_PATCH;
     size_t audio_elements = (size_t)layout.audio_rows * AUDIO_WIDTH;

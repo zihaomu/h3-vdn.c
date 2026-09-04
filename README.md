@@ -135,18 +135,20 @@ or silent container.
 With `--profile`, the HIP backend also reports weight-read/H2D throughput,
 command wait time, allocation/dispatch counters, and GPU event time for linear,
 SDPA, VDN solve, and VDN scan operations. On `gfx1201`, VDN window attention
-uses a wave32 kernel by default. A fixed 50-layer sequence-840 forward improved
-from a 19.12-second scalar median to 13.41 seconds while remaining bitwise
-identical; set `H3_VDN_SCALAR_SDPA=1` to restore the scalar oracle. These are
-microbenchmark results, not a production-resolution throughput claim. The
-method, exact inputs, rejected candidates, and next priorities are recorded in
+uses a wave32 kernel with precomputed window bounds and a D=128 specialization;
+set `H3_VDN_SCALAR_SDPA=1` to restore the bitwise oracle. At the real
+512x512/56-frame token geometry, the standalone kernel median is 0.6542 seconds
+and one complete 50-layer forward improved from 53.48 to 37.42 seconds while
+preserving both full-output hashes. This is a single-NFE compute acceptance,
+not a production-resolution visual-quality or full mux benchmark. The method,
+exact inputs, rejected candidates, and next priorities are recorded in
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
 
 HIP weight streaming also reuses a thread-safe 8 MiB pinned staging buffer by
 default, avoiding page-lock/unlock for every tensor. Set
 `H3_HIP_STAGING_CACHE=0` for the old allocation lifecycle when diagnosing I/O.
 Together with wave32 attention, the same 64x32/56-frame native E2E acceptance
-run fell from about 170.7 to 95.95 seconds and reproduced the MP4 SHA-256 above.
+run fell from about 170.7 to 92.66 seconds and reproduced the MP4 SHA-256 above.
 
 ### Current OpenVDN scope
 
@@ -163,8 +165,9 @@ The validated MVP intentionally keeps a narrow correctness surface:
 - One selected ROCm device is used. Eight devices are enumerated, but multi-GPU
   layer sharding remains future work.
 - The `gfx1201` wave32 attention path is bitwise-checked against the scalar
-  implementation at the current smoke shape. Large production canvases are
-  valid but have not completed visual-quality or performance acceptance.
+  implementation and has completed a 50-layer production-token performance
+  run. Large production canvases have not completed visual-quality or full
+  VAE/mux acceptance.
 - VDN execution is HIP-only. The separate original MiniMax-H3 Metal path and
   its CLI behavior remain available on macOS.
 
