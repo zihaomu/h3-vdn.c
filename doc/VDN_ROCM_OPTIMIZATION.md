@@ -484,6 +484,65 @@ preserve the scalar D=128 reduction tree. A WMMA candidate is consequently not
 eligible for the exact BF16 default track and moves to the explicitly
 non-bitwise SageAttention/low-precision research gate instead.
 
+### RESEARCH KEEP: native gfx12 SageAttention-style SDPA
+
+The native gfx12 design was informed by SageAttention PR #368 fixed at commit
+`66f5e64c9e36084c863a4480e570069245e58f90` (Apache-2.0), without importing its
+PyTorch extension runtime. The implementation remains C/C++17 and HIP-only.
+`H3_VDN_SDPA=sage-i8-bf16` is an explicit experimental mode; `auto` continues
+to select the bitwise-exact wave32 implementation. The incomplete F16 and FP8
+modes fail explicitly instead of silently falling back.
+
+Q and K are symmetrically quantized to signed I8 `[-127,127]`, using one scale
+per head and 32 Q rows or 64 K rows. Rounding is round-to-nearest-even and a
+zero group uses scale 1. GPU output matched the CPU quantization oracle exactly,
+including non-aligned tails and zero groups. The production S=5338/H=56/D=128
+quantization itself averaged 0.001098 seconds.
+
+One 256-thread fused block owns 16 queries from one head. Wave 0 evaluates I8
+QK tiles; pass one accumulates softmax normalizers, pass two recomputes scores
+and immediately consumes BF16 probabilities. Eight waves concurrently compute
+the eight 16-column P*V tiles with BF16 WMMA, so no SxS score or mask tensor is
+materialized. The existing packed text/audio/video mask is evaluated per score;
+query, key, and value tails are zero-padded in LDS. A targeted test crosses
+frame and Q32/K64 scale boundaries and changes only values in a masked frame;
+the protected output reports zero BF16 mismatches.
+
+Five crossed production-shape standalone groups gave:
+
+| Metric | exact wave32 | I8-QK/BF16-PV Sage | Change |
+|---|---:|---:|---:|
+| Median, including Q/K quantization | 0.412219 s | 0.097357 s | -76.38%, 4.234x |
+| Synthetic relative RMSE | — | 0.00379933 | approximate |
+| Synthetic cosine | — | 0.999992786 | finite |
+| Stable output hash | `2a54af9f76d9adbe` | `98fc5281025a8eba` | repeatable |
+
+Disassembly contains both `v_wmma_i32_16x16x16_iu8` and
+`v_wmma_f32_16x16x16_bf16`. The fused kernel uses wave32, 72 VGPR, 68 SGPR,
+18,048 bytes of LDS, no VGPR/SGPR spills, no private segment, and no dynamic
+stack. A combined gfx90a/gfx1100/gfx1201 bundle compiles; the public entry point
+rejects non-gfx12 hardware before dispatch.
+
+Three crossed real-weight production-token samples retained the speedup:
+
+| 50-layer metric | exact wave32 | Sage | Change |
+|---|---:|---:|---:|
+| Forward median | 30.120520 s | 18.788200 s | -37.62%, 1.603x |
+| Independent SDPA samples | 16.318/16.382 s | 5.171/5.220 s | about -68.2% |
+| Peak live allocation | 4.969 GiB | 5.040 GiB | +71 MiB |
+
+The Sage video/audio hashes were stable at `9f08559b684bc7ff` and
+`b27024068a0fe1a6`. Relative to exact wave32, final F32 velocity had maximum
+absolute error 0.420409739, relative RMSE 0.0152040993, cosine
+0.999884424423, and no non-finite values. A separate diagnostic retained all
+50 exact hidden states on the same GPU and compared every BF16 element at each
+candidate layer. Relative RMSE was 0.00274554 at layer 1, peaked at 0.01931865
+at layer 22, and ended at 0.00896422 at layer 50; all layers were finite.
+
+This is a research keep, not a stable default. It must next pass the three-
+prompt video, audio, and complete E2E quality gate. BF16 exact fallback remains
+mandatory regardless of that result.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -492,12 +551,16 @@ Build and run the local gates with:
 make BACKEND=hip -j16 \
   h3_vdn_gpu_ops_tests h3_vdn_feature_tests \
   h3_vdn_solve_tests h3_vdn_scan_tests h3_vdn_forward_smoke_tests \
-  h3_f32_sdpa_bench h3_vdn_video_vae_smoke_tests
+  h3_f32_sdpa_bench h3_vdn_video_vae_smoke_tests \
+  h3_vdn_sage_tests h3_vdn_sage_quant_tests h3_vdn_sage_sdpa_bench
 
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_gpu_ops_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_feature_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_solve_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_scan_tests
+./h3_vdn_sage_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_sage_quant_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_sage_sdpa_bench
 
 # Generic F32/D64 oracle versus the default exact wave32 specialization.
 HIP_VISIBLE_DEVICES=4 ./h3_f32_sdpa_bench

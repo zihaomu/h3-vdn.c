@@ -37,9 +37,9 @@ CXXFLAGS += -DH3_BACKEND_HIP $(HIP_OFFLOAD_FLAGS)
 LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lrocsolver -lrocblas -lamdhip64 -licuuc -licui18n -lm -lpthread -ldl
 LIB_C += h3_tokenizer_stub.c
-LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c
+LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c h3_vdn_sage.c
 LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp
-BACKEND_PROBE_OBJ := h3_hip.o
+BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sage.o
 else
 $(error unsupported BACKEND=$(BACKEND); use metal or hip)
 endif
@@ -49,7 +49,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
 	vdn-metadata-test vdn-reference-test vdn-block-loader-test vdn-prompt-test \
-	vdn-gpu-ops-test vdn-refiner-smoke-test vdn-block-smoke-test \
+	vdn-gpu-ops-test vdn-sage-test vdn-refiner-smoke-test vdn-block-smoke-test \
 	vdn-stack-smoke-test vdn-forward-smoke-test vdn-denoise-smoke-test \
 	vdn-video-vae-smoke-test vdn-audio-vae-smoke-test \
 	vdn-e2e-test vdn-input-contract-test \
@@ -158,6 +158,24 @@ h3_vdn_scan_tests: tests/test_gpu_vdn_scan.o $(BACKEND_PROBE_OBJ) \
 	$(LINK) -o $@ $^ $(LDLIBS)
 
 h3_vdn_sdpa_bench: tests/bench_vdn_sdpa.o $(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3_vdn_sage_tests: tests/test_vdn_sage.o h3_vdn_sage.o
+	$(CC) -o $@ $^ -lm
+
+vdn-sage-test: h3_vdn_sage_tests
+	./h3_vdn_sage_tests
+
+h3_vdn_sage_quant_tests: tests/test_vdn_sage_quant.o $(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3_vdn_sage_quant_bench: tests/bench_vdn_sage_quant.o $(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3_vdn_sage_sdpa_bench: tests/bench_vdn_sage_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
@@ -428,6 +446,7 @@ clean:
 		h3_vdn_reference_tests h3_vdn_block_loader_tests h3_vdn_prompt_tests \
 		h3_vdn_input_contract_tests h3_vdn_gpu_ops_tests \
 		h3_vdn_feature_tests h3_vdn_solve_tests h3_vdn_scan_tests \
+		h3_vdn_sage_tests h3_vdn_sage_quant_tests \
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
 		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
@@ -439,4 +458,5 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 h3_vdn_sdpa_bench h3_f32_sdpa_bench \
+	h3_vdn_sage_quant_bench h3_vdn_sage_sdpa_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d

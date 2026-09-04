@@ -817,7 +817,7 @@ cleanup:
     return output;
 }
 
-int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
+static int h3_vdn_forward_impl(h3_gpu *gpu, h3_vdn_weight_store *store,
                    const h3_vdn_model_weights *weights,
                    const h3_gpu_tensor *refined_prompt,
                    const h3_vdn_layout *layout,
@@ -826,6 +826,7 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
                    float video_timestep, float audio_timestep,
                    uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress progress, void *progress_opaque,
+                   h3_vdn_layer_observer observer, void *observer_opaque,
                    h3_vdn_velocity *velocity,
                    h3_vdn_forward_timing *timing,
                    char *error, size_t error_size) {
@@ -973,6 +974,10 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
         h3_gpu_tensor_free(modulation);
         modulation = NULL;
         h3_vdn_block_weights_free(&block);
+        if (observer && !observer(gpu, layer + 1, VDN_BLOCKS, hidden,
+                                  observer_opaque, error, error_size)) {
+            ok = 0; goto cleanup;
+        }
         if (progress) progress(layer + 1, VDN_BLOCKS, progress_opaque);
     }
     if (timing) timing->blocks_seconds = dit_now() - timing_phase;
@@ -1059,6 +1064,45 @@ cleanup:
         timing->total_seconds = timing_stop - timing_start;
     }
     return ok;
+}
+
+int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
+                   const h3_vdn_model_weights *weights,
+                   const h3_gpu_tensor *refined_prompt,
+                   const h3_vdn_layout *layout,
+                   const h3_gpu_tensor *video_rows,
+                   const h3_gpu_tensor *audio_rows,
+                   float video_timestep, float audio_timestep,
+                   uint32_t radius, uint32_t chunk,
+                   h3_vdn_layer_progress progress, void *progress_opaque,
+                   h3_vdn_velocity *velocity,
+                   h3_vdn_forward_timing *timing,
+                   char *error, size_t error_size) {
+    return h3_vdn_forward_impl(
+        gpu, store, weights, refined_prompt, layout, video_rows, audio_rows,
+        video_timestep, audio_timestep, radius, chunk, progress,
+        progress_opaque, NULL, NULL, velocity, timing, error, error_size);
+}
+
+int h3_vdn_forward_observed(
+                   h3_gpu *gpu, h3_vdn_weight_store *store,
+                   const h3_vdn_model_weights *weights,
+                   const h3_gpu_tensor *refined_prompt,
+                   const h3_vdn_layout *layout,
+                   const h3_gpu_tensor *video_rows,
+                   const h3_gpu_tensor *audio_rows,
+                   float video_timestep, float audio_timestep,
+                   uint32_t radius, uint32_t chunk,
+                   h3_vdn_layer_progress progress, void *progress_opaque,
+                   h3_vdn_layer_observer observer, void *observer_opaque,
+                   h3_vdn_velocity *velocity,
+                   h3_vdn_forward_timing *timing,
+                   char *error, size_t error_size) {
+    return h3_vdn_forward_impl(
+        gpu, store, weights, refined_prompt, layout, video_rows, audio_rows,
+        video_timestep, audio_timestep, radius, chunk, progress,
+        progress_opaque, observer, observer_opaque, velocity, timing, error,
+        error_size);
 }
 
 int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,

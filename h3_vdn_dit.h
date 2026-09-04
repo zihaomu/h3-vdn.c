@@ -68,6 +68,11 @@ typedef struct {
 
 typedef void (*h3_vdn_layer_progress)(unsigned completed, unsigned total,
                                       void *opaque);
+typedef int (*h3_vdn_layer_observer)(h3_gpu *gpu, unsigned completed,
+                                     unsigned total,
+                                     const h3_gpu_tensor *hidden,
+                                     void *opaque,
+                                     char *error, size_t error_size);
 
 /* Execute one complete 50-layer VDN DiT model evaluation. Inputs and returned
  * velocity rows are F32. The caller owns the two returned tensors. */
@@ -80,6 +85,23 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
                    float video_timestep, float audio_timestep,
                    uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress progress, void *progress_opaque,
+                   h3_vdn_velocity *velocity,
+                   h3_vdn_forward_timing *timing,
+                   char *error, size_t error_size);
+/* Diagnostic variant used for layer-by-layer numerical propagation gates.
+ * The observer runs after each submitted block and may synchronously inspect
+ * hidden. Production callers should continue to use h3_vdn_forward(). */
+int h3_vdn_forward_observed(
+                   h3_gpu *gpu, h3_vdn_weight_store *store,
+                   const h3_vdn_model_weights *weights,
+                   const h3_gpu_tensor *refined_prompt,
+                   const h3_vdn_layout *layout,
+                   const h3_gpu_tensor *video_rows,
+                   const h3_gpu_tensor *audio_rows,
+                   float video_timestep, float audio_timestep,
+                   uint32_t radius, uint32_t chunk,
+                   h3_vdn_layer_progress progress, void *progress_opaque,
+                   h3_vdn_layer_observer observer, void *observer_opaque,
                    h3_vdn_velocity *velocity,
                    h3_vdn_forward_timing *timing,
                    char *error, size_t error_size);

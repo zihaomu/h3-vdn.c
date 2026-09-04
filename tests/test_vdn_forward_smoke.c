@@ -17,8 +17,89 @@ enum {
     DEFAULT_LATENT_W = 4,
     DEFAULT_AUDIO_LATENTS = 3,
     VIDEO_PATCH = 96,
-    AUDIO_WIDTH = 32
+    AUDIO_WIDTH = 32,
+    HIDDEN = 5376,
+    BLOCKS = 50
 };
+
+typedef struct {
+    size_t elements;
+    int capture;
+    h3_gpu_tensor *snapshots[BLOCKS];
+    uint16_t *reference;
+    uint16_t *candidate;
+} layer_comparison;
+
+static float bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static int observe_layer(h3_gpu *gpu, unsigned completed, unsigned total,
+                         const h3_gpu_tensor *hidden, void *opaque,
+                         char *error, size_t error_size) {
+    layer_comparison *comparison = opaque;
+    if (!comparison || completed < 1 || completed > BLOCKS ||
+        total != BLOCKS) {
+        snprintf(error, error_size, "invalid layer comparison callback");
+        return 0;
+    }
+    size_t index = completed - 1;
+    if (comparison->capture) {
+        comparison->snapshots[index] = h3_gpu_tensor_new_bf16(
+            gpu, comparison->elements);
+        if (!comparison->snapshots[index] || !h3_gpu_begin(gpu) ||
+            !h3_gpu_copy_bf16(gpu, comparison->snapshots[index], 0, hidden,
+                              0, comparison->elements) ||
+            !h3_gpu_submit(gpu)) {
+            snprintf(error, error_size, "cannot capture hidden layer %u: %s",
+                     completed, h3_gpu_error(gpu));
+            return 0;
+        }
+        return 1;
+    }
+    if (!comparison->snapshots[index] ||
+        !h3_gpu_tensor_read_bf16(comparison->snapshots[index],
+                                 comparison->reference,
+                                 comparison->elements) ||
+        !h3_gpu_tensor_read_bf16(hidden, comparison->candidate,
+                                 comparison->elements)) {
+        snprintf(error, error_size, "cannot read hidden layer %u: %s",
+                 completed, h3_gpu_error(gpu));
+        return 0;
+    }
+    float maximum = 0.0f;
+    double squared_error = 0.0, squared_reference = 0.0;
+    double squared_candidate = 0.0, dot_product = 0.0;
+    size_t invalid = 0;
+    for (size_t element = 0; element < comparison->elements; element++) {
+        float reference = bf16_to_f32(comparison->reference[element]);
+        float candidate = bf16_to_f32(comparison->candidate[element]);
+        float difference = candidate - reference;
+        if (fabsf(difference) > maximum) maximum = fabsf(difference);
+        squared_error += (double)difference * difference;
+        squared_reference += (double)reference * reference;
+        squared_candidate += (double)candidate * candidate;
+        dot_product += (double)reference * candidate;
+        invalid += !isfinite(candidate);
+    }
+    double relative_rmse = squared_reference > 0.0 ?
+        sqrt(squared_error / squared_reference) : INFINITY;
+    double cosine = squared_reference > 0.0 && squared_candidate > 0.0 ?
+        dot_product / sqrt(squared_reference * squared_candidate) : 0.0;
+    printf("VDN Sage layer error[%u]: max_abs=%.9g relative_rmse=%.9g "
+           "cosine=%.12g invalid=%zu\n", completed, maximum,
+           relative_rmse, cosine, invalid);
+    if (invalid) {
+        snprintf(error, error_size,
+                 "Sage hidden layer %u contains non-finite values",
+                 completed);
+        return 0;
+    }
+    return 1;
+}
 
 static int env_u32(const char *name, uint32_t fallback, uint32_t *value,
                    char *error, size_t error_size) {
@@ -76,17 +157,21 @@ int main(int argc, char **argv) {
     h3_vdn_layout layout;
     h3_vdn_velocity velocity;
     h3_vdn_forward_timing forward_timing;
+    h3_vdn_forward_timing baseline_forward_timing;
     h3_vdn_denoise_timing denoise_timing;
     memset(&model, 0, sizeof(model));
     memset(&prompt, 0, sizeof(prompt));
     memset(&layout, 0, sizeof(layout));
     memset(&velocity, 0, sizeof(velocity));
     memset(&forward_timing, 0, sizeof(forward_timing));
+    memset(&baseline_forward_timing, 0, sizeof(baseline_forward_timing));
     memset(&denoise_timing, 0, sizeof(denoise_timing));
     h3_gpu_tensor *refined = NULL, *video = NULL, *audio = NULL;
     float *video_host = NULL, *audio_host = NULL;
     float *video_output = NULL, *audio_output = NULL;
     float *video_compare = NULL, *audio_compare = NULL;
+    layer_comparison layers;
+    memset(&layers, 0, sizeof(layers));
     uint32_t frames = DEFAULT_FRAMES;
     uint32_t latent_h = DEFAULT_LATENT_H;
     uint32_t latent_w = DEFAULT_LATENT_W;
@@ -94,6 +179,10 @@ int main(int argc, char **argv) {
     int denoise = getenv("VDN_SMOKE_DENOISE") != NULL;
     int compare_sdpa = !denoise &&
         getenv("VDN_SMOKE_COMPARE_SDPA") != NULL;
+    int compare_sage = !denoise &&
+        getenv("VDN_SMOKE_COMPARE_SAGE") != NULL;
+    int compare_sage_layers = compare_sage &&
+        getenv("VDN_SMOKE_SAGE_LAYER_ERRORS") != NULL;
     if (!env_u32("VDN_SMOKE_FRAMES", frames, &frames,
                  error, sizeof(error)) ||
         !env_u32("VDN_SMOKE_LATENT_H", latent_h, &latent_h,
@@ -132,6 +221,10 @@ int main(int argc, char **argv) {
     audio = h3_gpu_tensor_from_f32(gpu, audio_host, audio_elements);
     int ok = video && audio;
     if (compare_sdpa) setenv("H3_VDN_SCALAR_SDPA", "1", 1);
+    if (compare_sage) {
+        setenv("H3_VDN_SCALAR_SDPA", "0", 1);
+        setenv("H3_VDN_SDPA", "wave32", 1);
+    }
     if (ok && denoise)
         ok = h3_vdn_denoise(
             gpu, store, &model, refined, &layout, video, audio, 8, 1, 5,
@@ -139,40 +232,72 @@ int main(int argc, char **argv) {
             error, sizeof(error)) &&
              h3_gpu_tensor_read_f32(video, video_output, video_elements) &&
              h3_gpu_tensor_read_f32(audio, audio_output, audio_elements);
-    else if (ok)
-        ok = h3_vdn_forward(
-                 gpu, store, &model, refined, &layout, video, audio,
-                 0.125f, 0.375f, 1, 5, layer_progress, NULL,
-                 &velocity, &forward_timing, error, sizeof(error)) &&
+    else if (ok) {
+        layers.elements = (size_t)layout.sequence * HIDDEN;
+        layers.capture = 1;
+        if (compare_sage_layers) {
+            layers.reference = malloc(
+                layers.elements * sizeof(*layers.reference));
+            layers.candidate = malloc(
+                layers.elements * sizeof(*layers.candidate));
+            ok = layers.reference && layers.candidate;
+        }
+        if (ok && compare_sage_layers)
+            ok = h3_vdn_forward_observed(
+                gpu, store, &model, refined, &layout, video, audio,
+                0.125f, 0.375f, 1, 5, layer_progress, NULL,
+                observe_layer, &layers, &velocity, &forward_timing,
+                error, sizeof(error));
+        else if (ok)
+            ok = h3_vdn_forward(
+                gpu, store, &model, refined, &layout, video, audio,
+                0.125f, 0.375f, 1, 5, layer_progress, NULL,
+                &velocity, &forward_timing, error, sizeof(error));
+        ok = ok &&
              h3_gpu_tensor_read_f32(velocity.video, video_output,
                                     video_elements) &&
              h3_gpu_tensor_read_f32(velocity.audio, audio_output,
                                     audio_elements);
+    }
     if (!ok) {
         if (!error[0]) snprintf(error, sizeof(error),
                                 "cannot read VDN forward outputs: %s",
                                 h3_gpu_error(gpu));
         goto failed;
     }
-    if (compare_sdpa) {
+    if (compare_sdpa || compare_sage) {
+        baseline_forward_timing = forward_timing;
         video_compare = malloc(video_elements * sizeof(*video_compare));
         audio_compare = malloc(audio_elements * sizeof(*audio_compare));
         h3_vdn_velocity_free(&velocity);
         setenv("H3_VDN_SCALAR_SDPA", "0", 1);
+        if (compare_sage)
+            setenv("H3_VDN_SDPA", "sage-i8-bf16", 1);
         ok = video_compare && audio_compare &&
              h3_gpu_tensor_write_f32(video, video_host, video_elements) &&
-             h3_gpu_tensor_write_f32(audio, audio_host, audio_elements) &&
-             h3_vdn_forward(
-                 gpu, store, &model, refined, &layout, video, audio,
-                 0.125f, 0.375f, 1, 5, layer_progress, NULL,
-                 &velocity, &forward_timing, error, sizeof(error)) &&
+             h3_gpu_tensor_write_f32(audio, audio_host, audio_elements);
+        layers.capture = 0;
+        if (ok && compare_sage_layers)
+            ok = h3_vdn_forward_observed(
+                gpu, store, &model, refined, &layout, video, audio,
+                0.125f, 0.375f, 1, 5, layer_progress, NULL,
+                observe_layer, &layers, &velocity, &forward_timing,
+                error, sizeof(error));
+        else if (ok)
+            ok = h3_vdn_forward(
+                gpu, store, &model, refined, &layout, video, audio,
+                0.125f, 0.375f, 1, 5, layer_progress, NULL,
+                &velocity, &forward_timing, error, sizeof(error));
+        ok = ok &&
              h3_gpu_tensor_read_f32(velocity.video, video_compare,
                                     video_elements) &&
              h3_gpu_tensor_read_f32(velocity.audio, audio_compare,
                                     audio_elements);
         if (!ok) goto failed;
         double squared = 0.0, reference_squared = 0.0;
+        double candidate_squared = 0.0, dot_product = 0.0;
         float maximum = 0.0f;
+        size_t candidate_invalid = 0;
         size_t compared = video_elements + audio_elements;
         for (size_t index = 0; index < video_elements; index++) {
             float difference = fabsf(video_output[index] - video_compare[index]);
@@ -180,6 +305,11 @@ int main(int argc, char **argv) {
             squared += (double)difference * difference;
             reference_squared +=
                 (double)video_output[index] * video_output[index];
+            candidate_squared +=
+                (double)video_compare[index] * video_compare[index];
+            dot_product +=
+                (double)video_output[index] * video_compare[index];
+            candidate_invalid += !isfinite(video_compare[index]);
         }
         for (size_t index = 0; index < audio_elements; index++) {
             float difference = fabsf(audio_output[index] - audio_compare[index]);
@@ -187,19 +317,38 @@ int main(int argc, char **argv) {
             squared += (double)difference * difference;
             reference_squared +=
                 (double)audio_output[index] * audio_output[index];
+            candidate_squared +=
+                (double)audio_compare[index] * audio_compare[index];
+            dot_product +=
+                (double)audio_output[index] * audio_compare[index];
+            candidate_invalid += !isfinite(audio_compare[index]);
         }
         double rmse = sqrt(squared / (double)compared);
         double relative_rmse = reference_squared > 0.0 ?
             sqrt(squared / reference_squared) : 0.0;
-        printf("VDN SDPA scalar/wave32 comparison: max_abs=%.9g "
-               "rmse=%.9g relative_rmse=%.9g wave_video=%016llx "
-               "wave_audio=%016llx\n", maximum, rmse, relative_rmse,
+        double cosine = reference_squared > 0.0 && candidate_squared > 0.0 ?
+            dot_product / sqrt(reference_squared * candidate_squared) : 0.0;
+        printf("VDN SDPA %s comparison: max_abs=%.9g "
+               "rmse=%.9g relative_rmse=%.9g cosine=%.12g "
+               "invalid=%zu candidate_video=%016llx "
+               "candidate_audio=%016llx baseline_wall=%.6f "
+               "candidate_wall=%.6f\n",
+               compare_sage ? "wave32/sage-i8-bf16" : "scalar/wave32",
+               maximum, rmse, relative_rmse, cosine, candidate_invalid,
                (unsigned long long)hash_f32(video_compare, video_elements),
-               (unsigned long long)hash_f32(audio_compare, audio_elements));
-        if (memcmp(video_output, video_compare,
+               (unsigned long long)hash_f32(audio_compare, audio_elements),
+               baseline_forward_timing.total_seconds,
+               forward_timing.total_seconds);
+        if (candidate_invalid) {
+            snprintf(error, sizeof(error),
+                     "Sage VDN SDPA output contains non-finite values");
+            goto failed;
+        }
+        if (!compare_sage &&
+            (memcmp(video_output, video_compare,
                    video_elements * sizeof(*video_output)) ||
             memcmp(audio_output, audio_compare,
-                   audio_elements * sizeof(*audio_output))) {
+                   audio_elements * sizeof(*audio_output)))) {
             snprintf(error, sizeof(error),
                      "scalar/wave32 VDN SDPA output is not bitwise identical");
             goto failed;
@@ -270,6 +419,9 @@ int main(int argc, char **argv) {
 failed:
     fprintf(stderr, "VDN complete forward smoke failed: %s\n", error);
 cleanup:
+    for (size_t index = 0; index < BLOCKS; index++)
+        h3_gpu_tensor_free(layers.snapshots[index]);
+    free(layers.candidate); free(layers.reference);
     free(audio_compare); free(video_compare);
     free(audio_output); free(video_output);
     free(audio_host); free(video_host);

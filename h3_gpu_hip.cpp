@@ -1,9 +1,11 @@
 #include "h3_gpu.h"
+#include "h3_vdn_sage.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 #include <rocsolver/rocsolver.h>
+#include <rocwmma/rocwmma.hpp>
 
 /* ROCm 7 keeps a variadic compatibility macro for the removed workspace
  * arguments. Use the current function declaration directly under C++17. */
@@ -31,6 +33,7 @@ struct h3_gpu_staging {
 struct h3_gpu {
     int device;
     int warp_size;
+    char gcn_arch_name[64];
     hipStream_t stream;
     rocblas_handle blas;
     char error[512];
@@ -62,6 +65,8 @@ struct h3_gpu {
     hipEvent_t staging_copy_start[2];
     hipEvent_t staging_copy_end[2];
     int staging_events_initialized;
+    void *sage_workspace;
+    size_t sage_workspace_bytes;
 };
 
 struct h3_gpu_tensor {
@@ -453,6 +458,28 @@ static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *gpu, const void *values,
         gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
     gpu->stats.tensor_allocations++;
     return tensor;
+}
+
+static int h3_gpu_ensure_sage_workspace(h3_gpu *gpu, size_t bytes) {
+    if (gpu->sage_workspace_bytes >= bytes) return 1;
+    void *replacement = nullptr;
+    if (!h3_gpu_check(gpu, hipMalloc(&replacement, bytes ? bytes : 1),
+                      "hipMalloc VDN Sage workspace")) return 0;
+    if (gpu->sage_workspace) {
+        if (!h3_gpu_check(gpu, hipFree(gpu->sage_workspace),
+                          "hipFree old VDN Sage workspace")) {
+            (void)hipFree(replacement);
+            return 0;
+        }
+        gpu->stats.live_bytes -= gpu->sage_workspace_bytes;
+    }
+    gpu->sage_workspace = replacement;
+    gpu->sage_workspace_bytes = bytes;
+    gpu->stats.allocated_bytes += bytes;
+    gpu->stats.live_bytes += bytes;
+    if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+        gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
 }
 
 static int h3_gpu_valid_range(const h3_gpu_tensor *tensor,
@@ -1503,6 +1530,379 @@ __device__ static int h3_hip_vdn_key_allowed(
     return key_frame >= lower && key_frame <= upper;
 }
 
+template <uint32_t group_rows>
+__global__ static void h3_hip_vdn_sage_quant_bf16_i8_kernel(
+        const hip_bfloat16 *input, int8_t *output, float *scales,
+        uint32_t sequence, uint32_t heads, uint32_t head_dim,
+        uint32_t groups) {
+    uint32_t group = blockIdx.x;
+    uint32_t head = blockIdx.y;
+    uint32_t lane = threadIdx.x;
+    if (group >= groups || head >= heads) return;
+    uint32_t row_begin = group * group_rows;
+    uint32_t group_elements = group_rows * head_dim;
+    float local_amax = 0.0f;
+    for (uint32_t local = lane; local < group_elements;
+         local += blockDim.x) {
+        uint32_t row = row_begin + local / head_dim;
+        uint32_t dimension = local % head_dim;
+        if (row < sequence) {
+            size_t index = (static_cast<size_t>(row) * heads + head) *
+                           head_dim + dimension;
+            local_amax = fmaxf(local_amax,
+                               fabsf(static_cast<float>(input[index])));
+        }
+    }
+    extern __shared__ float reduction[];
+    reduction[lane] = local_amax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride)
+            reduction[lane] = fmaxf(reduction[lane],
+                                    reduction[lane + stride]);
+        __syncthreads();
+    }
+    float amax = reduction[0];
+    float quant_scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    float inverse_scale = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (lane == 0)
+        scales[static_cast<size_t>(head) * groups + group] = quant_scale;
+    for (uint32_t local = lane; local < group_elements;
+         local += blockDim.x) {
+        uint32_t row = row_begin + local / head_dim;
+        uint32_t dimension = local % head_dim;
+        if (row < sequence) {
+            size_t index = (static_cast<size_t>(row) * heads + head) *
+                           head_dim + dimension;
+            int32_t rounded = __float2int_rn(
+                static_cast<float>(input[index]) * inverse_scale);
+            if (rounded > 127) rounded = 127;
+            if (rounded < -127) rounded = -127;
+            output[index] = static_cast<int8_t>(rounded);
+        }
+    }
+}
+
+__global__ static void h3_hip_vdn_sage_wmma_qk_tile_i8_kernel(
+        const int8_t *query, const int8_t *key,
+        const float *query_scales, const float *key_scales, float *scores,
+        uint32_t sequence, uint32_t heads, uint32_t query_start,
+        uint32_t key_start, uint32_t head, uint32_t query_groups,
+        uint32_t key_groups, float scale) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr uint32_t tile = 16;
+    constexpr uint32_t head_dim = 128;
+    constexpr uint32_t depth_tile = 16;
+    using query_fragment = rocwmma::fragment<
+        rocwmma::matrix_a, tile, tile, depth_tile, int8_t,
+        rocwmma::row_major>;
+    using key_fragment = rocwmma::fragment<
+        rocwmma::matrix_b, tile, tile, depth_tile, int8_t,
+        rocwmma::col_major>;
+    using score_fragment = rocwmma::fragment<
+        rocwmma::accumulator, tile, tile, depth_tile, int32_t>;
+    uint32_t lane = threadIdx.x;
+    size_t inner = static_cast<size_t>(heads) * head_dim;
+    size_t query_base = static_cast<size_t>(query_start) * inner +
+                        static_cast<size_t>(head) * head_dim;
+    size_t key_base = static_cast<size_t>(key_start) * inner +
+                      static_cast<size_t>(head) * head_dim;
+    score_fragment accumulator;
+    rocwmma::fill_fragment(accumulator, 0);
+#pragma unroll
+    for (uint32_t depth = 0; depth < head_dim; depth += depth_tile) {
+        query_fragment query_values;
+        key_fragment key_values;
+        rocwmma::load_matrix_sync(
+            query_values, query + query_base + depth,
+            static_cast<uint32_t>(inner));
+        rocwmma::load_matrix_sync(
+            key_values, key + key_base + depth,
+            static_cast<uint32_t>(inner));
+        rocwmma::mma_sync(
+            accumulator, query_values, key_values, accumulator);
+    }
+    __shared__ int32_t integer_scores[tile * tile];
+    rocwmma::store_matrix_sync(
+        integer_scores, accumulator, tile, rocwmma::mem_row_major);
+    __syncwarp();
+    for (uint32_t index = lane; index < tile * tile; index += 32) {
+        uint32_t query_row = query_start + index / tile;
+        uint32_t key_row = key_start + index % tile;
+        float query_scale = query_scales[
+            static_cast<size_t>(head) * query_groups + query_row / 32];
+        float key_scale = key_scales[
+            static_cast<size_t>(head) * key_groups + key_row / 64];
+        scores[index] = static_cast<float>(integer_scores[index]) *
+                        query_scale * key_scale * scale;
+    }
+    (void)sequence;
+#else
+    /* The host entry point rejects non-gfx12 devices. Keeping a device-side
+     * fallback lets a single HIP source compile into multi-architecture
+     * bundles without asking rocWMMA for an unavailable I8 instruction. */
+    (void)query; (void)key; (void)query_scales; (void)key_scales;
+    (void)scores; (void)sequence; (void)heads; (void)query_start;
+    (void)key_start; (void)head; (void)query_groups; (void)key_groups;
+    (void)scale;
+#endif
+}
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ __forceinline__ static void h3_hip_vdn_sage_qk_wmma_16x16(
+        const int8_t *query, uint32_t query_stride,
+        const int8_t *key, uint32_t key_stride, int32_t *scores) {
+    constexpr uint32_t tile = 16;
+    constexpr uint32_t depth_tile = 16;
+    using query_fragment = rocwmma::fragment<
+        rocwmma::matrix_a, tile, tile, depth_tile, int8_t,
+        rocwmma::row_major>;
+    using key_fragment = rocwmma::fragment<
+        rocwmma::matrix_b, tile, tile, depth_tile, int8_t,
+        rocwmma::col_major>;
+    using score_fragment = rocwmma::fragment<
+        rocwmma::accumulator, tile, tile, depth_tile, int32_t>;
+    score_fragment accumulator;
+    rocwmma::fill_fragment(accumulator, 0);
+#pragma unroll
+    for (uint32_t depth = 0; depth < 128; depth += depth_tile) {
+        query_fragment query_values;
+        key_fragment key_values;
+        rocwmma::load_matrix_sync(
+            query_values, query + depth, query_stride);
+        rocwmma::load_matrix_sync(key_values, key + depth, key_stride);
+        rocwmma::mma_sync(
+            accumulator, query_values, key_values, accumulator);
+    }
+    rocwmma::store_matrix_sync(
+        scores, accumulator, tile, rocwmma::mem_row_major);
+    __syncwarp();
+}
+#endif
+
+/* Experimental two-pass FlashAttention-style gfx12 kernel. One 256-thread
+ * block owns 16 queries for one head. Wave 0 computes I8 QK tiles; all eight
+ * waves compute one 16-column BF16 P*V tile each. The first pass obtains the
+ * exact softmax normalizer without an SxS score buffer, while the second pass
+ * recomputes QK and immediately consumes BF16 probabilities. */
+__global__ static void h3_hip_vdn_sage_attention_i8_bf16_kernel(
+        const int8_t *query, const int8_t *key,
+        const float *query_scales, const float *key_scales,
+        const hip_bfloat16 *value, hip_bfloat16 *output,
+        uint32_t sequence, uint32_t heads, uint32_t video_start,
+        uint32_t video_end, uint32_t frames, uint32_t tokens_per_frame,
+        uint32_t radius, uint32_t chunk, int anchor_both, float scale,
+        uint32_t query_groups, uint32_t key_groups) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr uint32_t tile = 16;
+    constexpr uint32_t head_dim = 128;
+    constexpr uint32_t waves = head_dim / tile;
+    uint32_t thread = threadIdx.x;
+    uint32_t lane = thread & 31;
+    uint32_t wave = thread >> 5;
+    uint32_t query_start = blockIdx.x * tile;
+    uint32_t head = blockIdx.y;
+    if (head >= heads || query_start >= sequence) return;
+    size_t inner_wide = static_cast<size_t>(heads) * head_dim;
+    uint32_t inner = heads * head_dim;
+
+    __shared__ int32_t integer_scores[tile * tile];
+    __shared__ hip_bfloat16 probabilities[tile * tile];
+    __shared__ int8_t query_tail[tile * head_dim];
+    __shared__ int8_t key_tail[tile * head_dim];
+    __shared__ hip_bfloat16 value_tail[tile * head_dim];
+    __shared__ float output_tiles[waves * tile * tile];
+    __shared__ float row_maximum[tile];
+    __shared__ float row_sum[tile];
+
+    int query_is_tail = sequence - query_start < tile;
+    const int8_t *query_tile = query +
+        static_cast<size_t>(query_start) * inner_wide +
+        static_cast<size_t>(head) * head_dim;
+    uint32_t query_stride = inner;
+    if (query_is_tail && wave == 0) {
+        for (uint32_t index = lane; index < tile * head_dim; index += 32) {
+            uint32_t row = index / head_dim;
+            uint32_t dimension = index % head_dim;
+            query_tail[index] = query_start + row < sequence ?
+                query[(static_cast<size_t>(query_start + row) * heads +
+                       head) * head_dim + dimension] : 0;
+        }
+        __syncwarp();
+    }
+    if (query_is_tail) {
+        query_tile = query_tail;
+        query_stride = head_dim;
+    }
+
+    float running_maximum = -INFINITY;
+    float running_sum = 0.0f;
+    for (uint32_t key_start = 0; key_start < sequence; key_start += tile) {
+        int key_is_tail = sequence - key_start < tile;
+        const int8_t *key_tile = key +
+            static_cast<size_t>(key_start) * inner_wide +
+            static_cast<size_t>(head) * head_dim;
+        uint32_t key_stride = inner;
+        if (key_is_tail && wave == 0) {
+            for (uint32_t index = lane; index < tile * head_dim; index += 32) {
+                uint32_t row = index / head_dim;
+                uint32_t dimension = index % head_dim;
+                key_tail[index] = key_start + row < sequence ?
+                    key[(static_cast<size_t>(key_start + row) * heads +
+                         head) * head_dim + dimension] : 0;
+            }
+            __syncwarp();
+            key_tile = key_tail;
+            key_stride = head_dim;
+        }
+        if (wave == 0) {
+            h3_hip_vdn_sage_qk_wmma_16x16(
+                query_tile, query_stride, key_tile, key_stride,
+                integer_scores);
+            if (lane < tile) {
+                uint32_t query_row = query_start + lane;
+                if (query_row < sequence) {
+                    float query_scale = query_scales[
+                        static_cast<size_t>(head) * query_groups +
+                        query_row / 32];
+#pragma unroll
+                    for (uint32_t column = 0; column < tile; column++) {
+                        uint32_t key_row = key_start + column;
+                        if (key_row >= sequence ||
+                            !h3_hip_vdn_key_allowed(
+                                query_row, key_row, video_start, video_end,
+                                frames, tokens_per_frame, radius, chunk,
+                                anchor_both)) continue;
+                        float key_scale = key_scales[
+                            static_cast<size_t>(head) * key_groups +
+                            key_row / 64];
+                        float score =
+                            static_cast<float>(integer_scores[lane * tile +
+                                                              column]) *
+                            query_scale * key_scale * scale;
+                        float next_maximum = fmaxf(running_maximum, score);
+                        float old_scale = running_sum == 0.0f ? 0.0f :
+                            expf(running_maximum - next_maximum);
+                        float new_scale = expf(score - next_maximum);
+                        running_sum = running_sum * old_scale + new_scale;
+                        running_maximum = next_maximum;
+                    }
+                }
+            }
+        }
+    }
+    if (wave == 0 && lane < tile) {
+        row_maximum[lane] = running_maximum;
+        row_sum[lane] = running_sum;
+    }
+    __syncthreads();
+
+    using probability_fragment = rocwmma::fragment<
+        rocwmma::matrix_a, tile, tile, tile, rocwmma::bfloat16_t,
+        rocwmma::row_major>;
+    using value_fragment = rocwmma::fragment<
+        rocwmma::matrix_b, tile, tile, tile, rocwmma::bfloat16_t,
+        rocwmma::row_major>;
+    using output_fragment = rocwmma::fragment<
+        rocwmma::accumulator, tile, tile, tile, float>;
+    output_fragment accumulator;
+    rocwmma::fill_fragment(accumulator, 0.0f);
+
+    for (uint32_t key_start = 0; key_start < sequence; key_start += tile) {
+        int key_is_tail = sequence - key_start < tile;
+        const int8_t *key_tile = key +
+            static_cast<size_t>(key_start) * inner_wide +
+            static_cast<size_t>(head) * head_dim;
+        const hip_bfloat16 *value_tile = value +
+            static_cast<size_t>(key_start) * inner_wide +
+            static_cast<size_t>(head) * head_dim;
+        uint32_t key_stride = inner;
+        uint32_t value_stride = inner;
+        if (key_is_tail) {
+            for (uint32_t index = thread; index < tile * head_dim;
+                 index += blockDim.x) {
+                uint32_t row = index / head_dim;
+                uint32_t dimension = index % head_dim;
+                if (key_start + row < sequence) {
+                    size_t source =
+                        (static_cast<size_t>(key_start + row) * heads +
+                         head) * head_dim + dimension;
+                    key_tail[index] = key[source];
+                    value_tail[index] = value[source];
+                } else {
+                    key_tail[index] = 0;
+                    value_tail[index] = hip_bfloat16(0.0f);
+                }
+            }
+            __syncthreads();
+            key_tile = key_tail;
+            value_tile = value_tail;
+            key_stride = head_dim;
+            value_stride = head_dim;
+        }
+        if (wave == 0)
+            h3_hip_vdn_sage_qk_wmma_16x16(
+                query_tile, query_stride, key_tile, key_stride,
+                integer_scores);
+        __syncthreads();
+        uint32_t query_local = thread / tile;
+        uint32_t key_local = thread % tile;
+        uint32_t query_row = query_start + query_local;
+        uint32_t key_row = key_start + key_local;
+        float probability = 0.0f;
+        if (query_row < sequence && key_row < sequence &&
+            h3_hip_vdn_key_allowed(
+                query_row, key_row, video_start, video_end, frames,
+                tokens_per_frame, radius, chunk, anchor_both)) {
+            float query_scale = query_scales[
+                static_cast<size_t>(head) * query_groups + query_row / 32];
+            float key_scale = key_scales[
+                static_cast<size_t>(head) * key_groups + key_row / 64];
+            float score = static_cast<float>(integer_scores[thread]) *
+                          query_scale * key_scale * scale;
+            probability = expf(score - row_maximum[query_local]) /
+                          row_sum[query_local];
+        }
+        probabilities[thread] = hip_bfloat16(probability);
+        __syncthreads();
+        probability_fragment probability_values;
+        value_fragment value_values;
+        rocwmma::load_matrix_sync(
+            probability_values, probabilities, tile);
+        rocwmma::load_matrix_sync(
+            value_values, value_tile + wave * tile, value_stride);
+        rocwmma::mma_sync(
+            accumulator, probability_values, value_values, accumulator);
+        __syncthreads();
+    }
+    rocwmma::store_matrix_sync(
+        output_tiles + wave * tile * tile, accumulator, tile,
+        rocwmma::mem_row_major);
+    __syncthreads();
+    for (uint32_t index = thread; index < tile * head_dim;
+         index += blockDim.x) {
+        uint32_t query_local = index / head_dim;
+        uint32_t dimension = index % head_dim;
+        uint32_t query_row = query_start + query_local;
+        if (query_row < sequence) {
+            uint32_t output_wave = dimension / tile;
+            uint32_t output_column = dimension % tile;
+            float result = output_tiles[
+                output_wave * tile * tile + query_local * tile +
+                output_column];
+            output[(static_cast<size_t>(query_row) * heads + head) *
+                   head_dim + dimension] = hip_bfloat16(result);
+        }
+    }
+#else
+    (void)query; (void)key; (void)query_scales; (void)key_scales;
+    (void)value; (void)output; (void)sequence; (void)heads;
+    (void)video_start; (void)video_end; (void)frames;
+    (void)tokens_per_frame; (void)radius; (void)chunk;
+    (void)anchor_both; (void)scale; (void)query_groups; (void)key_groups;
+#endif
+}
+
 __global__ static void h3_hip_vdn_window_sdpa_bf16_scalar_kernel(
         const hip_bfloat16 *query, const hip_bfloat16 *key,
         const hip_bfloat16 *value, hip_bfloat16 *output,
@@ -2521,8 +2921,12 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
         return nullptr;
     }
     hipDeviceProp_t properties;
-    if (hipGetDeviceProperties(&properties, gpu->device) == hipSuccess)
+    if (hipGetDeviceProperties(&properties, gpu->device) == hipSuccess) {
         gpu->warp_size = properties.warpSize;
+        std::snprintf(gpu->gcn_arch_name, sizeof(gpu->gcn_arch_name), "%s",
+                      properties.gcnArchName[0] ? properties.gcnArchName :
+                                                  "unknown");
+    }
     rocblas_status blas_status = rocblas_create_handle(&gpu->blas);
     if (blas_status == rocblas_status_success)
         blas_status = rocblas_set_stream(gpu->blas, gpu->stream);
@@ -2558,6 +2962,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_destroy_events(gpu);
     h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
+    (void)hipFree(gpu->sage_workspace);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);
     if (gpu->staging_lock_initialized)
@@ -2681,6 +3086,11 @@ extern "C" int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
 extern "C" int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor,
                                         uint16_t *values, size_t elements) {
     return h3_gpu_copy_to_host(tensor, 0, values, elements, H3_GPU_BF16);
+}
+
+extern "C" int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor,
+                                      int8_t *values, size_t elements) {
+    return h3_gpu_copy_to_host(tensor, 0, values, elements, H3_GPU_I8);
 }
 
 extern "C" int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor,
@@ -3957,6 +4367,183 @@ extern "C" int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        head_dim, scale, H3_GPU_BF16, 0);
 }
 
+extern "C" int h3_gpu_vdn_sage_quant_qk_bf16(
+                     h3_gpu *gpu, h3_gpu_tensor *query_i8,
+                     h3_gpu_tensor *key_i8, h3_gpu_tensor *query_scales,
+                     h3_gpu_tensor *key_scales,
+                     const h3_gpu_tensor *query_bf16,
+                     const h3_gpu_tensor *key_bf16,
+                     uint32_t sequence, uint32_t heads,
+                     uint32_t head_dim) {
+    size_t inner, elements;
+    uint32_t query_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 31) / 32);
+    uint32_t key_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 63) / 64);
+    size_t query_scale_elements, key_scale_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || !sequence || !heads ||
+        head_dim != 128 ||
+        !h3_gpu_count_2d(gpu, heads, head_dim, &inner,
+                         "VDN Sage quant inner") ||
+        !h3_gpu_count_2d(gpu, sequence, static_cast<uint32_t>(inner),
+                         &elements, "VDN Sage quant tensor") ||
+        !h3_gpu_count_2d(gpu, heads, query_groups, &query_scale_elements,
+                         "VDN Sage Q scales") ||
+        !h3_gpu_count_2d(gpu, heads, key_groups, &key_scale_elements,
+                         "VDN Sage K scales") ||
+        !h3_gpu_require_tensor(gpu, query_bf16, elements, H3_GPU_BF16,
+                               "VDN Sage query") ||
+        !h3_gpu_require_tensor(gpu, key_bf16, elements, H3_GPU_BF16,
+                               "VDN Sage key") ||
+        !h3_gpu_require_tensor(gpu, query_i8, elements, H3_GPU_I8,
+                               "VDN Sage quantized query") ||
+        !h3_gpu_require_tensor(gpu, key_i8, elements, H3_GPU_I8,
+                               "VDN Sage quantized key") ||
+        !h3_gpu_require_tensor(gpu, query_scales, query_scale_elements,
+                               H3_GPU_F32, "VDN Sage query scales") ||
+        !h3_gpu_require_tensor(gpu, key_scales, key_scale_elements,
+                               H3_GPU_F32, "VDN Sage key scales")) return 0;
+    constexpr uint32_t threads = 256;
+    size_t shared_bytes = threads * sizeof(float);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(h3_hip_vdn_sage_quant_bf16_i8_kernel<32>),
+        dim3(query_groups, heads), dim3(threads), shared_bytes, gpu->stream,
+        static_cast<const hip_bfloat16 *>(query_bf16->data),
+        static_cast<int8_t *>(query_i8->data),
+        static_cast<float *>(query_scales->data), sequence, heads, head_dim,
+        query_groups);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(h3_hip_vdn_sage_quant_bf16_i8_kernel<64>),
+        dim3(key_groups, heads), dim3(threads), shared_bytes, gpu->stream,
+        static_cast<const hip_bfloat16 *>(key_bf16->data),
+        static_cast<int8_t *>(key_i8->data),
+        static_cast<float *>(key_scales->data), sequence, heads, head_dim,
+        key_groups);
+    if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
+    gpu->stats.direct_dispatches += 2;
+    return 1;
+}
+
+extern "C" int h3_gpu_vdn_sage_wmma_qk_tile_i8(
+                     h3_gpu *gpu, h3_gpu_tensor *scores_f32,
+                     const h3_gpu_tensor *query_i8,
+                     const h3_gpu_tensor *key_i8,
+                     const h3_gpu_tensor *query_scales,
+                     const h3_gpu_tensor *key_scales,
+                     uint32_t sequence, uint32_t heads,
+                     uint32_t head_dim, uint32_t query_start,
+                     uint32_t key_start, uint32_t head, float scale) {
+    constexpr uint32_t tile = 16;
+    size_t inner, elements;
+    uint32_t query_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 31) / 32);
+    uint32_t key_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 63) / 64);
+    size_t query_scale_elements, key_scale_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || !sequence || !heads ||
+        head_dim != 128 || query_start > sequence || key_start > sequence ||
+        sequence - query_start < tile || sequence - key_start < tile ||
+        head >= heads || !std::isfinite(scale) || scale <= 0.0f ||
+        std::strncmp(gpu->gcn_arch_name, "gfx12", 5) != 0 ||
+        gpu->warp_size != 32 ||
+        !h3_gpu_count_2d(gpu, heads, head_dim, &inner,
+                         "VDN Sage WMMA inner") ||
+        !h3_gpu_count_2d(gpu, sequence, static_cast<uint32_t>(inner),
+                         &elements, "VDN Sage WMMA tensor") ||
+        !h3_gpu_count_2d(gpu, heads, query_groups, &query_scale_elements,
+                         "VDN Sage WMMA Q scales") ||
+        !h3_gpu_count_2d(gpu, heads, key_groups, &key_scale_elements,
+                         "VDN Sage WMMA K scales") ||
+        !h3_gpu_require_tensor(gpu, query_i8, elements, H3_GPU_I8,
+                               "VDN Sage WMMA query") ||
+        !h3_gpu_require_tensor(gpu, key_i8, elements, H3_GPU_I8,
+                               "VDN Sage WMMA key") ||
+        !h3_gpu_require_tensor(gpu, query_scales, query_scale_elements,
+                               H3_GPU_F32, "VDN Sage WMMA Q scales") ||
+        !h3_gpu_require_tensor(gpu, key_scales, key_scale_elements,
+                               H3_GPU_F32, "VDN Sage WMMA K scales") ||
+        !h3_gpu_require_tensor(gpu, scores_f32, tile * tile, H3_GPU_F32,
+                               "VDN Sage WMMA scores")) return 0;
+    hipLaunchKernelGGL(h3_hip_vdn_sage_wmma_qk_tile_i8_kernel,
+                       dim3(1), dim3(32), 0, gpu->stream,
+                       static_cast<const int8_t *>(query_i8->data),
+                       static_cast<const int8_t *>(key_i8->data),
+                       static_cast<const float *>(query_scales->data),
+                       static_cast<const float *>(key_scales->data),
+                       static_cast<float *>(scores_f32->data), sequence, heads,
+                       query_start, key_start, head, query_groups, key_groups,
+                       scale);
+    if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
+    gpu->stats.direct_dispatches++;
+    return 1;
+}
+
+extern "C" int h3_gpu_vdn_sage_attention_i8_bf16(
+                     h3_gpu *gpu, h3_gpu_tensor *output_bf16,
+                     const h3_gpu_tensor *query_i8,
+                     const h3_gpu_tensor *key_i8,
+                     const h3_gpu_tensor *query_scales,
+                     const h3_gpu_tensor *key_scales,
+                     const h3_gpu_tensor *value_bf16,
+                     uint32_t sequence, uint32_t heads,
+                     uint32_t head_dim, uint32_t video_start,
+                     uint32_t frames, uint32_t tokens_per_frame,
+                     uint32_t radius, uint32_t chunk,
+                     int anchor_both, float scale) {
+    size_t inner, elements;
+    uint64_t video_rows = static_cast<uint64_t>(frames) * tokens_per_frame;
+    uint64_t video_end_wide = static_cast<uint64_t>(video_start) + video_rows;
+    uint32_t query_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 31) / 32);
+    uint32_t key_groups = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sequence) + 63) / 64);
+    size_t query_scale_elements, key_scale_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || !sequence || !heads ||
+        head_dim != 128 || !frames || !tokens_per_frame ||
+        (anchor_both != 0 && anchor_both != 1) ||
+        video_start > sequence || video_end_wide > sequence ||
+        !std::isfinite(scale) || scale <= 0.0f ||
+        std::strncmp(gpu->gcn_arch_name, "gfx12", 5) != 0 ||
+        gpu->warp_size != 32 ||
+        !h3_gpu_count_2d(gpu, heads, head_dim, &inner,
+                         "VDN Sage attention inner") ||
+        inner > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, sequence, static_cast<uint32_t>(inner),
+                         &elements, "VDN Sage attention tensor") ||
+        !h3_gpu_count_2d(gpu, heads, query_groups, &query_scale_elements,
+                         "VDN Sage attention Q scales") ||
+        !h3_gpu_count_2d(gpu, heads, key_groups, &key_scale_elements,
+                         "VDN Sage attention K scales") ||
+        !h3_gpu_require_tensor(gpu, query_i8, elements, H3_GPU_I8,
+                               "VDN Sage attention query") ||
+        !h3_gpu_require_tensor(gpu, key_i8, elements, H3_GPU_I8,
+                               "VDN Sage attention key") ||
+        !h3_gpu_require_tensor(gpu, query_scales, query_scale_elements,
+                               H3_GPU_F32, "VDN Sage attention Q scales") ||
+        !h3_gpu_require_tensor(gpu, key_scales, key_scale_elements,
+                               H3_GPU_F32, "VDN Sage attention K scales") ||
+        !h3_gpu_require_tensor(gpu, value_bf16, elements, H3_GPU_BF16,
+                               "VDN Sage attention value") ||
+        !h3_gpu_require_tensor(gpu, output_bf16, elements, H3_GPU_BF16,
+                               "VDN Sage attention output")) return 0;
+    dim3 grid((sequence + 15) / 16, heads);
+    hipLaunchKernelGGL(h3_hip_vdn_sage_attention_i8_bf16_kernel,
+                       grid, dim3(256), 0, gpu->stream,
+                       static_cast<const int8_t *>(query_i8->data),
+                       static_cast<const int8_t *>(key_i8->data),
+                       static_cast<const float *>(query_scales->data),
+                       static_cast<const float *>(key_scales->data),
+                       static_cast<const hip_bfloat16 *>(value_bf16->data),
+                       static_cast<hip_bfloat16 *>(output_bf16->data),
+                       sequence, heads, video_start,
+                       static_cast<uint32_t>(video_end_wide), frames,
+                       tokens_per_frame, radius, chunk, anchor_both, scale,
+                       query_groups, key_groups);
+    if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
+    gpu->stats.direct_dispatches++;
+    return 1;
+}
+
 extern "C" int h3_gpu_vdn_window_sdpa_bf16(
                      h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query,
@@ -3989,6 +4576,75 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
         return 0;
     h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     uint32_t video_end = static_cast<uint32_t>(video_end_wide);
+    h3_vdn_sdpa_mode mode = H3_VDN_SDPA_AUTO;
+    const char *mode_value = std::getenv("H3_VDN_SDPA");
+    if (mode_value && *mode_value &&
+        !h3_vdn_sdpa_mode_parse(mode_value, &mode)) {
+        h3_gpu_set_error(gpu, "invalid H3_VDN_SDPA mode '%s'", mode_value);
+        return 0;
+    }
+    if (mode == H3_VDN_SDPA_SAGE_I8_F16 ||
+        mode == H3_VDN_SDPA_SAGE_I8_FP8_E4M3) {
+        h3_gpu_set_error(
+            gpu, "H3_VDN_SDPA=%s is not enabled yet for %s; use auto, "
+            "wave32, scalar, or sage-i8-bf16",
+            h3_vdn_sdpa_mode_name(mode),
+            gpu->gcn_arch_name[0] ? gpu->gcn_arch_name : "unknown HIP arch");
+        return 0;
+    }
+    if (mode == H3_VDN_SDPA_SAGE_I8_BF16) {
+        uint32_t query_groups = static_cast<uint32_t>(
+            (static_cast<uint64_t>(sequence) + 31) / 32);
+        uint32_t key_groups = static_cast<uint32_t>(
+            (static_cast<uint64_t>(sequence) + 63) / 64);
+        size_t scale_elements;
+        if (head_dim != 128 || gpu->warp_size != 32 ||
+            std::strncmp(gpu->gcn_arch_name, "gfx12", 5) != 0) {
+            h3_gpu_set_error(
+                gpu, "H3_VDN_SDPA=sage-i8-bf16 requires gfx12 wave32 "
+                "and head_dim=128 (got %s wave%d D=%u)",
+                gpu->gcn_arch_name[0] ? gpu->gcn_arch_name : "unknown",
+                gpu->warp_size, head_dim);
+            return 0;
+        }
+        if (static_cast<size_t>(query_groups) >
+                SIZE_MAX - static_cast<size_t>(key_groups) ||
+            !h3_gpu_count_2d(
+                gpu, heads, query_groups + key_groups, &scale_elements,
+                "VDN Sage workspace scales") ||
+            elements > SIZE_MAX / 2 ||
+            scale_elements > (SIZE_MAX - elements * 2) / sizeof(float)) {
+            h3_gpu_set_error(gpu, "VDN Sage workspace size overflow");
+            return 0;
+        }
+        size_t workspace_bytes = elements * 2 +
+                                 scale_elements * sizeof(float);
+        if (!h3_gpu_ensure_sage_workspace(gpu, workspace_bytes)) return 0;
+        uint8_t *workspace = static_cast<uint8_t *>(gpu->sage_workspace);
+        h3_gpu_tensor query_i8 = {
+            gpu, workspace, elements, elements, H3_GPU_I8};
+        h3_gpu_tensor key_i8 = {
+            gpu, workspace + elements, elements, elements, H3_GPU_I8};
+        float *scale_data = reinterpret_cast<float *>(
+            workspace + elements * 2);
+        size_t query_scale_elements =
+            static_cast<size_t>(heads) * query_groups;
+        h3_gpu_tensor query_scales = {
+            gpu, scale_data, query_scale_elements,
+            query_scale_elements * sizeof(float), H3_GPU_F32};
+        size_t key_scale_elements = static_cast<size_t>(heads) * key_groups;
+        h3_gpu_tensor key_scales = {
+            gpu, scale_data + query_scale_elements, key_scale_elements,
+            key_scale_elements * sizeof(float), H3_GPU_F32};
+        return h3_gpu_vdn_sage_quant_qk_bf16(
+                   gpu, &query_i8, &key_i8, &query_scales, &key_scales,
+                   query, key, sequence, heads, head_dim) &&
+               h3_gpu_vdn_sage_attention_i8_bf16(
+                   gpu, output, &query_i8, &key_i8, &query_scales,
+                   &key_scales, value, sequence, heads, head_dim,
+                   video_start, frames, tokens_per_frame, radius, chunk,
+                   anchor_both, scale);
+    }
     const char *scalar_value = std::getenv("H3_VDN_SCALAR_SDPA");
     const char *reload_query_value = std::getenv("H3_VDN_RELOAD_QUERY");
     int reload_query = reload_query_value && *reload_query_value &&
@@ -3999,8 +4655,17 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
     const char *lane0_softmax_value = std::getenv("H3_VDN_LANE0_SOFTMAX");
     int lane0_softmax = lane0_softmax_value && *lane0_softmax_value &&
         std::strcmp(lane0_softmax_value, "0");
-    int use_wave32 = gpu->warp_size == 32 && head_dim <= 256 &&
-        !(scalar_value && *scalar_value && std::strcmp(scalar_value, "0"));
+    int legacy_force_scalar = scalar_value && *scalar_value &&
+                              std::strcmp(scalar_value, "0");
+    if (mode == H3_VDN_SDPA_WAVE32 &&
+        (gpu->warp_size != 32 || head_dim > 256)) {
+        h3_gpu_set_error(gpu,
+            "H3_VDN_SDPA=wave32 is unsupported for warp=%d head_dim=%u",
+            gpu->warp_size, head_dim);
+        return 0;
+    }
+    int use_wave32 = mode != H3_VDN_SDPA_SCALAR && !legacy_force_scalar &&
+                     gpu->warp_size == 32 && head_dim <= 256;
     if (use_wave32) {
         const hip_bfloat16 *query_data =
             static_cast<const hip_bfloat16 *>(query->data);
