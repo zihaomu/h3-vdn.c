@@ -132,6 +132,28 @@ test and the public CLI. All 56 decoded video frames had distinct frame hashes;
 the decoded audio measured -27.5 dB mean and -14.5 dB peak, ruling out a frozen
 or silent container.
 
+The E2E test also accepts `VDN_E2E_FRAMES`, `VDN_E2E_LATENT_H`,
+`VDN_E2E_LATENT_W`, `VDN_E2E_AUDIO_LATENTS`, and `VDN_E2E_NFE` while retaining
+the fast 64x32 defaults. The stable-release production gate uses:
+
+```sh
+HIP_VISIBLE_DEVICES=0 \
+VDN_E2E_FRAMES=56 VDN_E2E_LATENT_H=32 VDN_E2E_LATENT_W=32 \
+VDN_E2E_AUDIO_LATENTS=93 VDN_E2E_NFE=8 \
+./h3_vdn_e2e_tests \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/prompts/example_0.safetensors \
+  outputs/vdn-e2e-production.mp4
+```
+
+Two consecutive production runs completed in 486.49 and 487.20 seconds. Both
+produced the same 2,315,918-byte, 56-frame 512x512 MP4 with SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+The denoised latent, decoded F32 video, PCM, RGB24, and final MP4 hashes all
+matched across runs; all 56 decoded frames were distinct and the audio measured
+-23.5 dB mean / -9.8 dB peak.
+
 With `--profile`, the HIP backend also reports weight-read/H2D throughput,
 command wait time, allocation/dispatch counters, and GPU event time for linear,
 SDPA, VDN solve, and VDN scan operations. On `gfx1201`, VDN window attention

@@ -305,6 +305,30 @@ gates, small 50-layer forward, and 1,774 host checks passed. The final native
 exact 73,528-byte MP4 and SHA-256. Its streams remain 56-frame H.264 at
 64x32/24 fps and stereo AAC at 32 kHz.
 
+### KEEP: parameterized production E2E release gate
+
+The native E2E harness now accepts requested frames, latent height/width, audio
+latents, and NFE through `VDN_E2E_*` variables, with overflow, even-canvas, NFE,
+and synchronized audio/video geometry validation. Its existing 64x32 defaults
+remain unchanged. It also reports FNV-1a hashes for denoised video/audio rows,
+decoded F32 video, decoded PCM, and RGB24 output.
+
+Two consecutive single-GPU runs used 56 requested frames, a 17x32x32 video
+latent, 93 audio latents, and 8 NFE. They completed in 486.49 and 487.20 seconds
+with roughly 873 MiB maximum host RSS. All five internal hashes matched:
+
+- video rows `e77bfd64f14b695c`
+- audio rows `bdde023376238608`
+- decoded video F32 `127cba9e701bb2c4`
+- decoded audio PCM `5cfe75130b41efad`
+- RGB24 `0338db1c620814e3`
+
+Both outputs were byte-identical 2,315,918-byte MP4 files with SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+`ffprobe` reports H.264, 56 frames, 512x512 at 24 fps, and stereo AAC at 32 kHz.
+All 56 decoded frame hashes were distinct; audio mean/peak volume was
+-23.5/-9.8 dB.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -337,6 +361,16 @@ HIP_VISIBLE_DEVICES=0 H3_PROFILE=1 \
   models/vdn-minimax-h3/h3-base \
   models/vdn-minimax-h3/stage-dmd-step-250 \
   models/vdn-minimax-h3/prompts/example_0.safetensors
+
+# Full stable-release production E2E (56 frames, 512x512, 8 NFE)
+HIP_VISIBLE_DEVICES=0 \
+  VDN_E2E_FRAMES=56 VDN_E2E_LATENT_H=32 VDN_E2E_LATENT_W=32 \
+  VDN_E2E_AUDIO_LATENTS=93 VDN_E2E_NFE=8 \
+  ./h3_vdn_e2e_tests \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/prompts/example_0.safetensors \
+  outputs/vdn-e2e-production.mp4
 ```
 
 For timing, alternate scalar and wave32 runs rather than executing all samples
