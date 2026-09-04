@@ -1548,7 +1548,7 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_scalar_kernel(
  * output dimensions per lane for the production D=128 shape. This removes the
  * two block-wide barriers at every reduction step in the scalar oracle. */
 template <bool fixed_d128, bool cache_query = false,
-          bool jump_mask_gaps = false>
+          bool jump_mask_gaps = false, bool distributed_softmax = false>
 __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         const hip_bfloat16 *query, const hip_bfloat16 *key,
         const hip_bfloat16 *value, hip_bfloat16 *output,
@@ -1682,7 +1682,8 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
             partial += __shfl_down(partial, offset, 32);
         float old_scale = 0.0f;
         float new_scale = 0.0f;
-        if (lane == 0) {
+        if constexpr (distributed_softmax) {
+            partial = __shfl(partial, 0, 32);
             float score = partial * scale;
             float next_max = fmaxf(running_max, score);
             old_scale = running_sum == 0.0f ? 0.0f :
@@ -1690,9 +1691,19 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
             new_scale = expf(score - next_max);
             running_sum = running_sum * old_scale + new_scale;
             running_max = next_max;
+        } else {
+            if (lane == 0) {
+                float score = partial * scale;
+                float next_max = fmaxf(running_max, score);
+                old_scale = running_sum == 0.0f ? 0.0f :
+                            expf(running_max - next_max);
+                new_scale = expf(score - next_max);
+                running_sum = running_sum * old_scale + new_scale;
+                running_max = next_max;
+            }
+            old_scale = __shfl(old_scale, 0, 32);
+            new_scale = __shfl(new_scale, 0, 32);
         }
-        old_scale = __shfl(old_scale, 0, 32);
-        new_scale = __shfl(new_scale, 0, 32);
         if constexpr (fixed_d128) {
 #pragma unroll
             for (uint32_t slot = 0; slot < 4; slot++) {
@@ -1728,7 +1739,7 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
 }
 
 template <bool fixed_d128, bool cache_query = false,
-          bool jump_mask_gaps = false>
+          bool jump_mask_gaps = false, bool distributed_softmax = false>
 static void h3_hip_launch_vdn_window_sdpa_bf16_wave32(
         hipStream_t stream, const hip_bfloat16 *query,
         const hip_bfloat16 *key, const hip_bfloat16 *value,
@@ -1738,7 +1749,7 @@ static void h3_hip_launch_vdn_window_sdpa_bf16_wave32(
         uint32_t chunk, int anchor_both, float scale) {
     hipLaunchKernelGGL(
         (h3_hip_vdn_window_sdpa_bf16_wave32_kernel<
-            fixed_d128, cache_query, jump_mask_gaps>),
+            fixed_d128, cache_query, jump_mask_gaps, distributed_softmax>),
         dim3(sequence, heads), dim3(32), 0, stream, query, key, value, output,
         sequence, heads, head_dim, video_start, video_end, frames,
         tokens_per_frame, radius, chunk, anchor_both, scale);
@@ -3877,6 +3888,9 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
     const char *scan_mask_value = std::getenv("H3_VDN_SCAN_MASK");
     int scan_mask = scan_mask_value && *scan_mask_value &&
         std::strcmp(scan_mask_value, "0");
+    const char *lane0_softmax_value = std::getenv("H3_VDN_LANE0_SOFTMAX");
+    int lane0_softmax = lane0_softmax_value && *lane0_softmax_value &&
+        std::strcmp(lane0_softmax_value, "0");
     int use_wave32 = gpu->warp_size == 32 && head_dim <= 256 &&
         !(scalar_value && *scalar_value && std::strcmp(scalar_value, "0"));
     if (use_wave32) {
@@ -3906,10 +3920,21 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
                     sequence, heads, head_dim, video_start, video_end, frames,
                     tokens_per_frame, radius, chunk, anchor_both, scale);
             } else {
-                h3_hip_launch_vdn_window_sdpa_bf16_wave32<true, true, true>(
-                    gpu->stream, query_data, key_data, value_data, output_data,
-                    sequence, heads, head_dim, video_start, video_end, frames,
-                    tokens_per_frame, radius, chunk, anchor_both, scale);
+                if (lane0_softmax) {
+                    h3_hip_launch_vdn_window_sdpa_bf16_wave32<
+                        true, true, true>(
+                        gpu->stream, query_data, key_data, value_data,
+                        output_data, sequence, heads, head_dim, video_start,
+                        video_end, frames, tokens_per_frame, radius, chunk,
+                        anchor_both, scale);
+                } else {
+                    h3_hip_launch_vdn_window_sdpa_bf16_wave32<
+                        true, true, true, true>(
+                        gpu->stream, query_data, key_data, value_data,
+                        output_data, sequence, heads, head_dim, video_start,
+                        video_end, frames, tokens_per_frame, radius, chunk,
+                        anchor_both, scale);
+                }
             }
         } else {
             h3_hip_launch_vdn_window_sdpa_bf16_wave32<false>(

@@ -262,6 +262,49 @@ comparison, and 1,774 host checks passed. The final 8-NFE dual-VAE/mux run took
 88.39 seconds under the then-current system load and reproduced the exact
 73,528-byte MP4 SHA-256.
 
+### REJECT: split full/window query launches
+
+The production query rows were split into three launches for the prefix plus
+first anchor, window-restricted middle frames, and last anchor plus suffix. This
+removed query-category and anchor branches while preserving each query's key
+and reduction order, but separating long and short rows lost useful scheduling
+overlap. Five crossed groups of five iterations regressed from a 0.638988-second
+median to 0.810594 seconds (+26.9%). Every output hash remained exact; the
+candidate and its diagnostic switch were removed without running the 50-layer
+gate.
+
+### KEEP: distributed wave online-softmax state
+
+After lane 0 finishes the dot-product reduction, the D=128 production kernel
+now broadcasts the score once. Every lane performs the same online-softmax
+max/sum update, so the value accumulators consume local scales instead of two
+separate wave shuffles from lane 0. The floating-point operation order is
+unchanged. `H3_VDN_LANE0_SOFTMAX=1` restores the previous path for same-binary
+A/B.
+
+Five crossed standalone groups of five production-shape iterations reduced the
+median from 0.638640 to 0.415342 seconds (-35.0%). All ten full-output hashes
+were `3d65eea81de34693`, and prefix/suffix, zero-prefix, one-token-per-frame, and
+both-gap boundary shapes were bitwise identical. The accepted code object uses
+34 VGPRs versus 31 for the legacy path, with no VGPR/SGPR spills and no private
+segment.
+
+On real weights, pipeline-staging samples had median SDPA event times of 18.834
+seconds for lane-0 softmax and 16.372 seconds for the distributed path (-13.1%).
+Median external wall time fell from 35.51 to 33.00 seconds (-7.1%), while the
+device peak remained 4.969 GiB and the 66.818 GiB payload was unchanged. Three
+distributed runs reproduced video/audio hashes `b3d3500676d3fb12` /
+`5fbd7afb3d78a277`. One legacy sample produced a transient different hash; one
+serial-staging and one additional pipeline legacy run both reproduced the
+baseline, and all candidate runs remained exact, so it was recorded but did not
+invalidate the candidate comparison.
+
+The default and cache-disabled real loaders, GPU operator/feature/solve/scan
+gates, small 50-layer forward, and 1,774 host checks passed. The final native
+8-NFE dual-VAE/mux acceptance completed in 74.71 seconds and reproduced the
+exact 73,528-byte MP4 and SHA-256. Its streams remain 56-frame H.264 at
+64x32/24 fps and stereo AAC at 32 kHz.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -303,7 +346,7 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 ## Next priorities
 
 1. Evaluate a tiled/matrix-instruction production SDPA kernel against the new
-   0.6401-second wave32 baseline, preserving the scalar oracle.
+   0.4153-second wave32 baseline, preserving the scalar oracle.
 2. Consider layer-level host prefetch only if it preserves bounded memory and
    improves on double-buffered per-tensor staging; do not pursue an explicit
    block workspace unless allocator behavior changes materially.

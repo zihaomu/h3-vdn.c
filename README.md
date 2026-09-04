@@ -139,16 +139,17 @@ uses a wave32 kernel with precomputed window bounds and a D=128 specialization;
 set `H3_VDN_SCALAR_SDPA=1` to restore the bitwise oracle. At the real
 512x512/56-frame token geometry, caching the invariant query values and jumping
 directly over masked video-key gaps reduced the crossed standalone median from
-0.6613 to 0.6401 seconds (-3.2%). Set `H3_VDN_RELOAD_QUERY=1` and
-`H3_VDN_SCAN_MASK=1` to restore the two legacy behaviors for exact A/B
-diagnosis. One complete
-50-layer profile measured 18.647 seconds of SDPA GPU time, versus 20.884 seconds
-before these additions, with no spills or change to the full-output hashes.
-The earlier specialization made the complete forward improve from 53.48 to
-37.42 seconds; total wall time remains sensitive to concurrent weight I/O,
-so kernel and GPU-event comparisons are reported separately. This is a
-single-NFE compute acceptance, not a production-resolution visual-quality or
-full mux benchmark. The method,
+0.6613 to 0.6401 seconds (-3.2%). The current kernel broadcasts the reduced
+score once and updates identical online-softmax state in every lane, replacing
+two scale shuffles and a lane-0-only branch without changing arithmetic order.
+Five crossed standalone groups reduced the median again from 0.6386 to 0.4153
+seconds (-35.0%); all hashes remained exact. `H3_VDN_RELOAD_QUERY=1`,
+`H3_VDN_SCAN_MASK=1`, and `H3_VDN_LANE0_SOFTMAX=1` restore the corresponding
+legacy behaviors for A/B diagnosis. On real weights, the latest 50-layer A/B
+reduced median SDPA event time from 18.834 to 16.372 seconds (-13.1%) and
+external wall time from 35.51 to 33.00 seconds (-7.1%), with the same 4.969 GiB
+peak, output hashes, and 66.818 GiB weight payload. This is a single-NFE compute
+acceptance, not a production-resolution visual-quality benchmark. The method,
 exact inputs, rejected candidates, and next priorities are recorded in
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
 
@@ -161,10 +162,10 @@ serialized loop automatically. On the production-token 50-layer forward, the
 crossed external wall-time median fell from 37.01 to 35.51 seconds (-4.1%) for
 the same 66.818 GiB weight payload, at a cost of about 8 MiB host RSS.
 Together with wave32 attention, the same 64x32/56-frame native E2E acceptance
-run fell from about 170.7 to 92.66 seconds. A low-contention attention-only
-follow-up completed in about 83.8 seconds; the final pipelined-staging acceptance
-took 88.39 seconds under heavier system load. Both reproduced the MP4 SHA-256
-above, while the isolated production A/B reports the staging gain.
+run fell from about 170.7 to 92.66 seconds. After pinned-buffer pipelining and
+distributed wave softmax, the latest run completed in 74.71 seconds. Every
+acceptance reproduced the exact 73,528-byte MP4 SHA-256 above; isolated crossed
+A/B results are used for individual optimization claims.
 
 ### Current OpenVDN scope
 
