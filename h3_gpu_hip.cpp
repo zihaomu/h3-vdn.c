@@ -20,7 +20,13 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <pthread.h>
 #include <unistd.h>
+
+struct h3_gpu_staging {
+    void *data;
+    h3_gpu_staging *next;
+};
 
 struct h3_gpu {
     int device;
@@ -49,6 +55,13 @@ struct h3_gpu {
     double profile_load_upload_seconds;
     uint64_t profile_load_read_bytes;
     uint64_t profile_load_upload_bytes;
+    pthread_mutex_t staging_lock;
+    int staging_lock_initialized;
+    int staging_cache_enabled;
+    h3_gpu_staging *staging_ready;
+    size_t staging_ready_count;
+    uint64_t staging_hits;
+    uint64_t staging_misses;
 };
 
 struct h3_gpu_tensor {
@@ -90,6 +103,66 @@ static size_t h3_gpu_dtype_size(h3_gpu_dtype dtype) {
         case H3_GPU_U32: return sizeof(uint32_t);
     }
     return 0;
+}
+
+static void *h3_gpu_acquire_staging(h3_gpu *gpu, size_t bytes) {
+    if (gpu->staging_cache_enabled) {
+        (void)pthread_mutex_lock(&gpu->staging_lock);
+        h3_gpu_staging *item = gpu->staging_ready;
+        if (item) {
+            gpu->staging_ready = item->next;
+            gpu->staging_ready_count--;
+            gpu->staging_hits++;
+            (void)pthread_mutex_unlock(&gpu->staging_lock);
+            void *data = item->data;
+            std::free(item);
+            return data;
+        }
+        gpu->staging_misses++;
+        (void)pthread_mutex_unlock(&gpu->staging_lock);
+    }
+    void *data = nullptr;
+    if (!h3_gpu_check(gpu, hipHostMalloc(&data, bytes),
+                      "hipHostMalloc weight staging")) return nullptr;
+    return data;
+}
+
+static void h3_gpu_release_staging(h3_gpu *gpu, void *data) {
+    constexpr size_t max_ready = 32;
+    if (!data) return;
+    if (gpu->staging_cache_enabled) {
+        h3_gpu_staging *item = static_cast<h3_gpu_staging *>(
+            std::malloc(sizeof(*item)));
+        if (item) {
+            item->data = data;
+            (void)pthread_mutex_lock(&gpu->staging_lock);
+            if (gpu->staging_ready_count < max_ready) {
+                item->next = gpu->staging_ready;
+                gpu->staging_ready = item;
+                gpu->staging_ready_count++;
+                (void)pthread_mutex_unlock(&gpu->staging_lock);
+                return;
+            }
+            (void)pthread_mutex_unlock(&gpu->staging_lock);
+            std::free(item);
+        }
+    }
+    (void)hipHostFree(data);
+}
+
+static void h3_gpu_purge_staging(h3_gpu *gpu) {
+    if (!gpu || !gpu->staging_lock_initialized) return;
+    (void)pthread_mutex_lock(&gpu->staging_lock);
+    h3_gpu_staging *item = gpu->staging_ready;
+    gpu->staging_ready = nullptr;
+    gpu->staging_ready_count = 0;
+    (void)pthread_mutex_unlock(&gpu->staging_lock);
+    while (item) {
+        h3_gpu_staging *next = item->next;
+        (void)hipHostFree(item->data);
+        std::free(item);
+        item = next;
+    }
 }
 
 enum h3_gpu_profile_category {
@@ -253,7 +326,7 @@ static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
     constexpr double gib = 1024.0 * 1024.0 * 1024.0;
     std::fprintf(stderr,
         "h3 profile: %-20s %-14s read=%8.3fs (%7.3fGiB, %6.2fGiB/s) "
-        "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s)\n",
+        "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s) staging-hit=%llu/%llu\n",
         gpu->profile_label[0] ? gpu->profile_label : "HIP context",
         "weight-load", gpu->profile_load_read_seconds,
         static_cast<double>(gpu->profile_load_read_bytes) / gib,
@@ -264,7 +337,10 @@ static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
         static_cast<double>(gpu->profile_load_upload_bytes) / gib,
         gpu->profile_load_upload_seconds > 0.0 ?
             static_cast<double>(gpu->profile_load_upload_bytes) / gib /
-                gpu->profile_load_upload_seconds : 0.0);
+                gpu->profile_load_upload_seconds : 0.0,
+        static_cast<unsigned long long>(gpu->staging_hits),
+        static_cast<unsigned long long>(gpu->staging_hits +
+                                        gpu->staging_misses));
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *gpu, const void *values,
@@ -377,10 +453,9 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
     }
 
     constexpr size_t chunk_capacity = 8 * 1024 * 1024;
-    void *staging = nullptr;
     h3_gpu *gpu = tensor->owner;
-    if (!h3_gpu_check(gpu, hipHostMalloc(&staging, chunk_capacity),
-                      "hipHostMalloc weight staging")) {
+    void *staging = h3_gpu_acquire_staging(gpu, chunk_capacity);
+    if (!staging) {
         close(descriptor);
         if (error && error_size)
             std::snprintf(error, error_size, "%s", gpu->error);
@@ -409,7 +484,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                               got < 0 ? std::strerror(errno)
                                       : "unexpected end of file");
             }
-            (void)hipHostFree(staging);
+            h3_gpu_release_staging(gpu, staging);
             close(descriptor);
             return 0;
         }
@@ -425,7 +500,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                           "hipStreamSynchronize weight upload")) {
             if (error && error_size)
                 std::snprintf(error, error_size, "%s", gpu->error);
-            (void)hipHostFree(staging);
+            h3_gpu_release_staging(gpu, staging);
             close(descriptor);
             return 0;
         }
@@ -436,7 +511,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
         completed += static_cast<size_t>(got);
     }
 
-    (void)hipHostFree(staging);
+    h3_gpu_release_staging(gpu, staging);
     close(descriptor);
     return 1;
 }
@@ -2074,6 +2149,17 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
                           "out of memory creating HIP context");
         return nullptr;
     }
+    if (pthread_mutex_init(&gpu->staging_lock, nullptr) != 0) {
+        if (error && error_size)
+            std::snprintf(error, error_size,
+                          "cannot initialize HIP staging-cache lock");
+        std::free(gpu);
+        return nullptr;
+    }
+    gpu->staging_lock_initialized = 1;
+    const char *staging_value = std::getenv("H3_HIP_STAGING_CACHE");
+    gpu->staging_cache_enabled =
+        !(staging_value && !std::strcmp(staging_value, "0"));
     hipError_t status = hipGetDevice(&gpu->device);
     if (status == hipSuccess)
         status = hipStreamCreateWithFlags(&gpu->stream, hipStreamNonBlocking);
@@ -2081,6 +2167,7 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
         if (error && error_size)
             std::snprintf(error, error_size, "cannot create HIP context: %s",
                           hipGetErrorString(status));
+        (void)pthread_mutex_destroy(&gpu->staging_lock);
         std::free(gpu);
         return nullptr;
     }
@@ -2097,6 +2184,7 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
                           rocblas_status_to_string(blas_status));
         if (gpu->blas) (void)rocblas_destroy_handle(gpu->blas);
         (void)hipStreamDestroy(gpu->stream);
+        (void)pthread_mutex_destroy(&gpu->staging_lock);
         std::free(gpu);
         return nullptr;
     }
@@ -2119,8 +2207,11 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_emit_ops(gpu);
     h3_gpu_profile_emit_load(gpu);
     h3_gpu_profile_destroy_events(gpu);
+    h3_gpu_purge_staging(gpu);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);
+    if (gpu->staging_lock_initialized)
+        (void)pthread_mutex_destroy(&gpu->staging_lock);
     std::free(gpu);
 }
 

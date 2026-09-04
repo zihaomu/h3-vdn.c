@@ -142,6 +142,12 @@ microbenchmark results, not a production-resolution throughput claim. The
 method, exact inputs, rejected candidates, and next priorities are recorded in
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
 
+HIP weight streaming also reuses a thread-safe 8 MiB pinned staging buffer by
+default, avoiding page-lock/unlock for every tensor. Set
+`H3_HIP_STAGING_CACHE=0` for the old allocation lifecycle when diagnosing I/O.
+Together with wave32 attention, the same 64x32/56-frame native E2E acceptance
+run fell from about 170.7 to 95.95 seconds and reproduced the MP4 SHA-256 above.
+
 ### Current OpenVDN scope
 
 The validated MVP intentionally keeps a narrow correctness surface:
@@ -613,6 +619,10 @@ converted `prompts/example_0.safetensors`. `vdn-e2e-test` injects the
 project-local FFmpeg library path itself and writes
 `outputs/vdn-e2e-smoke.mp4`. The full denoise test performs 400 real transformer
 block evaluations and is not a quick unit test.
+
+`make BACKEND=hip h3_vdn_sdpa_bench` builds the standalone window-attention
+benchmark. Its default arguments model the 512x512/56-frame VDN geometry;
+`H3_VDN_SCALAR_SDPA=1 ./h3_vdn_sdpa_bench` runs the scalar oracle.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and

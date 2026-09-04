@@ -73,6 +73,13 @@ in 141.72 seconds and reproduced the existing MP4 SHA-256 exactly:
 The container contains 56 H.264 frames at 64x32/24 fps and stereo AAC at
 32 kHz.
 
+A standalone production-length benchmark covers the 512x512/56-frame attention
+geometry: sequence 5338, video start 986, 17 latent frames, and 256 video tokens
+per frame. Three crossed samples produced scalar times of 4.709, 5.756, and
+4.740 seconds (median 4.740) versus wave32 averages of 0.8280, 0.8277, and
+0.8295 seconds (median 0.8280), a 5.72x kernel speedup. All six runs hashed the
+complete 38,262,784-element BF16 output to `3d65eea81de34693`.
+
 ### REJECT: two-buffer weight upload pipeline
 
 A two-buffer 8 MiB pipeline overlapped `pread` with H2D copies and preserved
@@ -87,6 +94,33 @@ Combining POTRF/POTRI info readback reduced two synchronization points to one,
 but crossed profiles were indistinguishable: 12.637 s deferred versus 12.599 s
 eager, and solve GPU time was 0.369 versus 0.373 s. It also weakened failure
 ordering by submitting POTRI before confirming POTRF. The code was removed.
+
+### REJECT: transparent exact-size allocation pool
+
+A 3 GiB exact-size device allocation pool recorded 4,965 reuse hits during one
+50-layer forward. Three crossed samples had medians of 13.41 seconds without
+the pool and 13.33 seconds with it, only 0.6% apart, while the pool retained the
+full 3.0 GiB limit. The memory cost and lifetime/locking complexity are not
+justified by a sub-noise result, so the implementation and opt-out were removed.
+
+### KEEP: persistent pinned weight staging
+
+Weight reads still use the original 8 MiB chunks and preserve their ordering,
+but a thread-safe per-context cache now recycles the pinned staging buffer
+instead of calling `hipHostMalloc`/`hipHostFree` for every tensor. It retains at
+most 32 buffers for concurrent loaders; the sequential VDN path uses one, so
+the observed pinned-memory cost is 8 MiB. `H3_HIP_STAGING_CACHE=0` restores the
+old lifecycle.
+
+Three crossed 50-layer samples produced 13.83, 13.90, and 12.81 seconds without
+the cache (median 13.83) versus 12.49, 12.51, and 12.41 seconds with it (median
+12.49), a 9.7% reduction. The cache recorded 2,579 hits in 2,580 acquisitions.
+Disk and H2D payloads are unchanged, and all runs retained both output hashes.
+The full 8-NFE VAE/mux test fell from 141.72 seconds on the wave32-only commit
+to 95.95 seconds with staging reuse (-32.3%), and from the original 170.7-second
+acceptance baseline by about 43.8%. Maximum host RSS increased from roughly
+652 MiB to 660 MiB, matching one retained staging buffer. The MP4 SHA-256 and
+stream metadata remained identical.
 
 ## Test gates
 
@@ -107,6 +141,10 @@ HIP_VISIBLE_DEVICES=0 VDN_SMOKE_COMPARE_SDPA=1 \
   models/vdn-minimax-h3/h3-base \
   models/vdn-minimax-h3/stage-dmd-step-250 \
   models/vdn-minimax-h3/prompts/example_0.safetensors
+
+# 512x512 / 56-frame attention geometry; add H3_VDN_SCALAR_SDPA=1 for oracle
+make BACKEND=hip h3_vdn_sdpa_bench
+HIP_VISIBLE_DEVICES=0 ./h3_vdn_sdpa_bench
 ```
 
 For timing, alternate scalar and wave32 runs rather than executing all samples
@@ -117,10 +155,12 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
 1. Profile production sequence lengths; determine when scalar, wave, or a tiled
    matrix-instruction kernel wins.
-2. Replace per-block activation allocation with a shape-keyed workspace only if
-   allocation count and wall time both improve without increasing peak memory.
-3. Evaluate a persistent weight FD/staging cache. Do not revive per-tensor
-   events or page-lock the entire streamed model.
+2. Replace per-block activation allocation with an explicit block workspace
+   only if allocation count and wall time both improve without increasing peak
+   memory; a transparent 3 GiB allocation pool has already been rejected.
+3. Extend the retained fixed-size staging cache with an FD cache only if a
+   separate A/B shows benefit. Do not revive per-tensor events or page-lock the
+   entire streamed model.
 4. Fuse the bidirectional scan launches, preserving the CPU oracle.
 5. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
    perceptual output gates before making reduced precision the default.
