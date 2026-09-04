@@ -452,6 +452,38 @@ MP4 SHA-256 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`,
 and ffprobe all passed. A separate smoke run forced the scalar fallback and
 reproduced decoded-F32 hash `4e1406b60b207415`.
 
+### REJECT: exact LDS-tiled BF16/D128 VDN SDPA
+
+An opt-in experiment grouped eight same-frame queries in one 256-thread block
+and shared eight D=128 K/V rows through 4 KiB of LDS. Every wave retained the
+default QK reduction tree, online-softmax key order, and PV update order.
+Whole key tiles outside the common VDN mask were skipped. Five same-process,
+crossed production-geometry groups appeared positive in isolation: the
+default median was 0.413741 seconds and the tiled median was 0.397547 seconds
+(-3.91%, 1.041x), with zero mismatches across every BF16 output. Prefix,
+suffix, frame-size, and query/key tail fixtures also matched exactly.
+
+The required real-weight gate reversed that result:
+
+| 50-layer production-token metric | Default mean | LDS tile mean | Change |
+|---|---:|---:|---:|
+| SDPA event time | 16.2315 s | 19.5890 s | +20.69% |
+| Forward wall | 30.398459 s | 33.825738 s | +11.27% |
+| Output hashes | `b3d350...fb12` / `5fbd7a...a277` | identical | exact |
+| Peak live GPU allocation | 4.969 GiB | 4.969 GiB | unchanged |
+
+The crossed order reproduced the regression, while read/H2D payload and times
+were effectively unchanged. The standalone synthetic residency/cache context
+therefore did not predict sustained layer execution. The candidate and its
+environment switch were removed; the existing one-wave exact kernel remains
+the default.
+
+ROCm exposes the gfx12 BF16 intrinsic
+`wmma_f32_16x16x16_bf16_w32_gfx12`, but its 16-wide matrix accumulation cannot
+preserve the scalar D=128 reduction tree. A WMMA candidate is consequently not
+eligible for the exact BF16 default track and moves to the explicitly
+non-bitwise SageAttention/low-precision research gate instead.
+
 ## Test gates
 
 Build and run the local gates with:
