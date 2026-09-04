@@ -62,6 +62,9 @@ struct h3_gpu {
     size_t staging_ready_count;
     uint64_t staging_hits;
     uint64_t staging_misses;
+    hipEvent_t staging_copy_start[2];
+    hipEvent_t staging_copy_end[2];
+    int staging_events_initialized;
 };
 
 struct h3_gpu_tensor {
@@ -163,6 +166,60 @@ static void h3_gpu_purge_staging(h3_gpu *gpu) {
         std::free(item);
         item = next;
     }
+}
+
+static int h3_gpu_init_staging_events(h3_gpu *gpu) {
+    if (gpu->staging_events_initialized) return 1;
+    for (unsigned slot = 0; slot < 2; slot++) {
+        if (!h3_gpu_check(gpu, hipEventCreate(&gpu->staging_copy_start[slot]),
+                          "hipEventCreate staging start") ||
+            !h3_gpu_check(gpu, hipEventCreate(&gpu->staging_copy_end[slot]),
+                          "hipEventCreate staging end")) {
+            for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+                if (gpu->staging_copy_start[cleanup])
+                    (void)hipEventDestroy(gpu->staging_copy_start[cleanup]);
+                if (gpu->staging_copy_end[cleanup])
+                    (void)hipEventDestroy(gpu->staging_copy_end[cleanup]);
+                gpu->staging_copy_start[cleanup] = nullptr;
+                gpu->staging_copy_end[cleanup] = nullptr;
+            }
+            return 0;
+        }
+    }
+    gpu->staging_events_initialized = 1;
+    return 1;
+}
+
+static void h3_gpu_destroy_staging_events(h3_gpu *gpu) {
+    if (!gpu) return;
+    for (unsigned slot = 0; slot < 2; slot++) {
+        if (gpu->staging_copy_start[slot])
+            (void)hipEventDestroy(gpu->staging_copy_start[slot]);
+        if (gpu->staging_copy_end[slot])
+            (void)hipEventDestroy(gpu->staging_copy_end[slot]);
+    }
+    gpu->staging_events_initialized = 0;
+}
+
+static int h3_gpu_finish_staging_copy(h3_gpu *gpu, unsigned slot,
+                                      size_t *pending_bytes, int profile) {
+    if (!*pending_bytes) return 1;
+    if (!h3_gpu_check(gpu, hipEventSynchronize(gpu->staging_copy_end[slot]),
+                      "hipEventSynchronize weight upload")) return 0;
+    if (profile) {
+        float milliseconds = 0.0f;
+        if (!h3_gpu_check(
+                gpu, hipEventElapsedTime(&milliseconds,
+                                         gpu->staging_copy_start[slot],
+                                         gpu->staging_copy_end[slot]),
+                "hipEventElapsedTime weight upload")) return 0;
+        gpu->profile_load_upload_seconds +=
+            static_cast<double>(milliseconds) / 1000.0;
+        gpu->profile_load_upload_bytes +=
+            static_cast<uint64_t>(*pending_bytes);
+    }
+    *pending_bytes = 0;
+    return 1;
 }
 
 enum h3_gpu_profile_category {
@@ -465,6 +522,71 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
     size_t completed = 0;
     size_t bytes = tensor->bytes;
     int profile = h3_gpu_profile_enabled();
+    const char *serial_value = std::getenv("H3_HIP_SERIAL_STAGING");
+    int serial = !gpu->staging_cache_enabled ||
+        (serial_value && *serial_value && std::strcmp(serial_value, "0"));
+    if (!serial && bytes > chunk_capacity) {
+        void *staging_pair[2] = {
+            staging, h3_gpu_acquire_staging(gpu, chunk_capacity)
+        };
+        size_t pending_bytes[2] = {0, 0};
+        int ok = staging_pair[1] && h3_gpu_init_staging_events(gpu);
+        unsigned slot = 0;
+        while (ok && completed < bytes) {
+            ok = h3_gpu_finish_staging_copy(
+                gpu, slot, &pending_bytes[slot], profile);
+            if (!ok) break;
+            size_t request = bytes - completed;
+            if (request > chunk_capacity) request = chunk_capacity;
+            ssize_t got;
+            double read_start = profile ? h3_gpu_now() : 0.0;
+            do {
+                got = pread(descriptor, staging_pair[slot], request,
+                            static_cast<off_t>(file_offset + completed));
+            } while (got < 0 && errno == EINTR);
+            if (profile && got > 0) {
+                gpu->profile_load_read_seconds += h3_gpu_now() - read_start;
+                gpu->profile_load_read_bytes += static_cast<uint64_t>(got);
+            }
+            if (got <= 0) {
+                if (error && error_size)
+                    std::snprintf(error, error_size, "cannot read %s: %s",
+                                  path, got < 0 ? std::strerror(errno) :
+                                                 "unexpected end of file");
+                ok = 0;
+                break;
+            }
+            unsigned char *destination =
+                static_cast<unsigned char *>(tensor->data) + completed;
+            ok = h3_gpu_check(
+                     gpu, hipEventRecord(gpu->staging_copy_start[slot],
+                                         gpu->stream),
+                     "hipEventRecord weight upload start") &&
+                 h3_gpu_check(
+                     gpu, hipMemcpyAsync(destination, staging_pair[slot],
+                                         static_cast<size_t>(got),
+                                         hipMemcpyHostToDevice, gpu->stream),
+                     "hipMemcpyAsync file-to-device") &&
+                 h3_gpu_check(
+                     gpu, hipEventRecord(gpu->staging_copy_end[slot],
+                                         gpu->stream),
+                     "hipEventRecord weight upload end");
+            if (!ok) break;
+            pending_bytes[slot] = static_cast<size_t>(got);
+            completed += static_cast<size_t>(got);
+            slot ^= 1;
+        }
+        for (unsigned finish = 0; finish < 2; finish++)
+            if (!h3_gpu_finish_staging_copy(
+                    gpu, finish, &pending_bytes[finish], profile)) ok = 0;
+        if (!ok) (void)hipStreamSynchronize(gpu->stream);
+        h3_gpu_release_staging(gpu, staging_pair[1]);
+        h3_gpu_release_staging(gpu, staging_pair[0]);
+        close(descriptor);
+        if (!ok && error && error_size && !error[0])
+            std::snprintf(error, error_size, "%s", gpu->error);
+        return ok;
+    }
     while (completed < bytes) {
         size_t request = bytes - completed;
         if (request > chunk_capacity) request = chunk_capacity;
@@ -2325,6 +2447,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_emit_ops(gpu);
     h3_gpu_profile_emit_load(gpu);
     h3_gpu_profile_destroy_events(gpu);
+    h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);

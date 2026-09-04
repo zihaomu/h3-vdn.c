@@ -215,6 +215,53 @@ traffic reduced weight-read throughput to 3.74 GiB/s. The final native 8-NFE,
 dual-VAE, mux acceptance completed in about 83.8 seconds and reproduced the
 exact 73,528-byte MP4 and SHA-256 above.
 
+### REJECT: multiple head waves per workgroup
+
+Packing adjacent heads for the same query into one workgroup appeared highly
+effective on the synthetic benchmark: a final crossed 1-versus-16-wave median
+fell from 0.644220 to 0.397790 seconds (-38.25%), with bitwise-identical output.
+The 512-thread kernel used 35 VGPRs, no spills or private segment, and reported
+occupancy 16. Real weights reversed the result. After a profile mark excluded
+prompt/setup operations, the same-process production 50-layer comparison was
+19.409 seconds of SDPA and 34.851 seconds wall for one wave, versus 19.973 and
+35.447 seconds for 16 waves (+2.91% SDPA, +1.71% wall). Both full outputs were
+bitwise identical. Real-model data takes precedence, so every candidate kernel,
+environment switch, and comparison hook was removed.
+
+### REJECT: staging chunk-size sweep and explicit block workspace
+
+A real block-0 plus top-level/refiner loader streamed 2.946 GiB per run while
+sweeping 4, 8, 16, 32, 64, and 128 MiB pinned chunks. The 8/16 MiB cases read
+at roughly 13.2--13.4 GiB/s; 32/64/128 MiB fell to roughly 12.4/10.5/10.0
+GiB/s, while RSS rose from about 427 to 550 MiB. Four MiB matched 8 MiB reads
+but was slightly slower for upload. The fixed 8 MiB chunk remains the best
+tradeoff; the temporary sizing code was removed.
+
+A `rocprofv3` HIP-runtime trace measured 5,217 `hipMalloc` and 5,217 `hipFree`
+calls in a complete small forward. They totaled only 105.7 and 147.5 ms. The
+call count is shape-independent, putting the production workspace's theoretical
+upper bound below 1% of wall time. This confirms the earlier allocation-pool
+rejection, so a large explicit block-workspace refactor was not implemented.
+
+### KEEP: double-buffered weight staging
+
+Weights spanning multiple 8 MiB chunks now alternate between two cached pinned
+buffers. Per-buffer HIP events prevent reuse before completion, allowing the
+next `pread` to overlap the previous H2D copy on the existing single GPU stream.
+Timing-enabled events keep upload profiling meaningful. Small tensors retain
+the one-buffer path; `H3_HIP_SERIAL_STAGING=1` restores it for same-binary A/B,
+and disabling the staging cache automatically selects serialized behavior.
+
+On production geometry, three crossed external wall samples had medians of
+37.01 seconds serialized and 35.51 seconds pipelined (-4.05%). Internal profile
+wall medians were 36.163 and 34.288 seconds (-5.19%). The payload remained
+66.818 GiB, device peak stayed 4.969 GiB, host RSS rose by only 8--9 MiB, and
+every video/audio hash stayed `b3d3500676d3fb12` / `5fbd7afb3d78a277`.
+Default and cache-disabled loader paths, all GPU operator gates, scalar/wave32
+comparison, and 1,774 host checks passed. The final 8-NFE dual-VAE/mux run took
+88.39 seconds under the then-current system load and reproduced the exact
+73,528-byte MP4 SHA-256.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -257,9 +304,9 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
 1. Evaluate a tiled/matrix-instruction production SDPA kernel against the new
    0.6401-second wave32 baseline, preserving the scalar oracle.
-2. Replace per-block activation allocation with an explicit block workspace
-   only if allocation count and wall time both improve without increasing peak
-   memory; a transparent 3 GiB allocation pool has already been rejected.
+2. Consider layer-level host prefetch only if it preserves bounded memory and
+   improves on double-buffered per-tensor staging; do not pursue an explicit
+   block workspace unless allocator behavior changes materially.
 3. Do not add an FD-only cache: its crossed A/B improved the median by just
    0.8%. Further I/O work must reduce the 66.8 GiB payload itself. Do not revive
    per-tensor events or page-lock the entire streamed model.

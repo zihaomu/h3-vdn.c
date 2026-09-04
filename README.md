@@ -152,12 +152,19 @@ full mux benchmark. The method,
 exact inputs, rejected candidates, and next priorities are recorded in
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
 
-HIP weight streaming also reuses a thread-safe 8 MiB pinned staging buffer by
-default, avoiding page-lock/unlock for every tensor. Set
-`H3_HIP_STAGING_CACHE=0` for the old allocation lifecycle when diagnosing I/O.
+HIP weight streaming also reuses thread-safe 8 MiB pinned staging buffers,
+avoiding page-lock/unlock for every tensor. Tensors larger than one chunk use
+two buffers so the next `pread` overlaps the preceding asynchronous H2D copy;
+`H3_HIP_SERIAL_STAGING=1` restores the old serialized transfer loop. Setting
+`H3_HIP_STAGING_CACHE=0` restores the old allocation lifecycle and selects the
+serialized loop automatically. On the production-token 50-layer forward, the
+crossed external wall-time median fell from 37.01 to 35.51 seconds (-4.1%) for
+the same 66.818 GiB weight payload, at a cost of about 8 MiB host RSS.
 Together with wave32 attention, the same 64x32/56-frame native E2E acceptance
-run fell from about 170.7 to 92.66 seconds; the latest single-card run completed
-in about 83.8 seconds and reproduced the MP4 SHA-256 above.
+run fell from about 170.7 to 92.66 seconds. A low-contention attention-only
+follow-up completed in about 83.8 seconds; the final pipelined-staging acceptance
+took 88.39 seconds under heavier system load. Both reproduced the MP4 SHA-256
+above, while the isolated production A/B reports the staging gain.
 
 ### Current OpenVDN scope
 
