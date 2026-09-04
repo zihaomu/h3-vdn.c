@@ -1,21 +1,57 @@
 # h3.c
 
-Native MiniMax-H3 inference for Apple Silicon and native OpenVDN MiniMax-H3
-inference for AMD ROCm on Linux.
+## OpenVDN MiniMax-H3 on AMD ROCm — v0.1.0 stable
 
-The original MiniMax-H3 path supports prompt-to-video/audio, first/last-frame
-conditioning, and ordered Ref2VA image/video/audio references end to end on
-Metal. The OpenVDN path loads the Diffusers-format `h3-base` plus
-`stage-dmd-step-250`, merges its default and turbo LoRA adapters, streams all 50
-hybrid-attention blocks through one discrete GPU, and decodes synchronized video
-and audio on HIP.
+The primary work on the `vdn-h3-rocm` branch is a native C/C++ HIP port of
+[OpenVDN VDN-Minimax-H3](https://github.com/OpenVDN/vdn-minimax-h3). It runs the
+released `h3-base` and `stage-dmd-step-250` checkpoint end to end on one AMD
+GPU: default and turbo LoRA merge, all 50 hybrid-attention blocks for each of 8
+NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 
-| Path | Host/backend | Prompt input | Status |
-|---|---|---|---|
-| MiniMax-H3 FL2VA/Ref2VA | macOS, Metal | Raw text with optional media references | End to end |
-| OpenVDN `stage-dmd-step-250` | Linux, ROCm/HIP | Pre-encoded prompt safetensors | v0.1.0 stable scope validated |
+### What this port delivers
 
-## OpenVDN on Linux/ROCm
+| Area | Implemented and validated result |
+|---|---|
+| Native ROCm execution | HIP kernels plus rocBLAS/rocSOLVER; no CUDA runtime in the VDN inference path |
+| Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
+| VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
+| Hybrid attention | Window softmax plus VDN linear branch, with an optimized `gfx1201` wave32 path and scalar correctness fallback |
+| Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline, with diagnostic legacy fallbacks |
+| Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
+| Determinism | 26-run attention/staging stress matrix and two byte-identical production E2E renders |
+| Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
+
+The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
+32 kHz audio, and one GPU. Two consecutive runs produced byte-identical
+2,315,918-byte MP4 files with SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+Their denoised latent, decoded F32 video, PCM, and RGB24 hashes also matched.
+
+### ROCm compatibility
+
+| Target | Status | Evidence |
+|---|---|---|
+| Radeon AI PRO R9700 / `gfx1201`, ROCm 7.2.3 | **Stable, runtime tested** | Clean build, wave32/scalar parity, 50-layer stress, and production E2E |
+| `gfx90a`, `gfx942`, `gfx1030`, `gfx1100`, `gfx1151` | Compile-only | Complete HIP translation unit builds; runtime remains unvalidated |
+| Other ROCm targets | Unsupported | No build or runtime evidence |
+
+The v0.1.0 stable guarantee is deliberately precise: Linux, one selected
+`gfx1201` GPU, ROCm 7.2.3, `stage-dmd-step-250`, and `--prompt-embeds` input.
+The OpenVDN checkpoint omits its approximately 62 GB Qwen3-VL-32B prompt
+conditioner, so raw text is encoded with the pinned upstream preprocessing
+environment. OpenVDN also defines no first/last-frame or ordered-media input;
+those flags fail early and direct users to the separate MiniMax-H3
+FL2VA/Ref2VA path instead of silently applying incompatible model semantics.
+
+See the [stable release evidence](doc/VDN_ROCM_STABLE_RELEASE.md) and the
+[implementation and optimization ledger](doc/VDN_ROCM_OPTIMIZATION.md) for
+commands, hashes, benchmarks, fallbacks, and known limitations.
+
+The repository also retains native MiniMax-H3 inference on Apple Silicon. That
+Metal path supports raw prompt-to-video/audio, first/last-frame conditioning,
+and ordered Ref2VA image/video/audio references end to end.
+
+## Build and run OpenVDN on Linux/ROCm
 
 ### Requirements and pinned release
 
@@ -225,24 +261,8 @@ The first stable release intentionally keeps a narrow correctness surface:
 - VDN execution is HIP-only. The separate original MiniMax-H3 Metal path and
   its CLI behavior remain available on macOS.
 
-ROCm support is intentionally stated as a tested matrix:
-
-| Target | Status | Evidence |
-|---|---|---|
-| R9700 / `gfx1201`, ROCm 7.2.3 | Tested | Clean build, scalar/wave32 parity, 50-layer stress, and production E2E |
-| `gfx90a`, `gfx942`, `gfx1030`, `gfx1100`, `gfx1151` | Compile-only | HIP translation unit builds; runtime is unvalidated |
-| Other ROCm targets | Unsupported | No build or runtime evidence |
-
-The first stable release guarantees one selected `gfx1201` GPU. Wave32 is
-selected only when the runtime reports a 32-lane wave and the shape is eligible;
-`H3_VDN_SCALAR_SDPA=1` forces the correctness fallback.
-
-The repository performance ledger is
-[`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md). The broader
-workspace implementation and acceptance plan remains in
-`../doc/vdn-minimax-h3-implementation-plan.md`.
-Release evidence and known limitations are summarized in
-[`doc/VDN_ROCM_STABLE_RELEASE.md`](doc/VDN_ROCM_STABLE_RELEASE.md).
+The compatibility matrix and release-document links are kept at the top of
+this README so the tested boundary is visible before the detailed tutorials.
 
 ## MiniMax-H3 Metal tutorial
 
