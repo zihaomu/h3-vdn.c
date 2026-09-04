@@ -1425,7 +1425,8 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_scalar_kernel(
 /* gfx12 executes wave32. One wave handles a query/head pair and keeps four
  * output dimensions per lane for the production D=128 shape. This removes the
  * two block-wide barriers at every reduction step in the scalar oracle. */
-template <bool fixed_d128>
+template <bool fixed_d128, bool cache_query = false,
+          bool jump_mask_gaps = false>
 __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         const hip_bfloat16 *query, const hip_bfloat16 *key,
         const hip_bfloat16 *value, hip_bfloat16 *output,
@@ -1447,6 +1448,13 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         accumulators[slot] = 0.0f;
     float running_max = -INFINITY;
     float running_sum = 0.0f;
+    float cached_query[4];
+    if constexpr (fixed_d128 && cache_query) {
+#pragma unroll
+        for (uint32_t slot = 0; slot < 4; slot++)
+            cached_query[slot] = static_cast<float>(
+                query[query_base + lane + slot * 32]);
+    }
     int restrict_video_keys =
         query_row >= video_start && query_row < video_end;
     uint32_t window_start = video_start;
@@ -1482,27 +1490,46 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
         }
     }
     for (uint32_t key_row = 0; key_row < sequence; key_row++) {
-        if (restrict_video_keys && key_row >= video_start &&
-            key_row < video_end &&
-            (key_row < window_start || key_row >= window_end) &&
-            (!anchor_both ||
-             (key_row >= video_start + tokens_per_frame &&
-              key_row < video_end - tokens_per_frame))) continue;
+        if constexpr (jump_mask_gaps) {
+            /* With both endpoint frames anchored, allowed video keys are the
+             * ordered union of first anchor, window, and last anchor. Jump
+             * over the two possible gaps without changing reduction order. */
+            if (restrict_video_keys) {
+                uint32_t interior_start = video_start + tokens_per_frame;
+                uint32_t interior_end = video_end - tokens_per_frame;
+                if (key_row == interior_start &&
+                    window_start > interior_start)
+                    key_row = window_start;
+                else if (key_row == window_end && window_end < interior_end)
+                    key_row = interior_end;
+            }
+        } else {
+            if (restrict_video_keys && key_row >= video_start &&
+                key_row < video_end &&
+                (key_row < window_start || key_row >= window_end) &&
+                (!anchor_both ||
+                 (key_row >= video_start + tokens_per_frame &&
+                  key_row < video_end - tokens_per_frame))) continue;
+        }
         size_t key_base = static_cast<size_t>(key_row) * inner +
                           static_cast<size_t>(head) * head_dim;
         float partial = 0.0f;
         if constexpr (fixed_d128) {
             float product0 = fmaf(
-                static_cast<float>(query[query_base + lane]),
+                cache_query ? cached_query[0] :
+                    static_cast<float>(query[query_base + lane]),
                 static_cast<float>(key[key_base + lane]), 0.0f);
             float product32 = fmaf(
-                static_cast<float>(query[query_base + lane + 32]),
+                cache_query ? cached_query[1] :
+                    static_cast<float>(query[query_base + lane + 32]),
                 static_cast<float>(key[key_base + lane + 32]), 0.0f);
             float product64 = fmaf(
-                static_cast<float>(query[query_base + lane + 64]),
+                cache_query ? cached_query[2] :
+                    static_cast<float>(query[query_base + lane + 64]),
                 static_cast<float>(key[key_base + lane + 64]), 0.0f);
             float product96 = fmaf(
-                static_cast<float>(query[query_base + lane + 96]),
+                cache_query ? cached_query[3] :
+                    static_cast<float>(query[query_base + lane + 96]),
                 static_cast<float>(key[key_base + lane + 96]), 0.0f);
             /* Match the scalar 256-thread reduction tree exactly: its first
              * non-zero steps pair d+64, then d+32/d+96. */
@@ -1578,7 +1605,8 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
     }
 }
 
-template <bool fixed_d128>
+template <bool fixed_d128, bool cache_query = false,
+          bool jump_mask_gaps = false>
 static void h3_hip_launch_vdn_window_sdpa_bf16_wave32(
         hipStream_t stream, const hip_bfloat16 *query,
         const hip_bfloat16 *key, const hip_bfloat16 *value,
@@ -1587,7 +1615,8 @@ static void h3_hip_launch_vdn_window_sdpa_bf16_wave32(
         uint32_t frames, uint32_t tokens_per_frame, uint32_t radius,
         uint32_t chunk, int anchor_both, float scale) {
     hipLaunchKernelGGL(
-        (h3_hip_vdn_window_sdpa_bf16_wave32_kernel<fixed_d128>),
+        (h3_hip_vdn_window_sdpa_bf16_wave32_kernel<
+            fixed_d128, cache_query, jump_mask_gaps>),
         dim3(sequence, heads), dim3(32), 0, stream, query, key, value, output,
         sequence, heads, head_dim, video_start, video_end, frames,
         tokens_per_frame, radius, chunk, anchor_both, scale);
@@ -3719,6 +3748,12 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
     h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     uint32_t video_end = static_cast<uint32_t>(video_end_wide);
     const char *scalar_value = std::getenv("H3_VDN_SCALAR_SDPA");
+    const char *reload_query_value = std::getenv("H3_VDN_RELOAD_QUERY");
+    int reload_query = reload_query_value && *reload_query_value &&
+        std::strcmp(reload_query_value, "0");
+    const char *scan_mask_value = std::getenv("H3_VDN_SCAN_MASK");
+    int scan_mask = scan_mask_value && *scan_mask_value &&
+        std::strcmp(scan_mask_value, "0");
     int use_wave32 = gpu->warp_size == 32 && head_dim <= 256 &&
         !(scalar_value && *scalar_value && std::strcmp(scalar_value, "0"));
     if (use_wave32) {
@@ -3731,10 +3766,28 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
         hip_bfloat16 *output_data =
             static_cast<hip_bfloat16 *>(output->data);
         if (head_dim == 128) {
-            h3_hip_launch_vdn_window_sdpa_bf16_wave32<true>(
-                gpu->stream, query_data, key_data, value_data, output_data,
-                sequence, heads, head_dim, video_start, video_end, frames,
-                tokens_per_frame, radius, chunk, anchor_both, scale);
+            if (reload_query && (scan_mask || !anchor_both)) {
+                h3_hip_launch_vdn_window_sdpa_bf16_wave32<
+                    true, false, false>(
+                    gpu->stream, query_data, key_data, value_data, output_data,
+                    sequence, heads, head_dim, video_start, video_end, frames,
+                    tokens_per_frame, radius, chunk, anchor_both, scale);
+            } else if (reload_query) {
+                h3_hip_launch_vdn_window_sdpa_bf16_wave32<true, false, true>(
+                    gpu->stream, query_data, key_data, value_data, output_data,
+                    sequence, heads, head_dim, video_start, video_end, frames,
+                    tokens_per_frame, radius, chunk, anchor_both, scale);
+            } else if (scan_mask || !anchor_both) {
+                h3_hip_launch_vdn_window_sdpa_bf16_wave32<true, true, false>(
+                    gpu->stream, query_data, key_data, value_data, output_data,
+                    sequence, heads, head_dim, video_start, video_end, frames,
+                    tokens_per_frame, radius, chunk, anchor_both, scale);
+            } else {
+                h3_hip_launch_vdn_window_sdpa_bf16_wave32<true, true, true>(
+                    gpu->stream, query_data, key_data, value_data, output_data,
+                    sequence, heads, head_dim, video_start, video_end, frames,
+                    tokens_per_frame, radius, chunk, anchor_both, scale);
+            }
         } else {
             h3_hip_launch_vdn_window_sdpa_bf16_wave32<false>(
                 gpu->stream, query_data, key_data, value_data, output_data,

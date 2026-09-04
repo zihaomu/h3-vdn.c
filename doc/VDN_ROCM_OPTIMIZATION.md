@@ -173,6 +173,48 @@ The small-shape native 8-NFE VAE/mux acceptance completed in 92.66 seconds
 versus 95.95 seconds before this change and reproduced the exact 73,528-byte
 MP4 SHA-256 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`.
 
+### REJECT: one-exp online softmax update
+
+For a maximum update, one of the two online-softmax exponent arguments is zero,
+so a candidate replaced that `expf(0)` with 1.0. The standalone kernel improved
+by about 1.2%, and only 1,233 of 38,262,784 BF16 outputs differed, with maximum
+absolute error `1.52587891e-05` and RMSE `1.75812545e-08`. Those tiny local
+changes accumulated across 50 layers, however: final maximum absolute error was
+`0.483652472`, RMSE `0.00351053542`, and relative RMSE `1.111%`. The candidate
+and its temporary comparison hooks were removed because it failed the exact
+output gate.
+
+### KEEP: cached D=128 query and direct mask-gap jumps
+
+The fixed-D=128 kernel now loads each wave's four invariant query values before
+the key loop. `H3_VDN_RELOAD_QUERY=1` retains the old behavior for same-binary
+A/B. Five crossed groups of five production-shape iterations measured medians
+of 0.660494 seconds for reload and 0.653752 seconds for cached query (-1.0%),
+with identical `3d65eea81de34693` output hashes.
+
+When both endpoint frames are anchors, the allowed video-key region is the
+ordered union of the first frame, local window, and last frame. The kernel now
+jumps directly across the two possible gaps instead of evaluating every masked
+row; this preserves the exact key and floating-point reduction order.
+`H3_VDN_SCAN_MASK=1` retains the legacy scan. Five crossed groups of five
+iterations measured medians of 0.654632 and 0.639143 seconds (-2.37%). Tests
+cover prefix and suffix text, zero prefix, one token per frame, and both window
+gaps; every old/new output was bitwise identical.
+
+With both legacy switches enabled versus the combined default, five final
+crossed groups of five iterations measured medians of 0.661281 and 0.640123
+seconds, a 3.20% end-to-end kernel improvement. All ten hashes were again
+`3d65eea81de34693`.
+
+The combined production path uses 31 VGPRs, no VGPR or SGPR spills, and no
+private segment. A complete 50-layer run retained video/audio hashes
+`b3d3500676d3fb12` and `5fbd7afb3d78a277`, kept the 4.969 GiB peak, and measured
+18.647 seconds of SDPA GPU-event time versus 20.884 seconds before this batch.
+Its total wall time was excluded from the comparison because concurrent disk
+traffic reduced weight-read throughput to 3.74 GiB/s. The final native 8-NFE,
+dual-VAE, mux acceptance completed in about 83.8 seconds and reproduced the
+exact 73,528-byte MP4 and SHA-256 above.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -214,7 +256,7 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 ## Next priorities
 
 1. Evaluate a tiled/matrix-instruction production SDPA kernel against the new
-   0.6542-second wave32 baseline, preserving the scalar oracle.
+   0.6401-second wave32 baseline, preserving the scalar oracle.
 2. Replace per-block activation allocation with an explicit block workspace
    only if allocation count and wall time both improve without increasing peak
    memory; a transparent 3 GiB allocation pool has already been rejected.

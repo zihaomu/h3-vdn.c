@@ -137,10 +137,18 @@ command wait time, allocation/dispatch counters, and GPU event time for linear,
 SDPA, VDN solve, and VDN scan operations. On `gfx1201`, VDN window attention
 uses a wave32 kernel with precomputed window bounds and a D=128 specialization;
 set `H3_VDN_SCALAR_SDPA=1` to restore the bitwise oracle. At the real
-512x512/56-frame token geometry, the standalone kernel median is 0.6542 seconds
-and one complete 50-layer forward improved from 53.48 to 37.42 seconds while
-preserving both full-output hashes. This is a single-NFE compute acceptance,
-not a production-resolution visual-quality or full mux benchmark. The method,
+512x512/56-frame token geometry, caching the invariant query values and jumping
+directly over masked video-key gaps reduced the crossed standalone median from
+0.6613 to 0.6401 seconds (-3.2%). Set `H3_VDN_RELOAD_QUERY=1` and
+`H3_VDN_SCAN_MASK=1` to restore the two legacy behaviors for exact A/B
+diagnosis. One complete
+50-layer profile measured 18.647 seconds of SDPA GPU time, versus 20.884 seconds
+before these additions, with no spills or change to the full-output hashes.
+The earlier specialization made the complete forward improve from 53.48 to
+37.42 seconds; total wall time remains sensitive to concurrent weight I/O,
+so kernel and GPU-event comparisons are reported separately. This is a
+single-NFE compute acceptance, not a production-resolution visual-quality or
+full mux benchmark. The method,
 exact inputs, rejected candidates, and next priorities are recorded in
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
 
@@ -148,7 +156,8 @@ HIP weight streaming also reuses a thread-safe 8 MiB pinned staging buffer by
 default, avoiding page-lock/unlock for every tensor. Set
 `H3_HIP_STAGING_CACHE=0` for the old allocation lifecycle when diagnosing I/O.
 Together with wave32 attention, the same 64x32/56-frame native E2E acceptance
-run fell from about 170.7 to 92.66 seconds and reproduced the MP4 SHA-256 above.
+run fell from about 170.7 to 92.66 seconds; the latest single-card run completed
+in about 83.8 seconds and reproduced the MP4 SHA-256 above.
 
 ### Current OpenVDN scope
 
@@ -625,7 +634,10 @@ block evaluations and is not a quick unit test.
 
 `make BACKEND=hip h3_vdn_sdpa_bench` builds the standalone window-attention
 benchmark. Its default arguments model the 512x512/56-frame VDN geometry;
-`H3_VDN_SCALAR_SDPA=1 ./h3_vdn_sdpa_bench` runs the scalar oracle.
+`H3_VDN_SCALAR_SDPA=1 ./h3_vdn_sdpa_bench` runs the scalar oracle. For
+same-binary comparisons, `H3_VDN_RELOAD_QUERY=1` reloads query values inside
+the key loop and `H3_VDN_SCAN_MASK=1` scans masked rows instead of jumping over
+the two disallowed gaps.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
