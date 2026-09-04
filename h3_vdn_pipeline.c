@@ -233,6 +233,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
 
     clock_gettime(CLOCK_MONOTONIC, &dit_start);
     gpu = h3_gpu_create(NULL, detail, sizeof(detail));
+    if (gpu) h3_gpu_profile_set_label(gpu, "OpenVDN DiT");
     store = h3_vdn_weight_store_open(
         ctx->model_dir, ctx->vdn_checkpoint_dir,
         ctx->model.vdn.adapter_count > 1, detail, sizeof(detail));
@@ -261,6 +262,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     h3_rng_fill_normal(&rng, audio_rows, audio_elements);
     video = h3_gpu_tensor_from_f32(gpu, video_rows, video_elements);
     audio = h3_gpu_tensor_from_f32(gpu, audio_rows, audio_elements);
+    if (video && audio) h3_gpu_profile_mark(gpu, "setup");
     if (!video || !audio || !h3_vdn_denoise(
             gpu, store, &model, refined, &layout, video, audio,
             (unsigned)params->steps, 1, 5, layer_progress, nfe_progress,

@@ -774,6 +774,7 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
         dit_fail(error, error_size, "invalid VDN forward arguments");
         return 0;
     }
+    h3_gpu_profile_set_label(gpu, "OpenVDN DiT");
     int same_time = video_timestep == audio_timestep;
     float timesteps[2];
     uint32_t video_time_row = 0, audio_time_row = 0;
@@ -971,6 +972,7 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
         dit_fail(error, error_size, "invalid VDN denoising arguments");
         return 0;
     }
+    h3_gpu_profile_set_label(gpu, "OpenVDN DiT");
     h3_sigma_schedule schedule;
     if (!h3_serving_schedule_build((int)evaluations, &schedule)) {
         dit_fail(error, error_size, "cannot build VDN paired sigma schedule");
@@ -1021,6 +1023,7 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                         error, error_size);
         h3_vdn_velocity_free(&velocity);
         if (!ok) return 0;
+        h3_gpu_profile_mark(gpu, "NFE");
         if (nfe_progress) nfe_progress(step + 1, evaluations, progress_opaque);
     }
     return 1;

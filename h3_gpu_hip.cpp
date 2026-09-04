@@ -12,6 +12,7 @@
 #endif
 
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -23,11 +24,31 @@
 
 struct h3_gpu {
     int device;
+    int warp_size;
     hipStream_t stream;
     rocblas_handle blas;
     char error[512];
     h3_gpu_stats stats;
     int recording;
+    char profile_label[128];
+    double profile_start_wall;
+    double profile_mark_wall;
+    double command_start_wall;
+    h3_gpu_stats profile_start_stats;
+    h3_gpu_stats profile_mark_stats;
+    hipEvent_t *profile_events;
+    uint8_t *profile_categories;
+    size_t profile_capacity;
+    size_t profile_count;
+    int profile_event_open;
+    double profile_linear_ms;
+    double profile_sdpa_ms;
+    double profile_solve_ms;
+    double profile_scan_ms;
+    double profile_load_read_seconds;
+    double profile_load_upload_seconds;
+    uint64_t profile_load_read_bytes;
+    uint64_t profile_load_upload_bytes;
 };
 
 struct h3_gpu_tensor {
@@ -69,6 +90,181 @@ static size_t h3_gpu_dtype_size(h3_gpu_dtype dtype) {
         case H3_GPU_U32: return sizeof(uint32_t);
     }
     return 0;
+}
+
+enum h3_gpu_profile_category {
+    H3_HIP_PROFILE_LINEAR = 0,
+    H3_HIP_PROFILE_SDPA = 1,
+    H3_HIP_PROFILE_SOLVE = 2,
+    H3_HIP_PROFILE_SCAN = 3
+};
+
+static double h3_gpu_now(void) {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+static int h3_gpu_profile_enabled(void) {
+    const char *value = std::getenv("H3_PROFILE");
+    return value && *value && std::strcmp(value, "0");
+}
+
+static int h3_gpu_profile_init_events(h3_gpu *gpu) {
+    constexpr size_t capacity = 512;
+    if (gpu->profile_events) return 1;
+    hipEvent_t *events = static_cast<hipEvent_t *>(
+        std::calloc(capacity * 2, sizeof(*events)));
+    uint8_t *categories = static_cast<uint8_t *>(
+        std::calloc(capacity, sizeof(*categories)));
+    if (!events || !categories) {
+        std::free(events);
+        std::free(categories);
+        return 0;
+    }
+    size_t created = 0;
+    for (; created < capacity * 2; created++) {
+        if (hipEventCreateWithFlags(&events[created], hipEventDefault) !=
+            hipSuccess) break;
+    }
+    if (created != capacity * 2) {
+        for (size_t index = 0; index < created; index++)
+            (void)hipEventDestroy(events[index]);
+        std::free(events);
+        std::free(categories);
+        return 0;
+    }
+    gpu->profile_events = events;
+    gpu->profile_categories = categories;
+    gpu->profile_capacity = capacity;
+    return 1;
+}
+
+static void h3_gpu_profile_begin_op(h3_gpu *gpu) {
+    if (!gpu || !h3_gpu_profile_enabled() || gpu->profile_event_open ||
+        (gpu->profile_events &&
+         gpu->profile_count >= gpu->profile_capacity))
+        return;
+    if (!h3_gpu_profile_init_events(gpu) ||
+        gpu->profile_count >= gpu->profile_capacity) return;
+    if (hipEventRecord(gpu->profile_events[gpu->profile_count * 2],
+                       gpu->stream) == hipSuccess)
+        gpu->profile_event_open = 1;
+}
+
+static void h3_gpu_profile_end_op(h3_gpu *gpu,
+                                  h3_gpu_profile_category category) {
+    if (!gpu || !gpu->profile_event_open ||
+        gpu->profile_count >= gpu->profile_capacity) return;
+    size_t index = gpu->profile_count;
+    if (hipEventRecord(gpu->profile_events[index * 2 + 1], gpu->stream) ==
+        hipSuccess) {
+        gpu->profile_categories[index] = static_cast<uint8_t>(category);
+        gpu->profile_count++;
+    }
+    gpu->profile_event_open = 0;
+}
+
+struct h3_gpu_profile_scope {
+    h3_gpu *gpu;
+    h3_gpu_profile_category category;
+    h3_gpu_profile_scope(h3_gpu *value, h3_gpu_profile_category kind)
+        : gpu(value), category(kind) { h3_gpu_profile_begin_op(gpu); }
+    ~h3_gpu_profile_scope() { h3_gpu_profile_end_op(gpu, category); }
+};
+
+static void h3_gpu_profile_flush_ops(h3_gpu *gpu) {
+    if (!gpu || !gpu->profile_count) return;
+    for (size_t index = 0; index < gpu->profile_count; index++) {
+        float milliseconds = 0.0f;
+        if (hipEventElapsedTime(&milliseconds, gpu->profile_events[index * 2],
+                                gpu->profile_events[index * 2 + 1]) !=
+            hipSuccess) continue;
+        switch (gpu->profile_categories[index]) {
+        case H3_HIP_PROFILE_LINEAR: gpu->profile_linear_ms += milliseconds; break;
+        case H3_HIP_PROFILE_SDPA: gpu->profile_sdpa_ms += milliseconds; break;
+        case H3_HIP_PROFILE_SOLVE: gpu->profile_solve_ms += milliseconds; break;
+        case H3_HIP_PROFILE_SCAN: gpu->profile_scan_ms += milliseconds; break;
+        }
+    }
+    gpu->profile_count = 0;
+}
+
+static void h3_gpu_profile_destroy_events(h3_gpu *gpu) {
+    if (!gpu || !gpu->profile_events) return;
+    for (size_t index = 0; index < gpu->profile_capacity * 2; index++)
+        (void)hipEventDestroy(gpu->profile_events[index]);
+    std::free(gpu->profile_events);
+    std::free(gpu->profile_categories);
+    gpu->profile_events = nullptr;
+    gpu->profile_categories = nullptr;
+    gpu->profile_capacity = 0;
+    gpu->profile_count = 0;
+}
+
+static uint64_t h3_gpu_counter_delta(uint64_t value, uint64_t start) {
+    return value >= start ? value - start : 0;
+}
+
+static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
+                                const h3_gpu_stats &start,
+                                double wall_start) {
+    if (!gpu || !phase || !h3_gpu_profile_enabled()) return;
+    const h3_gpu_stats &value = gpu->stats;
+    std::fprintf(stderr,
+        "h3 profile: %-20s %-14s wall=%8.3fs encode=%8.3fs wait=%8.3fs "
+        "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu linear=%llu "
+        "attention=%llu direct=%llu\n",
+        gpu->profile_label[0] ? gpu->profile_label : "HIP context", phase,
+        h3_gpu_now() - wall_start,
+        value.command_encode_seconds - start.command_encode_seconds,
+        value.command_wait_seconds - start.command_wait_seconds,
+        static_cast<double>(value.peak_live_bytes) /
+            (1024.0 * 1024.0 * 1024.0),
+        static_cast<double>(h3_gpu_counter_delta(value.allocated_bytes,
+                                                  start.allocated_bytes)) /
+            (1024.0 * 1024.0 * 1024.0),
+        static_cast<unsigned long long>(h3_gpu_counter_delta(
+            value.submissions, start.submissions)),
+        static_cast<unsigned long long>(h3_gpu_counter_delta(
+            value.mps_linear_dispatches, start.mps_linear_dispatches)),
+        static_cast<unsigned long long>(h3_gpu_counter_delta(
+            value.mps_sdpa_dispatches, start.mps_sdpa_dispatches)),
+        static_cast<unsigned long long>(h3_gpu_counter_delta(
+            value.direct_dispatches, start.direct_dispatches)));
+}
+
+static void h3_gpu_profile_emit_ops(h3_gpu *gpu) {
+    if (!gpu || !h3_gpu_profile_enabled()) return;
+    double total = gpu->profile_linear_ms + gpu->profile_sdpa_ms +
+                   gpu->profile_solve_ms + gpu->profile_scan_ms;
+    if (total <= 0.0) return;
+    std::fprintf(stderr,
+        "h3 profile: %-20s %-14s measured=%8.3fs linear=%8.3fs "
+        "sdpa=%8.3fs solve=%8.3fs scan=%8.3fs\n",
+        gpu->profile_label[0] ? gpu->profile_label : "HIP context",
+        "gpu-op-classes", total / 1000.0, gpu->profile_linear_ms / 1000.0,
+        gpu->profile_sdpa_ms / 1000.0, gpu->profile_solve_ms / 1000.0,
+        gpu->profile_scan_ms / 1000.0);
+}
+
+static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
+    if (!gpu || !h3_gpu_profile_enabled() ||
+        !gpu->profile_load_read_bytes) return;
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    std::fprintf(stderr,
+        "h3 profile: %-20s %-14s read=%8.3fs (%7.3fGiB, %6.2fGiB/s) "
+        "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s)\n",
+        gpu->profile_label[0] ? gpu->profile_label : "HIP context",
+        "weight-load", gpu->profile_load_read_seconds,
+        static_cast<double>(gpu->profile_load_read_bytes) / gib,
+        gpu->profile_load_read_seconds > 0.0 ?
+            static_cast<double>(gpu->profile_load_read_bytes) / gib /
+                gpu->profile_load_read_seconds : 0.0,
+        gpu->profile_load_upload_seconds,
+        static_cast<double>(gpu->profile_load_upload_bytes) / gib,
+        gpu->profile_load_upload_seconds > 0.0 ?
+            static_cast<double>(gpu->profile_load_upload_bytes) / gib /
+                gpu->profile_load_upload_seconds : 0.0);
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *gpu, const void *values,
@@ -184,7 +380,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
     void *staging = nullptr;
     h3_gpu *gpu = tensor->owner;
     if (!h3_gpu_check(gpu, hipHostMalloc(&staging, chunk_capacity),
-                      "hipHostMalloc")) {
+                      "hipHostMalloc weight staging")) {
         close(descriptor);
         if (error && error_size)
             std::snprintf(error, error_size, "%s", gpu->error);
@@ -193,14 +389,20 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
 
     size_t completed = 0;
     size_t bytes = tensor->bytes;
+    int profile = h3_gpu_profile_enabled();
     while (completed < bytes) {
         size_t request = bytes - completed;
         if (request > chunk_capacity) request = chunk_capacity;
         ssize_t got;
+        double read_start = profile ? h3_gpu_now() : 0.0;
         do {
             got = pread(descriptor, staging, request,
                         static_cast<off_t>(file_offset + completed));
         } while (got < 0 && errno == EINTR);
+        if (profile && got > 0) {
+            gpu->profile_load_read_seconds += h3_gpu_now() - read_start;
+            gpu->profile_load_read_bytes += static_cast<uint64_t>(got);
+        }
         if (got <= 0) {
             if (error && error_size) {
                 std::snprintf(error, error_size, "cannot read %s: %s", path,
@@ -213,18 +415,23 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
         }
         unsigned char *destination =
             static_cast<unsigned char *>(tensor->data) + completed;
+        double upload_start = profile ? h3_gpu_now() : 0.0;
         if (!h3_gpu_check(gpu,
                           hipMemcpyAsync(destination, staging,
                                          static_cast<size_t>(got),
                                          hipMemcpyHostToDevice, gpu->stream),
                           "hipMemcpyAsync file-to-device") ||
             !h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
-                          "hipStreamSynchronize")) {
+                          "hipStreamSynchronize weight upload")) {
             if (error && error_size)
                 std::snprintf(error, error_size, "%s", gpu->error);
             (void)hipHostFree(staging);
             close(descriptor);
             return 0;
+        }
+        if (profile) {
+            gpu->profile_load_upload_seconds += h3_gpu_now() - upload_start;
+            gpu->profile_load_upload_bytes += static_cast<uint64_t>(got);
         }
         completed += static_cast<size_t>(got);
     }
@@ -1080,7 +1287,7 @@ __device__ static int h3_hip_vdn_key_allowed(
     return key_frame >= lower && key_frame <= upper;
 }
 
-__global__ static void h3_hip_vdn_window_sdpa_bf16_kernel(
+__global__ static void h3_hip_vdn_window_sdpa_bf16_scalar_kernel(
         const hip_bfloat16 *query, const hip_bfloat16 *key,
         const hip_bfloat16 *value, hip_bfloat16 *output,
         uint32_t sequence, uint32_t heads, uint32_t head_dim,
@@ -1138,6 +1345,88 @@ __global__ static void h3_hip_vdn_window_sdpa_bf16_kernel(
     }
     if (lane < head_dim)
         output[query_base + lane] = hip_bfloat16(accumulator / coefficients[2]);
+}
+
+/* gfx12 executes wave32. One wave handles a query/head pair and keeps four
+ * output dimensions per lane for the production D=128 shape. This removes the
+ * two block-wide barriers at every reduction step in the scalar oracle. */
+__global__ static void h3_hip_vdn_window_sdpa_bf16_wave32_kernel(
+        const hip_bfloat16 *query, const hip_bfloat16 *key,
+        const hip_bfloat16 *value, hip_bfloat16 *output,
+        uint32_t sequence, uint32_t heads, uint32_t head_dim,
+        uint32_t video_start, uint32_t video_end, uint32_t frames,
+        uint32_t tokens_per_frame, uint32_t radius, uint32_t chunk,
+        int anchor_both, float scale) {
+    uint32_t query_row = blockIdx.x;
+    uint32_t head = blockIdx.y;
+    uint32_t lane = threadIdx.x;
+    if (query_row >= sequence || head >= heads || lane >= 32) return;
+    size_t inner = static_cast<size_t>(heads) * head_dim;
+    size_t query_base = static_cast<size_t>(query_row) * inner +
+                        static_cast<size_t>(head) * head_dim;
+    float accumulators[8];
+#pragma unroll
+    for (uint32_t slot = 0; slot < 8; slot++) accumulators[slot] = 0.0f;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (uint32_t key_row = 0; key_row < sequence; key_row++) {
+        if (!h3_hip_vdn_key_allowed(query_row, key_row, video_start,
+                video_end, frames, tokens_per_frame, radius, chunk,
+                anchor_both)) continue;
+        size_t key_base = static_cast<size_t>(key_row) * inner +
+                          static_cast<size_t>(head) * head_dim;
+        float partial = 0.0f;
+        if (head_dim == 128) {
+            float product0 = fmaf(
+                static_cast<float>(query[query_base + lane]),
+                static_cast<float>(key[key_base + lane]), 0.0f);
+            float product32 = fmaf(
+                static_cast<float>(query[query_base + lane + 32]),
+                static_cast<float>(key[key_base + lane + 32]), 0.0f);
+            float product64 = fmaf(
+                static_cast<float>(query[query_base + lane + 64]),
+                static_cast<float>(key[key_base + lane + 64]), 0.0f);
+            float product96 = fmaf(
+                static_cast<float>(query[query_base + lane + 96]),
+                static_cast<float>(key[key_base + lane + 96]), 0.0f);
+            /* Match the scalar 256-thread reduction tree exactly: its first
+             * non-zero steps pair d+64, then d+32/d+96. */
+            partial = (product0 + product64) + (product32 + product96);
+        } else {
+            for (uint32_t dimension = lane; dimension < head_dim;
+                 dimension += 32)
+                partial = fmaf(
+                    static_cast<float>(query[query_base + dimension]),
+                    static_cast<float>(key[key_base + dimension]), partial);
+        }
+#pragma unroll
+        for (uint32_t offset = 16; offset; offset >>= 1)
+            partial += __shfl_down(partial, offset, 32);
+        float old_scale = 0.0f;
+        float new_scale = 0.0f;
+        if (lane == 0) {
+            float score = partial * scale;
+            float next_max = fmaxf(running_max, score);
+            old_scale = running_sum == 0.0f ? 0.0f :
+                        expf(running_max - next_max);
+            new_scale = expf(score - next_max);
+            running_sum = running_sum * old_scale + new_scale;
+            running_max = next_max;
+        }
+        old_scale = __shfl(old_scale, 0, 32);
+        new_scale = __shfl(new_scale, 0, 32);
+        uint32_t slot = 0;
+        for (uint32_t dimension = lane; dimension < head_dim;
+             dimension += 32, slot++)
+            accumulators[slot] = accumulators[slot] * old_scale +
+                new_scale * static_cast<float>(value[key_base + dimension]);
+    }
+    float denominator = __shfl(running_sum, 0, 32);
+    uint32_t slot = 0;
+    for (uint32_t dimension = lane; dimension < head_dim;
+         dimension += 32, slot++)
+        output[query_base + dimension] =
+            hip_bfloat16(accumulators[slot] / denominator);
 }
 
 __global__ static void h3_hip_vdn_softmax_gate_bf16_kernel(
@@ -1576,6 +1865,7 @@ static int h3_gpu_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                                         "linear bias")))
         return 0;
 
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_LINEAR);
     rocblas_datatype type = dtype == H3_GPU_F32 ? rocblas_datatype_f32_r :
                                                    rocblas_datatype_bf16_r;
     float alpha = 1.0f;
@@ -1690,6 +1980,7 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                          sequence, shared_bytes, max_shared);
         return 0;
     }
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     dim3 grid(sequence, batch * heads);
     if (dtype == H3_GPU_F32) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(h3_hip_sdpa_kernel<float>), grid,
@@ -1793,6 +2084,9 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
         std::free(gpu);
         return nullptr;
     }
+    hipDeviceProp_t properties;
+    if (hipGetDeviceProperties(&properties, gpu->device) == hipSuccess)
+        gpu->warp_size = properties.warpSize;
     rocblas_status blas_status = rocblas_create_handle(&gpu->blas);
     if (blas_status == rocblas_status_success)
         blas_status = rocblas_set_stream(gpu->blas, gpu->stream);
@@ -1806,6 +2100,12 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
         std::free(gpu);
         return nullptr;
     }
+    std::snprintf(gpu->profile_label, sizeof(gpu->profile_label),
+                  "HIP context");
+    gpu->profile_start_wall = h3_gpu_now();
+    gpu->profile_mark_wall = gpu->profile_start_wall;
+    gpu->profile_start_stats = gpu->stats;
+    gpu->profile_mark_stats = gpu->stats;
     return gpu;
 }
 
@@ -1813,6 +2113,12 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     if (!gpu) return;
     (void)hipSetDevice(gpu->device);
     (void)hipStreamSynchronize(gpu->stream);
+    h3_gpu_profile_flush_ops(gpu);
+    h3_gpu_profile_emit(gpu, "total", gpu->profile_start_stats,
+                        gpu->profile_start_wall);
+    h3_gpu_profile_emit_ops(gpu);
+    h3_gpu_profile_emit_load(gpu);
+    h3_gpu_profile_destroy_events(gpu);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);
     std::free(gpu);
@@ -1971,24 +2277,45 @@ extern "C" int h3_gpu_begin(h3_gpu *gpu) {
     }
     gpu->recording = 1;
     gpu->error[0] = '\0';
+    gpu->command_start_wall = h3_gpu_now();
     return 1;
 }
 
 extern "C" int h3_gpu_continue(h3_gpu *gpu) {
     if (!gpu || !gpu->recording) return 0;
+    double now = h3_gpu_now();
+    if (gpu->command_start_wall > 0.0)
+        gpu->stats.command_encode_seconds += now - gpu->command_start_wall;
+    double wait_start = h3_gpu_now();
     if (!h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
                       "hipStreamSynchronize"))
         return 0;
+    double waited = h3_gpu_now() - wait_start;
+    gpu->stats.command_wait_seconds += waited;
+    gpu->stats.gpu_seconds = gpu->stats.command_wait_seconds;
     gpu->stats.submissions++;
+    h3_gpu_profile_flush_ops(gpu);
+    gpu->command_start_wall = h3_gpu_now();
     return 1;
 }
 
 extern "C" int h3_gpu_submit(h3_gpu *gpu) {
     if (!gpu || !gpu->recording) return 0;
+    double now = h3_gpu_now();
+    if (gpu->command_start_wall > 0.0)
+        gpu->stats.command_encode_seconds += now - gpu->command_start_wall;
+    double wait_start = h3_gpu_now();
     int ok = h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
                           "hipStreamSynchronize");
+    double waited = h3_gpu_now() - wait_start;
     gpu->recording = 0;
-    if (ok) gpu->stats.submissions++;
+    gpu->command_start_wall = 0.0;
+    if (ok) {
+        gpu->stats.command_wait_seconds += waited;
+        gpu->stats.gpu_seconds = gpu->stats.command_wait_seconds;
+        gpu->stats.submissions++;
+        h3_gpu_profile_flush_ops(gpu);
+    }
     return ok;
 }
 
@@ -2003,13 +2330,23 @@ extern "C" int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats) {
 }
 
 extern "C" void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label) {
-    (void)gpu;
-    (void)label;
+    if (!gpu || !label) return;
+    std::snprintf(gpu->profile_label, sizeof(gpu->profile_label), "%s",
+                  label);
 }
 
 extern "C" void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
-    (void)gpu;
-    (void)phase;
+    if (!gpu || !phase || !*phase || !h3_gpu_profile_enabled()) return;
+    h3_gpu_profile_flush_ops(gpu);
+    h3_gpu_profile_emit(gpu, phase, gpu->profile_mark_stats,
+                        gpu->profile_mark_wall);
+    h3_gpu_profile_emit_ops(gpu);
+    gpu->profile_linear_ms = 0.0;
+    gpu->profile_sdpa_ms = 0.0;
+    gpu->profile_solve_ms = 0.0;
+    gpu->profile_scan_ms = 0.0;
+    gpu->profile_mark_stats = gpu->stats;
+    gpu->profile_mark_wall = h3_gpu_now();
 }
 
 extern "C" int h3_gpu_copy_bf16(h3_gpu *gpu,
@@ -3199,17 +3536,32 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
         !h3_gpu_require_tensor(gpu, output, elements, H3_GPU_BF16,
                                "VDN window output"))
         return 0;
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     uint32_t video_end = static_cast<uint32_t>(video_end_wide);
-    size_t shared_bytes = (H3_HIP_THREADS + 3) * sizeof(float);
-    hipLaunchKernelGGL(h3_hip_vdn_window_sdpa_bf16_kernel,
-                       dim3(sequence, heads), dim3(H3_HIP_THREADS),
-                       shared_bytes, gpu->stream,
-                       static_cast<const hip_bfloat16 *>(query->data),
-                       static_cast<const hip_bfloat16 *>(key->data),
-                       static_cast<const hip_bfloat16 *>(value->data),
-                       static_cast<hip_bfloat16 *>(output->data), sequence,
-                       heads, head_dim, video_start, video_end, frames,
-                       tokens_per_frame, radius, chunk, anchor_both, scale);
+    const char *scalar_value = std::getenv("H3_VDN_SCALAR_SDPA");
+    int use_wave32 = gpu->warp_size == 32 && head_dim <= 256 &&
+        !(scalar_value && *scalar_value && std::strcmp(scalar_value, "0"));
+    if (use_wave32) {
+        hipLaunchKernelGGL(h3_hip_vdn_window_sdpa_bf16_wave32_kernel,
+                           dim3(sequence, heads), dim3(32), 0, gpu->stream,
+                           static_cast<const hip_bfloat16 *>(query->data),
+                           static_cast<const hip_bfloat16 *>(key->data),
+                           static_cast<const hip_bfloat16 *>(value->data),
+                           static_cast<hip_bfloat16 *>(output->data), sequence,
+                           heads, head_dim, video_start, video_end, frames,
+                           tokens_per_frame, radius, chunk, anchor_both, scale);
+    } else {
+        size_t shared_bytes = (H3_HIP_THREADS + 3) * sizeof(float);
+        hipLaunchKernelGGL(h3_hip_vdn_window_sdpa_bf16_scalar_kernel,
+                           dim3(sequence, heads), dim3(H3_HIP_THREADS),
+                           shared_bytes, gpu->stream,
+                           static_cast<const hip_bfloat16 *>(query->data),
+                           static_cast<const hip_bfloat16 *>(key->data),
+                           static_cast<const hip_bfloat16 *>(value->data),
+                           static_cast<hip_bfloat16 *>(output->data), sequence,
+                           heads, head_dim, video_start, video_end, frames,
+                           tokens_per_frame, radius, chunk, anchor_both, scale);
+    }
     if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
     gpu->stats.mps_sdpa_dispatches++;
     return 1;
@@ -3423,6 +3775,7 @@ extern "C" int h3_gpu_vdn_solve_f32(
                                static_cast<size_t>(elements_wide),
                                H3_GPU_F32, "VDN injection"))
         return 0;
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SOLVE);
     uint32_t batches = static_cast<uint32_t>(batches_wide);
     uint32_t total = static_cast<uint32_t>(elements_wide);
     hipLaunchKernelGGL(h3_hip_vdn_add_identity_f32_kernel,
@@ -3615,6 +3968,7 @@ extern "C" int h3_gpu_vdn_scan_f32(
         !h3_gpu_require_tensor(gpu, suffix, static_cast<size_t>(elements),
                                H3_GPU_F32, "VDN suffix states"))
         return 0;
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SCAN);
     size_t bank_bytes = static_cast<size_t>(head_bank_elements) * sizeof(float);
     rocblas_stride stride = static_cast<rocblas_stride>(matrix_elements);
     const float one = 1.0f;

@@ -132,6 +132,16 @@ test and the public CLI. All 56 decoded video frames had distinct frame hashes;
 the decoded audio measured -27.5 dB mean and -14.5 dB peak, ruling out a frozen
 or silent container.
 
+With `--profile`, the HIP backend also reports weight-read/H2D throughput,
+command wait time, allocation/dispatch counters, and GPU event time for linear,
+SDPA, VDN solve, and VDN scan operations. On `gfx1201`, VDN window attention
+uses a wave32 kernel by default. A fixed 50-layer sequence-840 forward improved
+from a 19.12-second scalar median to 13.41 seconds while remaining bitwise
+identical; set `H3_VDN_SCALAR_SDPA=1` to restore the scalar oracle. These are
+microbenchmark results, not a production-resolution throughput claim. The
+method, exact inputs, rejected candidates, and next priorities are recorded in
+[`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md).
+
 ### Current OpenVDN scope
 
 The validated MVP intentionally keeps a narrow correctness surface:
@@ -146,14 +156,15 @@ The validated MVP intentionally keeps a narrow correctness surface:
   first/last frames, and ordered media references are not implemented for VDN.
 - One selected ROCm device is used. Eight devices are enumerated, but multi-GPU
   layer sharding remains future work.
-- The current attention kernels prioritize mathematical correctness. Large
-  production canvases are valid but have not completed visual-quality or
-  performance acceptance on this port.
+- The `gfx1201` wave32 attention path is bitwise-checked against the scalar
+  implementation at the current smoke shape. Large production canvases are
+  valid but have not completed visual-quality or performance acceptance.
 - VDN execution is HIP-only. The separate original MiniMax-H3 Metal path and
   its CLI behavior remain available on macOS.
 
-For this implementation workspace, the detailed status, numerical hashes, and
-acceptance matrix are maintained in
+The repository performance ledger is
+[`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md). The broader
+workspace implementation and acceptance plan remains in
 `../doc/vdn-minimax-h3-implementation-plan.md`.
 
 ## MiniMax-H3 Metal tutorial
@@ -489,8 +500,9 @@ prompt, seed, resolution, frame count, and step count.
   `--show` previews are not written there.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is
   unavailable.
-- `--profile` reports phase wall time, Metal encoding/wait time, peak live
-  tensor storage, cumulative allocation, and dispatch counts.
+- `--profile` reports phase wall time, backend encoding/wait time, peak live
+  tensor storage, cumulative allocation, and dispatch counts. HIP additionally
+  reports weight I/O throughput and event-timed operation classes.
 
 For example:
 

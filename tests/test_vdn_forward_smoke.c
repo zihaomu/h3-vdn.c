@@ -62,7 +62,10 @@ int main(int argc, char **argv) {
     h3_gpu_tensor *refined = NULL, *video = NULL, *audio = NULL;
     float *video_host = NULL, *audio_host = NULL;
     float *video_output = NULL, *audio_output = NULL;
+    float *video_compare = NULL, *audio_compare = NULL;
     int denoise = getenv("VDN_SMOKE_DENOISE") != NULL;
+    int compare_sdpa = !denoise &&
+        getenv("VDN_SMOKE_COMPARE_SDPA") != NULL;
     if (!gpu) goto failed;
     store = h3_vdn_weight_store_open(argv[1], argv[2], 1,
                                      error, sizeof(error));
@@ -92,6 +95,7 @@ int main(int argc, char **argv) {
     video = h3_gpu_tensor_from_f32(gpu, video_host, video_elements);
     audio = h3_gpu_tensor_from_f32(gpu, audio_host, audio_elements);
     int ok = video && audio;
+    if (compare_sdpa) setenv("H3_VDN_SCALAR_SDPA", "1", 1);
     if (ok && denoise)
         ok = h3_vdn_denoise(
             gpu, store, &model, refined, &layout, video, audio, 8, 1, 5,
@@ -112,6 +116,57 @@ int main(int argc, char **argv) {
                                 "cannot read VDN forward outputs: %s",
                                 h3_gpu_error(gpu));
         goto failed;
+    }
+    if (compare_sdpa) {
+        video_compare = malloc(video_elements * sizeof(*video_compare));
+        audio_compare = malloc(audio_elements * sizeof(*audio_compare));
+        h3_vdn_velocity_free(&velocity);
+        setenv("H3_VDN_SCALAR_SDPA", "0", 1);
+        ok = video_compare && audio_compare &&
+             h3_gpu_tensor_write_f32(video, video_host, video_elements) &&
+             h3_gpu_tensor_write_f32(audio, audio_host, audio_elements) &&
+             h3_vdn_forward(
+                 gpu, store, &model, refined, &layout, video, audio,
+                 0.125f, 0.375f, 1, 5, layer_progress, NULL,
+                 &velocity, error, sizeof(error)) &&
+             h3_gpu_tensor_read_f32(velocity.video, video_compare,
+                                    video_elements) &&
+             h3_gpu_tensor_read_f32(velocity.audio, audio_compare,
+                                    audio_elements);
+        if (!ok) goto failed;
+        double squared = 0.0, reference_squared = 0.0;
+        float maximum = 0.0f;
+        size_t compared = video_elements + audio_elements;
+        for (size_t index = 0; index < video_elements; index++) {
+            float difference = fabsf(video_output[index] - video_compare[index]);
+            if (difference > maximum) maximum = difference;
+            squared += (double)difference * difference;
+            reference_squared +=
+                (double)video_output[index] * video_output[index];
+        }
+        for (size_t index = 0; index < audio_elements; index++) {
+            float difference = fabsf(audio_output[index] - audio_compare[index]);
+            if (difference > maximum) maximum = difference;
+            squared += (double)difference * difference;
+            reference_squared +=
+                (double)audio_output[index] * audio_output[index];
+        }
+        double rmse = sqrt(squared / (double)compared);
+        double relative_rmse = reference_squared > 0.0 ?
+            sqrt(squared / reference_squared) : 0.0;
+        printf("VDN SDPA scalar/wave32 comparison: max_abs=%.9g "
+               "rmse=%.9g relative_rmse=%.9g wave_video=%016llx "
+               "wave_audio=%016llx\n", maximum, rmse, relative_rmse,
+               (unsigned long long)hash_f32(video_compare, video_elements),
+               (unsigned long long)hash_f32(audio_compare, audio_elements));
+        if (memcmp(video_output, video_compare,
+                   video_elements * sizeof(*video_output)) ||
+            memcmp(audio_output, audio_compare,
+                   audio_elements * sizeof(*audio_output))) {
+            snprintf(error, sizeof(error),
+                     "scalar/wave32 VDN SDPA output is not bitwise identical");
+            goto failed;
+        }
     }
     size_t invalid = 0, nonzero = 0, changed = 0;
     for (size_t index = 0; index < video_elements; index++) {
@@ -148,6 +203,7 @@ int main(int argc, char **argv) {
 failed:
     fprintf(stderr, "VDN complete forward smoke failed: %s\n", error);
 cleanup:
+    free(audio_compare); free(video_compare);
     free(audio_output); free(video_output);
     free(audio_host); free(video_host);
     h3_vdn_velocity_free(&velocity);
