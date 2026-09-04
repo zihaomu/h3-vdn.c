@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(condition) do {                                                \
@@ -13,9 +14,20 @@
 } while (0)
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s PROMPT.safetensors\n", argv[0]);
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: %s PROMPT.safetensors [EXPECTED_ROWS]\n",
+                argv[0]);
         return 2;
+    }
+    size_t expected_rows = 800;
+    if (argc == 3) {
+        char *end = NULL;
+        unsigned long long parsed = strtoull(argv[2], &end, 10);
+        if (!end || *end || !parsed || parsed > SIZE_MAX) {
+            fprintf(stderr, "invalid expected row count: %s\n", argv[2]);
+            return 2;
+        }
+        expected_rows = (size_t)parsed;
     }
     h3_text_embedding embedding;
     memset(&embedding, 0, sizeof(embedding));
@@ -24,7 +36,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot load VDN prompt: %s\n", error);
         return 1;
     }
-    CHECK(embedding.tokens == 800);
+    CHECK(embedding.tokens == expected_rows);
     CHECK(embedding.width == 5120);
     CHECK(embedding.values != NULL);
     CHECK(embedding.tags != NULL);

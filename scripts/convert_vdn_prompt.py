@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert a released OpenVDN prompt archive to portable safetensors.
+"""Convert an OpenVDN prompt archive to portable safetensors.
 
-The .pt file is a ZIP-based torch.save archive with a BF16 [800, 5120]
-embedding and I64 [800] tags. This converter never unpickles the input.
+The .pt file is a ZIP-based torch.save archive with a BF16 [L, 5120]
+embedding and I64 [L] tags. This converter never unpickles the input.
 """
 
 import argparse
@@ -12,10 +12,7 @@ import struct
 import zipfile
 
 
-ROWS = 800
 WIDTH = 5120
-EMBED_BYTES = ROWS * WIDTH * 2
-TAG_BYTES = ROWS * 8
 
 
 def member(names: list[str], suffix: str) -> str:
@@ -39,10 +36,18 @@ def convert(source: pathlib.Path, destination: pathlib.Path) -> None:
                        b"LongStorage"):
             if marker not in metadata:
                 raise ValueError(f"archive metadata is missing {marker!r}")
-        if archive.getinfo(embedding_name).file_size != EMBED_BYTES:
-            raise ValueError(f"prompt storage must be {EMBED_BYTES} bytes")
-        if archive.getinfo(tags_name).file_size != TAG_BYTES:
-            raise ValueError(f"tag storage must be {TAG_BYTES} bytes")
+        embed_bytes = archive.getinfo(embedding_name).file_size
+        tag_bytes = archive.getinfo(tags_name).file_size
+        row_bytes = WIDTH * 2
+        if not embed_bytes or embed_bytes % row_bytes:
+            raise ValueError(
+                f"prompt storage must be nonempty BF16 rows of width {WIDTH}"
+            )
+        rows = embed_bytes // row_bytes
+        if tag_bytes != rows * 8:
+            raise ValueError(
+                f"tag storage must contain one I64 value for each of {rows} rows"
+            )
         embedding = archive.read(embedding_name)
         tags = archive.read(tags_name)
 
@@ -52,12 +57,12 @@ def convert(source: pathlib.Path, destination: pathlib.Path) -> None:
             "converter": "h3-vdn.c/scripts/convert_vdn_prompt.py",
         },
         "prompt_embeds": {
-            "dtype": "BF16", "shape": [ROWS, WIDTH],
-            "data_offsets": [0, EMBED_BYTES],
+            "dtype": "BF16", "shape": [rows, WIDTH],
+            "data_offsets": [0, embed_bytes],
         },
         "token_tags": {
-            "dtype": "I64", "shape": [ROWS],
-            "data_offsets": [EMBED_BYTES, EMBED_BYTES + TAG_BYTES],
+            "dtype": "I64", "shape": [rows],
+            "data_offsets": [embed_bytes, embed_bytes + tag_bytes],
         },
     }
     encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")

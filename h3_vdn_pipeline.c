@@ -199,7 +199,10 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
         return NULL;
     }
     if (params->reference_count || params->first_frame || params->last_frame) {
-        h3_set_error(ctx, "VDN MVP does not support conditioning references");
+        h3_set_error(ctx,
+            "OpenVDN does not define first/last-frame or ordered media "
+            "conditioning; use MiniMax-H3 FL2VA/Ref2VA without "
+            "--vdn-checkpoint");
         return NULL;
     }
     if (params->preview_denoise) {

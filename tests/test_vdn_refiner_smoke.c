@@ -16,8 +16,10 @@ int main(int argc, char **argv) {
     int status = 1;
     char error[512];
     h3_text_embedding prompt;
+    h3_vdn_layout layout;
     h3_vdn_model_weights weights;
     memset(&prompt, 0, sizeof(prompt));
+    memset(&layout, 0, sizeof(layout));
     memset(&weights, 0, sizeof(weights));
     h3_gpu *gpu = h3_gpu_create(NULL, error, sizeof(error));
     h3_vdn_weight_store *store = NULL;
@@ -30,10 +32,22 @@ int main(int argc, char **argv) {
                                       error, sizeof(error)) ||
         !h3_vdn_model_weights_load(store, gpu, &weights,
                                    error, sizeof(error))) goto failed;
+    if (!h3_vdn_layout_build(&prompt, 17, 2, 4, 93, &layout,
+                             error, sizeof(error)) ||
+        layout.text_rows != prompt.tokens ||
+        layout.audio_start != prompt.tokens) {
+        if (!error[0]) snprintf(error, sizeof(error),
+                                "variable prompt layout mismatch");
+        goto failed;
+    }
     refined = h3_vdn_refine_prompt(gpu, &weights, &prompt,
                                    error, sizeof(error));
     if (!refined) goto failed;
-    size_t elements = (size_t)800 * 5376;
+    size_t elements = prompt.tokens * 5376;
+    if (h3_gpu_tensor_elements(refined) != elements) {
+        snprintf(error, sizeof(error), "refined prompt size mismatch");
+        goto failed;
+    }
     values = malloc(elements * sizeof(*values));
     if (!values || !h3_gpu_tensor_read_bf16(refined, values, elements)) {
         snprintf(error, sizeof(error), "cannot read refined prompt");
@@ -50,9 +64,9 @@ int main(int argc, char **argv) {
         snprintf(error, sizeof(error), "refined prompt is unexpectedly sparse");
         goto failed;
     }
-    printf("VDN real prompt refinement passed: BF16[800,5376], "
+    printf("VDN real prompt refinement passed: BF16[%zu,5376], "
            "hash=%016llx, nonzero=%zu/%zu\n",
-           (unsigned long long)hash, nonzero, elements);
+           prompt.tokens, (unsigned long long)hash, nonzero, elements);
     status = 0;
     goto cleanup;
 failed:
@@ -62,6 +76,7 @@ cleanup:
     h3_gpu_tensor_free(refined);
     h3_vdn_model_weights_free(&weights);
     h3_vdn_prompt_free(&prompt);
+    h3_vdn_layout_free(&layout);
     h3_vdn_weight_store_free(store);
     h3_gpu_free(gpu);
     return status;

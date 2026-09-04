@@ -8,7 +8,6 @@
 #include <string.h>
 
 enum {
-    VDN_PROMPT_ROWS = 800,
     VDN_TEXT_WIDTH = 5120,
     VDN_HIDDEN = 5376,
     VDN_HEADS = 56,
@@ -69,7 +68,7 @@ int h3_vdn_layout_build(const h3_text_embedding *prompt,
     }
     memset(layout, 0, sizeof(*layout));
     if (!prompt || !prompt->values || !prompt->tags ||
-        prompt->tokens != VDN_PROMPT_ROWS ||
+        !prompt->tokens || prompt->tokens > INT32_MAX ||
         prompt->width != VDN_TEXT_WIDTH || !latent_frames ||
         latent_height < 2 || latent_width < 2 ||
         latent_height % 2 || latent_width % 2 ||
@@ -80,7 +79,7 @@ int h3_vdn_layout_build(const h3_text_embedding *prompt,
     }
     h3_layout_spec spec;
     memset(&spec, 0, sizeof(spec));
-    spec.text_len = VDN_PROMPT_ROWS;
+    spec.text_len = (int)prompt->tokens;
     spec.latent_t = (int)latent_frames;
     spec.latent_h = (int)latent_height;
     spec.latent_w = (int)latent_width;
@@ -105,8 +104,8 @@ int h3_vdn_layout_build(const h3_text_embedding *prompt,
         goto failed;
     }
     layout->sequence = (uint32_t)layout->packed.seq_len;
-    layout->text_rows = VDN_PROMPT_ROWS;
-    layout->audio_start = VDN_PROMPT_ROWS;
+    layout->text_rows = (uint32_t)prompt->tokens;
+    layout->audio_start = layout->text_rows;
     layout->audio_rows = (uint32_t)layout->packed.audio_target_rows;
     layout->video_start = layout->audio_start + layout->audio_rows;
     layout->video_rows = (uint32_t)layout->packed.img_target_rows;
@@ -130,7 +129,7 @@ int h3_vdn_layout_build(const h3_text_embedding *prompt,
         dit_fail(error, error_size, "out of memory building VDN layout tables");
         goto failed;
     }
-    memcpy(layout->token_tags, prompt->tags, VDN_PROMPT_ROWS);
+    memcpy(layout->token_tags, prompt->tags, prompt->tokens);
     memset(layout->token_tags + layout->audio_start, 2,
            layout->audio_rows);
     memset(layout->token_tags + layout->video_start, 0,
@@ -163,6 +162,7 @@ failed:
 }
 
 static int run_refiner(h3_gpu *gpu, const h3_vdn_refiner_weights *weights,
+                       uint32_t rows,
                        h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                        h3_gpu_tensor *query_raw, h3_gpu_tensor *key_raw,
                        h3_gpu_tensor *value, h3_gpu_tensor *query,
@@ -174,45 +174,45 @@ static int run_refiner(h3_gpu *gpu, const h3_vdn_refiner_weights *weights,
     if (!dit_op(gpu, (call), label, error, error_size)) return 0;             \
 } while (0)
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weights->norm1,
-                            VDN_PROMPT_ROWS, VDN_HIDDEN, 1e-5f),
+                            rows, VDN_HIDDEN, 1e-5f),
        "VDN refiner attention RMSNorm");
     OP(h3_gpu_linear_bf16(gpu, query_raw, norm, weights->q, NULL,
-                          VDN_PROMPT_ROWS, VDN_HIDDEN, VDN_INNER),
+                          rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner Q projection");
     OP(h3_gpu_linear_bf16(gpu, key_raw, norm, weights->k, NULL,
-                          VDN_PROMPT_ROWS, VDN_HIDDEN, VDN_INNER),
+                          rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner K projection");
     OP(h3_gpu_linear_bf16(gpu, value, norm, weights->v, NULL,
-                          VDN_PROMPT_ROWS, VDN_HIDDEN, VDN_INNER),
+                          rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner V projection");
     OP(h3_gpu_vdn_qk_rope_bf16(
            gpu, query, key, query_raw, key_raw, weights->q_norm,
-           weights->k_norm, dummy_rope, dummy_rope, VDN_PROMPT_ROWS,
+           weights->k_norm, dummy_rope, dummy_rope, rows,
            VDN_HEADS, VDN_HEAD_DIM, 0, 1e-5f),
        "VDN refiner QK normalization");
     OP(h3_gpu_sdpa_bf16(gpu, attended, query, key, value,
-                        VDN_PROMPT_ROWS, VDN_HEADS, VDN_HEAD_DIM,
+                        rows, VDN_HEADS, VDN_HEAD_DIM,
                         1.0f / sqrtf((float)VDN_HEAD_DIM)),
        "VDN refiner full attention");
     OP(h3_gpu_linear_bf16(gpu, branch, attended, weights->out, NULL,
-                          VDN_PROMPT_ROWS, VDN_INNER, VDN_HIDDEN),
+                          rows, VDN_INNER, VDN_HIDDEN),
        "VDN refiner attention output");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, branch,
-                       VDN_PROMPT_ROWS * VDN_HIDDEN),
+                       rows * VDN_HIDDEN),
        "VDN refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weights->norm2,
-                            VDN_PROMPT_ROWS, VDN_HIDDEN, 1e-5f),
+                            rows, VDN_HIDDEN, 1e-5f),
        "VDN refiner MLP RMSNorm");
     OP(h3_gpu_linear_bf16(gpu, fc1, norm, weights->fc1, NULL,
-                          VDN_PROMPT_ROWS, VDN_HIDDEN, VDN_FFN * 2),
+                          rows, VDN_HIDDEN, VDN_FFN * 2),
        "VDN refiner MLP input");
-    OP(h3_gpu_swiglu_bf16(gpu, activated, fc1, VDN_PROMPT_ROWS, VDN_FFN),
+    OP(h3_gpu_swiglu_bf16(gpu, activated, fc1, rows, VDN_FFN),
        "VDN refiner SwiGLU");
     OP(h3_gpu_linear_bf16(gpu, branch, activated, weights->fc2, NULL,
-                          VDN_PROMPT_ROWS, VDN_FFN, VDN_HIDDEN),
+                          rows, VDN_FFN, VDN_HIDDEN),
        "VDN refiner MLP output");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, branch,
-                       VDN_PROMPT_ROWS * VDN_HIDDEN),
+                       rows * VDN_HIDDEN),
        "VDN refiner MLP residual");
 #undef OP
     return 1;
@@ -222,15 +222,20 @@ h3_gpu_tensor *h3_vdn_refine_prompt(
         h3_gpu *gpu, const h3_vdn_model_weights *weights,
         const h3_text_embedding *prompt, char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!gpu || !weights || !prompt || !prompt->values ||
-        prompt->tokens != VDN_PROMPT_ROWS || prompt->width != VDN_TEXT_WIDTH) {
+    if (!gpu || !weights || !prompt || !prompt->values || !prompt->tokens ||
+        prompt->tokens > UINT32_MAX / VDN_HIDDEN ||
+        prompt->width != VDN_TEXT_WIDTH ||
+        prompt->tokens > SIZE_MAX / VDN_HIDDEN ||
+        prompt->tokens > SIZE_MAX / VDN_INNER ||
+        prompt->tokens > SIZE_MAX / (VDN_FFN * 2u)) {
         dit_fail(error, error_size, "invalid VDN prompt refinement arguments");
         return NULL;
     }
-    size_t hidden_elements = (size_t)VDN_PROMPT_ROWS * VDN_HIDDEN;
-    size_t inner_elements = (size_t)VDN_PROMPT_ROWS * VDN_INNER;
+    uint32_t rows = (uint32_t)prompt->tokens;
+    size_t hidden_elements = prompt->tokens * VDN_HIDDEN;
+    size_t inner_elements = prompt->tokens * VDN_INNER;
     h3_gpu_tensor *source = h3_gpu_tensor_from_bf16(
-        gpu, prompt->values, (size_t)VDN_PROMPT_ROWS * VDN_TEXT_WIDTH);
+        gpu, prompt->values, prompt->tokens * VDN_TEXT_WIDTH);
     h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
     h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
     h3_gpu_tensor *query_raw = h3_gpu_tensor_new_bf16(gpu, inner_elements);
@@ -241,9 +246,9 @@ h3_gpu_tensor *h3_vdn_refine_prompt(
     h3_gpu_tensor *attended = h3_gpu_tensor_new_bf16(gpu, inner_elements);
     h3_gpu_tensor *branch = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
     h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)VDN_PROMPT_ROWS * VDN_FFN * 2);
+        gpu, prompt->tokens * VDN_FFN * 2u);
     h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)VDN_PROMPT_ROWS * VDN_FFN);
+        gpu, prompt->tokens * VDN_FFN);
     h3_gpu_tensor *dummy_rope = h3_gpu_tensor_new_bf16(gpu, 1);
     int ok = source && hidden && norm && query_raw && key_raw && value &&
              query && key && attended && branch && fc1 && activated &&
@@ -258,17 +263,17 @@ h3_gpu_tensor *h3_vdn_refine_prompt(
                 error, error_size) &&
          dit_op(gpu, h3_gpu_linear_bf16(
                     gpu, hidden, source, weights->context_weight,
-                    weights->context_bias, VDN_PROMPT_ROWS, VDN_TEXT_WIDTH,
+                    weights->context_bias, rows, VDN_TEXT_WIDTH,
                     VDN_HIDDEN), "VDN context projection", error, error_size) &&
-         run_refiner(gpu, &weights->refiner[0], hidden, norm, query_raw,
+         run_refiner(gpu, &weights->refiner[0], rows, hidden, norm, query_raw,
                      key_raw, value, query, key, attended, branch, fc1,
                      activated, dummy_rope, error, error_size) &&
-         run_refiner(gpu, &weights->refiner[1], hidden, norm, query_raw,
+         run_refiner(gpu, &weights->refiner[1], rows, hidden, norm, query_raw,
                      key_raw, value, query, key, attended, branch, fc1,
                      activated, dummy_rope, error, error_size) &&
          dit_op(gpu, h3_gpu_rms_norm_bf16(
                     gpu, hidden, hidden, weights->refiner_final_norm,
-                    VDN_PROMPT_ROWS, VDN_HIDDEN, 1e-5f),
+                    rows, VDN_HIDDEN, 1e-5f),
                 "VDN refiner final RMSNorm", error, error_size) &&
          dit_op(gpu, h3_gpu_submit(gpu), "submit VDN prompt refinement",
                 error, error_size);
@@ -755,7 +760,7 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
         (size_t)layout->sequence * VDN_ROPE_HALF : 0;
     if (!gpu || !store || !weights || !refined_prompt || !layout ||
         !video_rows || (layout && layout->audio_rows && !audio_rows) ||
-        !velocity || !layout->sequence || layout->text_rows != VDN_PROMPT_ROWS ||
+        !velocity || !layout->sequence || !layout->text_rows ||
         layout->video_start != layout->audio_start + layout->audio_rows ||
         layout->sequence != layout->video_start + layout->video_rows ||
         !isfinite(video_timestep) || !isfinite(audio_timestep) ||
@@ -763,7 +768,7 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
         audio_timestep < 0.0f || audio_timestep >= 1.0f ||
         h3_gpu_tensor_dtype(refined_prompt) != H3_GPU_BF16 ||
         h3_gpu_tensor_elements(refined_prompt) <
-            (size_t)VDN_PROMPT_ROWS * VDN_HIDDEN ||
+            (size_t)layout->text_rows * VDN_HIDDEN ||
         h3_gpu_tensor_dtype(video_rows) != H3_GPU_F32 ||
         h3_gpu_tensor_elements(video_rows) < video_elements ||
         (layout->audio_rows &&

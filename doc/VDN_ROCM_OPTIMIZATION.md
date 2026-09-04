@@ -9,7 +9,7 @@ compared with the scalar BF16 path.
 
 - Target start: `3cc97ec5f0c880486bdbb85335ba5d44ca5df562`
 - GPU: AMD Radeon AI PRO R9700, `gfx1201`, wave32
-- ROCm: 7.2
+- ROCm: 7.2.3; HIP 7.2.53211; AMD clang 22.0.0git
 - Checkpoint: OpenVDN `stage-dmd-step-250`, default and turbo adapters
 - Reference implementation: `alexhegit/h3-hip.c` at
   `377ad3698d9d82fdb9ab5a22afc9fdc2c521adc3`
@@ -328,6 +328,44 @@ Both outputs were byte-identical 2,315,918-byte MP4 files with SHA-256
 `ffprobe` reports H.264, 56 frames, 512x512 at 24 fps, and stereo AAC at 32 kHz.
 All 56 decoded frame hashes were distinct; audio mean/peak volume was
 -23.5/-9.8 dB.
+
+### KEEP: configurable HIP code-object targets
+
+The HIP build now accepts a space-separated `HIP_ARCHS` list while retaining
+`gfx1201` as the default. On ROCm 7.2.3 the complete HIP translation unit built
+successfully in compile-only checks for `gfx90a`, `gfx942`, `gfx1030`,
+`gfx1100`, `gfx1151`, and `gfx1201`. Only the R9700 `gfx1201` target has runtime
+evidence and is part of the stable support guarantee; the others remain
+compile-only rather than being advertised as supported.
+
+The validated GPU reports wavefront size 32, 31.9 GiB VRAM, and zero UMC RAS
+correctable/uncorrectable errors after the release stress run. Forced scalar
+and default wave32 production-shape attention both produced hash
+`3d65eea81de34693`; their single-iteration times were 4.8031 and 0.4146 seconds.
+The runtime continues to require wave size 32 before selecting the optimized
+kernel, and `H3_VDN_SCALAR_SDPA=1` remains the explicit fallback.
+
+### KEEP: official variable-length prompt contract
+
+OpenVDN upstream commit `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`
+uses a separate Qwen3-VL-32B conditioner: verbatim tokenization without special
+tokens, decoder hidden state 50, BF16 `[L,5120]`, and I64 `[L]` text tags. The
+release checkpoint contains no processor, tokenizer, or text-encoder files.
+Its three official prompts have 800, 821, and 1299 rows, which exposed the old
+800-row-only converter as an incomplete contract.
+
+The safe no-unpickle converter, safetensors loader, prompt refiner, and packed
+layout now carry `L` dynamically. All three official prompts pass conversion
+and loading; the 821- and 1299-row prompts pass real GPU refinement, and the
+821-row prompt passes a complete 50-layer forward on `gfx1201`. The existing
+800-row conversion is byte-identical and retains its established hashes.
+
+Raw text remains an explicit upstream preprocessing step: embedding the 62 GB
+PyTorch/Transformers conditioner into this native runtime is outside the stable
+binary's dependency and checkpoint boundary. Upstream OpenVDN inference defines
+only `render.prompt_file`; it has no first/last-frame or ordered-media config.
+The native API tests these unsupported paths for early, nonzero, actionable
+failure rather than borrowing the different FL2VA/Ref2VA model semantics.
 
 ## Test gates
 

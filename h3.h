@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define H3_VERSION "0.1.0-dev"
+#define H3_VERSION "0.1.0"
 #define H3_DEFAULT_WIDTH 864
 #define H3_DEFAULT_HEIGHT 480
 #define H3_DEFAULT_FRAMES 56
@@ -126,7 +126,7 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
-    /* OpenVDN MVP input: converted BF16 [tokens,5120] plus I64 token tags. */
+    /* OpenVDN input: converted BF16 [L,5120] plus I64 [L] token tags. */
     const char *prompt_embeddings;
 } h3_params;
 

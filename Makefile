@@ -27,11 +27,13 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 BACKEND_PROBE_OBJ := h3_metal.o
 else ifeq ($(BACKEND),hip)
 ROCM_PATH ?= /opt/rocm
+HIP_ARCHS ?= gfx1201
+HIP_OFFLOAD_FLAGS := $(addprefix --offload-arch=,$(HIP_ARCHS))
 CC := $(ROCM_PATH)/llvm/bin/clang
 CXX := $(ROCM_PATH)/bin/hipcc
 LINK := $(CXX)
 CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -DH3_BACKEND_HIP
-CXXFLAGS += -DH3_BACKEND_HIP --offload-arch=gfx1201
+CXXFLAGS += -DH3_BACKEND_HIP $(HIP_OFFLOAD_FLAGS)
 LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lrocsolver -lrocblas -lamdhip64 -licuuc -licui18n -lm -lpthread -ldl
 LIB_C += h3_tokenizer_stub.c
@@ -50,7 +52,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 	vdn-gpu-ops-test vdn-refiner-smoke-test vdn-block-smoke-test \
 	vdn-stack-smoke-test vdn-forward-smoke-test vdn-denoise-smoke-test \
 	vdn-video-vae-smoke-test vdn-audio-vae-smoke-test \
-	vdn-e2e-test \
+	vdn-e2e-test vdn-input-contract-test \
 	parity real-parity clean
 
 all: h3 libh3.a
@@ -128,6 +130,15 @@ h3_vdn_prompt_tests: tests/test_vdn_prompt.o h3_vdn_prompt.o h3_safetensors.o
 
 vdn-prompt-test: h3_vdn_prompt_tests
 	./h3_vdn_prompt_tests \
+		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors
+
+h3_vdn_input_contract_tests: tests/test_vdn_input_contract.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+vdn-input-contract-test: h3_vdn_input_contract_tests
+	./h3_vdn_input_contract_tests \
+		$(VDN_METADATA_ROOT)/h3-base \
+		$(VDN_METADATA_ROOT)/stage-dmd-step-250 \
 		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors
 
 h3_vdn_gpu_ops_tests: tests/test_gpu_vdn_ops.o $(BACKEND_PROBE_OBJ) \
@@ -407,7 +418,15 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_json_tests h3_vdn_metadata_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
+	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_gpu_ops_tests \
+		h3_gpu_dit_ops_tests h3_json_tests h3_vdn_metadata_tests \
+		h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
+		h3_vdn_reference_tests h3_vdn_block_loader_tests h3_vdn_prompt_tests \
+		h3_vdn_input_contract_tests h3_vdn_gpu_ops_tests \
+		h3_vdn_feature_tests h3_vdn_solve_tests h3_vdn_scan_tests \
+		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
+		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
+		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

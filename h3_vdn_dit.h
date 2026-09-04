@@ -72,8 +72,8 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                    h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
                    char *error, size_t error_size);
 
-/* Project and refine the released 800-row prompt. The returned BF16 tensor is
- * [800,5376] and owned by the caller. */
+/* Project and refine an official variable-length prompt. The returned BF16
+ * tensor is [prompt->tokens,5376] and owned by the caller. */
 h3_gpu_tensor *h3_vdn_refine_prompt(
     h3_gpu *gpu, const h3_vdn_model_weights *weights,
     const h3_text_embedding *prompt, char *error, size_t error_size);

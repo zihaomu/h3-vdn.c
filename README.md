@@ -13,13 +13,13 @@ and audio on HIP.
 | Path | Host/backend | Prompt input | Status |
 |---|---|---|---|
 | MiniMax-H3 FL2VA/Ref2VA | macOS, Metal | Raw text with optional media references | End to end |
-| OpenVDN `stage-dmd-step-250` | Linux, ROCm/HIP | Pre-encoded prompt safetensors | End-to-end MVP validated |
+| OpenVDN `stage-dmd-step-250` | Linux, ROCm/HIP | Pre-encoded prompt safetensors | v0.1.0 stable scope validated |
 
 ## OpenVDN on Linux/ROCm
 
 ### Requirements and pinned release
 
-The current HIP port is validated on x86_64 Ubuntu 24.04, ROCm 7.2, and an AMD
+The current HIP port is validated on x86_64 Ubuntu 24.04, ROCm 7.2.3, and an AMD
 Radeon AI PRO R9700 (`gfx1201`, 31.9 GiB). The preflight requires at least one
 `gfx1201` device,
 30 GB of VRAM, 16 GB of currently available host memory, and 100 GB of free disk
@@ -54,10 +54,10 @@ baseline reports are ignored by Git.
 
 ### Prepare a prompt
 
-The OpenVDN checkpoint does not contain the Qwen3-VL-32B prompt encoder. The
-native MVP therefore accepts an externally encoded prompt rather than raw `-p`
-text. Obtain the pinned upstream examples and convert one of its `prompts/*.pt`
-files to the small, auditable input format used by this runtime:
+The OpenVDN checkpoint does not contain its Qwen3-VL-32B processor or prompt
+encoder. The stable native API therefore accepts an externally encoded prompt
+rather than raw `-p` text. Obtain the pinned upstream examples and convert any
+of its `prompts/*.pt` files to the small, auditable input format used here:
 
 ```sh
 git clone https://github.com/OpenVDN/vdn-minimax-h3.git \
@@ -71,13 +71,19 @@ python3 scripts/convert_vdn_prompt.py \
 ```
 
 The converter uses only the Python standard library, never unpickles the `.pt`
-archive, and validates the released BF16 `[800,5120]` embeddings and I64 `[800]`
-token tags before writing safetensors.
+archive, and validates the official variable-length BF16 `[L,5120]` embeddings
+and I64 `[L]` token tags before writing safetensors. The three pinned examples
+contain 800, 821, and 1299 rows; all three are accepted. The 800-row conversion
+remains byte-identical to the earlier fixture.
 
 To encode a new text prompt, first use the pinned upstream OpenVDN
 `src/inference/encode_prompt.py` environment, then convert its `.pt` output with
-the same command. Direct raw-text VDN encoding inside this binary is not yet
-implemented.
+the same command. That official script tokenizes the prompt verbatim without a
+chat template or special tokens and extracts Qwen decoder hidden state 50. It
+loads the approximately 62 GB conditioner from `MiniMaxAI/MiniMax-H3`; keeping
+that separate avoids adding PyTorch/Transformers and a second model-sized
+runtime to this C inference binary. Raw `-p` therefore fails with an actionable
+error instead of silently using a different encoder.
 
 ### Build, inspect, and generate
 
@@ -90,6 +96,10 @@ make BACKEND=hip -j16
   --model-dir models/vdn-minimax-h3/h3-base \
   --vdn-checkpoint models/vdn-minimax-h3/stage-dmd-step-250
 ```
+
+The HIP build defaults to `HIP_ARCHS=gfx1201`. A different code-object set can
+be requested, for example `make BACKEND=hip HIP_ARCHS="gfx1100 gfx1201"`; this
+controls compilation only and does not imply runtime validation.
 
 Source the local tool environment in every new shell before generating media,
 then run the end-to-end correctness workload:
@@ -189,9 +199,9 @@ distributed wave softmax, the latest run completed in 74.71 seconds. Every
 acceptance reproduced the exact 73,528-byte MP4 SHA-256 above; isolated crossed
 A/B results are used for individual optimization claims.
 
-### Current OpenVDN scope
+### OpenVDN v0.1.0 stable scope
 
-The validated MVP intentionally keeps a narrow correctness surface:
+The first stable release intentionally keeps a narrow correctness surface:
 
 - `stage-dmd-step-250`, default plus turbo adapters, and exactly 8 NFE are
   validated end to end. `stage-b-step-2000` metadata is validated, but its
@@ -199,21 +209,40 @@ The validated MVP intentionally keeps a narrow correctness surface:
 - The VDN path always uses all 50 blocks with `--reuse 1`, `--core-reuse 1`, no
   token reduction, and no int8 row FC2. Unsupported speed combinations fail
   explicitly rather than being silently ignored.
-- `--prompt-embeds` is required. Raw `-p` text, `--show` denoising previews,
-  first/last frames, and ordered media references are not implemented for VDN.
+- `--prompt-embeds` is the stable VDN input API and accepts the official
+  variable-length `[L,5120]` contract. Raw `-p` remains an explicit external
+  preprocessing step because the released VDN checkpoint omits its 62 GB
+  Qwen3-VL-32B conditioner.
+- The pinned OpenVDN inference schema has no first/last-frame or ordered-media
+  input. Those flags fail before weights are loaded and direct users to the
+  separate MiniMax-H3 FL2VA/Ref2VA checkpoints. `--show` previews also remain
+  unsupported on VDN.
 - One selected ROCm device is used. Eight devices are enumerated, but multi-GPU
   layer sharding remains future work.
 - The `gfx1201` wave32 attention path is bitwise-checked against the scalar
   implementation and has completed a 50-layer production-token performance
-  run. Large production canvases have not completed visual-quality or full
-  VAE/mux acceptance.
+  run plus two byte-identical 512x512/56-frame full E2E acceptances.
 - VDN execution is HIP-only. The separate original MiniMax-H3 Metal path and
   its CLI behavior remain available on macOS.
+
+ROCm support is intentionally stated as a tested matrix:
+
+| Target | Status | Evidence |
+|---|---|---|
+| R9700 / `gfx1201`, ROCm 7.2.3 | Tested | Clean build, scalar/wave32 parity, 50-layer stress, and production E2E |
+| `gfx90a`, `gfx942`, `gfx1030`, `gfx1100`, `gfx1151` | Compile-only | HIP translation unit builds; runtime is unvalidated |
+| Other ROCm targets | Unsupported | No build or runtime evidence |
+
+The first stable release guarantees one selected `gfx1201` GPU. Wave32 is
+selected only when the runtime reports a 32-lane wave and the shape is eligible;
+`H3_VDN_SCALAR_SDPA=1` forces the correctness fallback.
 
 The repository performance ledger is
 [`doc/VDN_ROCM_OPTIMIZATION.md`](doc/VDN_ROCM_OPTIMIZATION.md). The broader
 workspace implementation and acceptance plan remains in
 `../doc/vdn-minimax-h3-implementation-plan.md`.
+Release evidence and known limitations are summarized in
+[`doc/VDN_ROCM_STABLE_RELEASE.md`](doc/VDN_ROCM_STABLE_RELEASE.md).
 
 ## MiniMax-H3 Metal tutorial
 
@@ -639,7 +668,7 @@ make BACKEND=hip h3_tests
 make BACKEND=hip \
   backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
   vdn-metadata-test vdn-reference-test vdn-block-loader-test \
-  vdn-prompt-test vdn-gpu-ops-test
+  vdn-prompt-test vdn-input-contract-test vdn-gpu-ops-test
 ```
 
 The real-weight tests are intentionally split so loader, refiner, block stack,
