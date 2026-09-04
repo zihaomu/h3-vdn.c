@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct h3_gpu h3_gpu;
 typedef struct h3_gpu_tensor h3_gpu_tensor;
 
@@ -293,6 +297,16 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim);
+/* Build an effective BF16 LoRA weight in row-major [output_dim,input_dim]:
+ * output = base + scale * lora_b[output_dim,rank] @
+ *                         lora_a[rank,input_dim].
+ * output may alias base, but must not alias either adapter matrix. */
+int h3_gpu_lora_merge_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *base,
+                           const h3_gpu_tensor *lora_a,
+                           const h3_gpu_tensor *lora_b,
+                           uint32_t input_dim, uint32_t output_dim,
+                           uint32_t rank, float scale);
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,
@@ -439,6 +453,114 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          const h3_gpu_tensor *rope_sin, uint32_t sequence,
                          uint32_t heads, uint32_t head_dim,
                          uint32_t rope_half, float epsilon);
+/* OpenVDN stores Q/K/V as independent projections and reuses their raw
+ * outputs in its NoPE linear branch. Normalize/RoPE Q and K without packing
+ * or modifying those raw tensors. */
+int h3_gpu_vdn_qk_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                            h3_gpu_tensor *key,
+                            const h3_gpu_tensor *query_raw,
+                            const h3_gpu_tensor *key_raw,
+                            const h3_gpu_tensor *q_norm,
+                            const h3_gpu_tensor *k_norm,
+                            const h3_gpu_tensor *rope_cos,
+                            const h3_gpu_tensor *rope_sin,
+                            uint32_t sequence, uint32_t heads,
+                            uint32_t head_dim, uint32_t rope_half,
+                            float epsilon);
+/* Correctness-first OpenVDN window attention. Non-video rows are global;
+ * video rows use chunk-aligned frame bounds and optional first/last anchors. */
+int h3_gpu_vdn_window_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *query,
+                            const h3_gpu_tensor *key,
+                            const h3_gpu_tensor *value,
+                            uint32_t sequence, uint32_t heads,
+                            uint32_t head_dim, uint32_t video_start,
+                            uint32_t frames, uint32_t tokens_per_frame,
+                            uint32_t radius, uint32_t chunk,
+                            int anchor_both, float scale);
+int h3_gpu_vdn_softmax_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *attended,
+                            const h3_gpu_tensor *gate_logits,
+                            uint32_t rows, uint32_t heads,
+                            uint32_t head_dim);
+/* Prepare the NoPE linear-branch features for contiguous video rows. Q gets
+ * SiLU+L2Norm; K/V first receive zero-padded separable 5x5x5 depthwise
+ * convolution, then SiLU, with L2Norm on K only. */
+int h3_gpu_vdn_linear_features_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *query,
+                            h3_gpu_tensor *key, h3_gpu_tensor *value,
+                            const h3_gpu_tensor *query_raw,
+                            const h3_gpu_tensor *key_raw,
+                            const h3_gpu_tensor *value_raw,
+                            const h3_gpu_tensor *k_spatial,
+                            const h3_gpu_tensor *k_temporal,
+                            const h3_gpu_tensor *v_spatial,
+                            const h3_gpu_tensor *v_temporal,
+                            uint32_t frames, uint32_t frame_height,
+                            uint32_t frame_width, uint32_t heads,
+                            uint32_t head_dim, float epsilon);
+int h3_gpu_vdn_text_features_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *key,
+                            h3_gpu_tensor *value,
+                            const h3_gpu_tensor *key_raw,
+                            const h3_gpu_tensor *value_raw,
+                            uint32_t rows, uint32_t heads,
+                            uint32_t head_dim, float epsilon);
+/* A/B are FP32 [frames,heads,head_dim,head_dim]. Beta is supplied as
+ * pre-sigmoid BF16 logits [frames*tokens_per_frame,heads]. */
+int h3_gpu_vdn_frame_stats_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *a,
+                            h3_gpu_tensor *b,
+                            const h3_gpu_tensor *key,
+                            const h3_gpu_tensor *value,
+                            const h3_gpu_tensor *beta_logits,
+                            uint32_t frames, uint32_t tokens_per_frame,
+                            uint32_t heads, uint32_t head_dim);
+/* In-place factorizes A+I and builds the exact VDN solve factors. Alpha is
+ * FP32 [frames,heads,head_dim]; transition/injection use the matrix shape. */
+int h3_gpu_vdn_solve_f32(h3_gpu *gpu,
+                            h3_gpu_tensor *transition,
+                            h3_gpu_tensor *injection,
+                            h3_gpu_tensor *a,
+                            const h3_gpu_tensor *b,
+                            const h3_gpu_tensor *alpha,
+                            uint32_t frames, uint32_t heads,
+                            uint32_t head_dim);
+int h3_gpu_vdn_frame_mean_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input, size_t input_offset,
+                            uint32_t frames, uint32_t tokens_per_frame,
+                            uint32_t width);
+/* Finalize FrameKDAAlpha after its two promoted-F32 linear projections. */
+int h3_gpu_vdn_alpha_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *delta,
+                            const h3_gpu_tensor *dt_bias,
+                            const h3_gpu_tensor *a_log,
+                            uint32_t frames, uint32_t heads,
+                            uint32_t head_dim);
+int h3_gpu_vdn_scan_f32(h3_gpu *gpu, h3_gpu_tensor *prefix,
+                            h3_gpu_tensor *suffix,
+                            const h3_gpu_tensor *transition,
+                            const h3_gpu_tensor *injection,
+                            const h3_gpu_tensor *text_state,
+                            float text_state_scale,
+                            uint32_t frames, uint32_t heads,
+                            uint32_t head_dim);
+/* Anchor-pruned readout: frames are original frames 1..F-2. It gathers the
+ * complement of the released chunk window, applies alpha bridges, Q readout,
+ * per-head RMSNorm and the per-channel sigmoid output gate. */
+int h3_gpu_vdn_readout_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *query,
+                            const h3_gpu_tensor *prefix,
+                            const h3_gpu_tensor *suffix,
+                            const h3_gpu_tensor *alpha,
+                            const h3_gpu_tensor *text_state,
+                            float text_state_scale,
+                            const h3_gpu_tensor *norm_weight,
+                            const h3_gpu_tensor *gate_logits,
+                            uint32_t frames, uint32_t tokens_per_frame,
+                            uint32_t heads, uint32_t head_dim,
+                            uint32_t radius, uint32_t chunk,
+                            float epsilon);
 /* H3 checkpoint QKV rows are [head, q/k/v, dimension], unlike the
  * conventional [q/k/v, head, dimension] layout accepted above. */
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -606,8 +728,17 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
                       size_t sample_offset, const h3_gpu_tensor *last,
                       const h3_gpu_tensor *previous, uint32_t elements,
                       float delta, float ratio);
+/* Apply a rectified-flow Euler update from an F32 velocity:
+ * sample += velocity_scale * velocity. */
+int h3_gpu_euler_f32(h3_gpu *gpu, h3_gpu_tensor *sample,
+                     const h3_gpu_tensor *velocity, uint32_t elements,
+                     float velocity_scale);
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

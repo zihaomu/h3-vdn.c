@@ -4320,6 +4320,15 @@ kernel void h3_euler_bf16(device float *sample [[buffer(0)]],
     sample[sample_index] = fma(args.delta, velocity, sample[sample_index]);
 }
 
+kernel void h3_euler_f32(device float *sample [[buffer(0)]],
+                         device const float *velocity [[buffer(1)]],
+                         constant uint &count [[buffer(2)]],
+                         constant float &velocity_scale [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    sample[gid] = fma(velocity_scale, velocity[gid], sample[gid]);
+}
+
 kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
                               device const ushort *up [[buffer(1)]],
                               device ushort *output [[buffer(2)]],

@@ -126,17 +126,21 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
+    /* OpenVDN MVP input: converted BF16 [tokens,5120] plus I64 token tags. */
+    const char *prompt_embeddings;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL \
 }
 
 typedef struct {
+    char backend[32];
     char name[128];
     char architecture[128];
+    int device_index;
     uint64_t physical_memory;
     uint64_t recommended_working_set;
     uint64_t max_buffer_length;
@@ -152,12 +156,70 @@ typedef struct {
     size_t tensors;
 } h3_component_info;
 
+#define H3_VDN_MAX_ADAPTERS 2
+
+typedef struct {
+    char name[32];
+    int rank;
+    int alpha;
+    int exact_targets;
+    size_t target_count;
+    size_t rank_pattern_count;
+    size_t alpha_pattern_count;
+} h3_vdn_adapter_info;
+
+typedef struct {
+    int version;
+    int softmax_radius;
+    int softmax_chunk;
+    int enable_softmax_gate;
+    int anchor_both;
+    int linear_head_dim;
+    int accumulator_f32;
+    int enable_text_state;
+    int short_conv_k;
+    int short_conv_v;
+    char delta_rule[32];
+    char bridge[32];
+} h3_vdn_transform_info;
+
+typedef struct {
+    int enabled;
+    int weights_present;
+    char checkpoint_name[64];
+    char model_revision[65];
+    int checkpoint_format_version;
+    int model_spec_format_version;
+    int num_attention_heads;
+    int attention_head_dim;
+    int hidden_size;
+    int num_layers;
+    int num_refiner_layers;
+    int ffn_dim;
+    int in_channels;
+    int audio_in_channels;
+    int text_dim;
+    int num_steps;
+    double video_shift;
+    double audio_shift;
+    h3_vdn_transform_info transform;
+    size_t adapter_count;
+    h3_vdn_adapter_info adapters[H3_VDN_MAX_ADAPTERS];
+    h3_component_info base_transformer;
+    h3_component_info video_vae;
+    h3_component_info audio_vae;
+    h3_component_info linear_branch;
+    h3_component_info default_adapter;
+    h3_component_info turbo_adapter;
+} h3_vdn_info;
+
 typedef struct {
     h3_component_info text_encoder;
     h3_component_info fl2va_transformer;
     h3_component_info ref2va_transformer;
     h3_component_info video_vae;
     h3_component_info audio_vae;
+    h3_vdn_info vdn;
 } h3_model_info;
 
 struct h3_result {
@@ -169,8 +231,17 @@ struct h3_result {
     uint64_t seed;
 };
 
-/* Load model metadata and initialize the Metal device. Weights remain unmapped. */
+/* Enumerate and inspect devices exposed by the compiled GPU backend. */
+int h3_device_count(void);
+int h3_probe_device(int device_index, h3_device_info *info,
+                    char *error, size_t error_size);
+
+/* Load model metadata and initialize the selected device. Weights remain unmapped. */
 h3_ctx *h3_load_dir(const char *model_dir);
+h3_ctx *h3_load_dir_device(const char *model_dir, int device_index);
+h3_ctx *h3_load_vdn_dir(const char *base_model_dir,
+                        const char *vdn_checkpoint_dir,
+                        int device_index);
 void h3_free(h3_ctx *ctx);
 
 const char *h3_last_error(const h3_ctx *ctx);

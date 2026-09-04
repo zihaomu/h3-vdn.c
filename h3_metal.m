@@ -1,7 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include "h3_metal.h"
+#include "h3_backend.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -12,15 +12,30 @@ static void h3_copy_string(char *destination, size_t size, NSString *value) {
     snprintf(destination, size, "%s", source ? source : "unknown");
 }
 
-int h3_metal_probe(h3_device_info *info, char *error, size_t error_size) {
+int h3_backend_device_count(char *error, size_t error_size) {
+    (void)error;
+    (void)error_size;
+    @autoreleasepool {
+        return (int)MTLCopyAllDevices().count;
+    }
+}
+
+int h3_backend_probe(int device_index, h3_device_info *info,
+                     char *error, size_t error_size) {
     if (!info) return 0;
     memset(info, 0, sizeof(*info));
     @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        if (!device) {
-            if (error && error_size) snprintf(error, error_size, "no Metal device available");
+        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+        if (device_index < 0 || (NSUInteger)device_index >= devices.count) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "Metal device index %d is out of range (count %zu)",
+                         device_index, (size_t)devices.count);
             return 0;
         }
+        id<MTLDevice> device = devices[(NSUInteger)device_index];
+        snprintf(info->backend, sizeof(info->backend), "metal");
+        info->device_index = device_index;
         h3_copy_string(info->name, sizeof(info->name), device.name);
         if (@available(macOS 14.0, *)) {
             h3_copy_string(info->architecture, sizeof(info->architecture),

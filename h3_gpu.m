@@ -2543,6 +2543,25 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
+int h3_gpu_lora_merge_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *base,
+                           const h3_gpu_tensor *lora_a,
+                           const h3_gpu_tensor *lora_b,
+                           uint32_t input_dim, uint32_t output_dim,
+                           uint32_t rank, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    (void)output;
+    (void)base;
+    (void)lora_a;
+    (void)lora_b;
+    (void)input_dim;
+    (void)output_dim;
+    (void)rank;
+    (void)scale;
+    h3_gpu_set_error(gpu, @"VDN LoRA merge is not implemented for Metal");
+    return 0;
+}
+
 static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
                                uint32_t input_dim, uint32_t hidden_dim,
                                uint32_t output_dim) {
@@ -4691,6 +4710,25 @@ int h3_gpu_euler_bf16(h3_gpu *opaque, h3_gpu_tensor *sample,
             [encoder setBuffer:TENSOR(last).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(previous).buffer offset:0 atIndex:2];
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_euler_f32(h3_gpu *opaque, h3_gpu_tensor *sample,
+                     const h3_gpu_tensor *velocity, uint32_t elements,
+                     float velocity_scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (!isfinite(velocity_scale) || !sample || !velocity ||
+        TENSOR(sample).dtype != H3_GPU_F32 ||
+        TENSOR(velocity).dtype != H3_GPU_F32 ||
+        TENSOR(sample).elements < elements ||
+        TENSOR(velocity).elements < elements) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_euler_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(sample).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(velocity).buffer offset:0 atIndex:1];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+            [encoder setBytes:&velocity_scale length:sizeof(velocity_scale)
+                       atIndex:3];
         });
 }
 

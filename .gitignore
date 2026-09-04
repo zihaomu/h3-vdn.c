@@ -1,8 +1,16 @@
 # Local models, references, experiments, and generated media.
 misc/
 MiniMax-H3/
+models/
 outputs/
 .ruff_cache/
+.venv/
+.tools/
+__pycache__/
+*.pyc
+
+# Environment snapshots are generated locally and may contain volatile usage data.
+doc/baseline/*.txt
 
 # Compiler and test outputs.
 *.o

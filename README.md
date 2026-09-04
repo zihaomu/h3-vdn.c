@@ -1,15 +1,162 @@
-# h3-metal
+# h3.c
 
-Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
-sequence of working vertical slices: deterministic host/model metadata first,
-then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
-first/last-frame conditioning and then ordered references.
+Native MiniMax-H3 inference for Apple Silicon and native OpenVDN MiniMax-H3
+inference for AMD ROCm on Linux.
 
-Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
-image/video/audio references work end to end. The current work is incremental
-H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
+The original MiniMax-H3 path supports prompt-to-video/audio, first/last-frame
+conditioning, and ordered Ref2VA image/video/audio references end to end on
+Metal. The OpenVDN path loads the Diffusers-format `h3-base` plus
+`stage-dmd-step-250`, merges its default and turbo LoRA adapters, streams all 50
+hybrid-attention blocks through one discrete GPU, and decodes synchronized video
+and audio on HIP.
 
-## Tutorial
+| Path | Host/backend | Prompt input | Status |
+|---|---|---|---|
+| MiniMax-H3 FL2VA/Ref2VA | macOS, Metal | Raw text with optional media references | End to end |
+| OpenVDN `stage-dmd-step-250` | Linux, ROCm/HIP | Pre-encoded prompt safetensors | End-to-end MVP validated |
+
+## OpenVDN on Linux/ROCm
+
+### Requirements and pinned release
+
+The current HIP port is validated on x86_64 Ubuntu 24.04, ROCm 7.2, and an AMD
+Radeon AI PRO R9700 (`gfx1201`, 31.9 GiB). The preflight requires at least one
+`gfx1201` device,
+30 GB of VRAM, 16 GB of currently available host memory, and 100 GB of free disk
+space. The full pinned model snapshot occupies about 87.4 GB on disk.
+
+The helper scripts pin both upstream inputs:
+
+```text
+OpenVDN code:  b8cb28fbfca0266d1c7742a9f25ab8b58191de97
+Model:         OpenVDN/vdn-minimax-h3
+Model revision: 18be6bcc4ee72585eee322ba28b5ccac2cf85ef0
+```
+
+Install project-local Hugging Face and FFmpeg tools, then run the environment
+check. The bootstrap writes only under `.tools/`; it does not replace the host
+Python environment or system FFmpeg.
+
+```sh
+scripts/bootstrap_vdn_tools.sh
+. scripts/use_vdn_tools.sh
+scripts/check_vdn_env.sh
+```
+
+Download and verify the pinned model snapshot:
+
+```sh
+scripts/download_vdn_model.sh models/vdn-minimax-h3
+```
+
+Model weights, local tools, generated media, converted prompts, and volatile
+baseline reports are ignored by Git.
+
+### Prepare a prompt
+
+The OpenVDN checkpoint does not contain the Qwen3-VL-32B prompt encoder. The
+native MVP therefore accepts an externally encoded prompt rather than raw `-p`
+text. Obtain the pinned upstream examples and convert one of its `prompts/*.pt`
+files to the small, auditable input format used by this runtime:
+
+```sh
+git clone https://github.com/OpenVDN/vdn-minimax-h3.git \
+  ../vdn-minimax-h3-upstream
+git -C ../vdn-minimax-h3-upstream checkout \
+  b8cb28fbfca0266d1c7742a9f25ab8b58191de97
+
+python3 scripts/convert_vdn_prompt.py \
+  ../vdn-minimax-h3-upstream/prompts/example_0.pt \
+  models/vdn-minimax-h3/prompts/example_0.safetensors
+```
+
+The converter uses only the Python standard library, never unpickles the `.pt`
+archive, and validates the released BF16 `[800,5120]` embeddings and I64 `[800]`
+token tags before writing safetensors.
+
+To encode a new text prompt, first use the pinned upstream OpenVDN
+`src/inference/encode_prompt.py` environment, then convert its `.pt` output with
+the same command. Direct raw-text VDN encoding inside this binary is not yet
+implemented.
+
+### Build, inspect, and generate
+
+Linux selects HIP by default; it can also be requested explicitly:
+
+```sh
+make BACKEND=hip -j16
+./h3 --list-devices
+./h3 --info \
+  --model-dir models/vdn-minimax-h3/h3-base \
+  --vdn-checkpoint models/vdn-minimax-h3/stage-dmd-step-250
+```
+
+Source the local tool environment in every new shell before generating media,
+then run the end-to-end correctness workload:
+
+```sh
+. scripts/use_vdn_tools.sh
+
+./h3 --device 0 \
+  --model-dir models/vdn-minimax-h3/h3-base \
+  --vdn-checkpoint models/vdn-minimax-h3/stage-dmd-step-250 \
+  --prompt-embeds models/vdn-minimax-h3/prompts/example_0.safetensors \
+  --width 64 --height 32 --frames 56 --seed 0 \
+  --output outputs/vdn-cli-smoke.mp4
+```
+
+The 64x32 canvas is deliberately a control-flow and resource-lifetime smoke
+test, not a visual-quality target. Width and height must be multiples of 32.
+The validated run performs eight actual model evaluations, each streaming all
+50 blocks and their effective base/default/turbo weights. If `--steps` is
+omitted, the CLI reads `8` from this checkpoint; an explicitly mismatched value
+fails before loading the large weights.
+
+Generation writes both the requested MP4 and
+`<output>.inference.json`. The record contains the fixed model revision,
+checkpoint and prompt paths, backend/device, seed, NFE, 12/3 video/audio shifts,
+tensor geometry, peak GPU allocation, and phase timings.
+
+The validated seed-0 smoke result is:
+
+```text
+video: H.264, 56 frames, 64x32, 24 fps, 2.333333 s
+audio: AAC, stereo, 32000 Hz, 2.325000 s
+MP4:   73528 bytes
+SHA256: 7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b
+peak GPU allocation: 9706357024 bytes (about 9.04 GiB)
+```
+
+This result was reproduced byte-for-byte by both the lower-level end-to-end
+test and the public CLI. All 56 decoded video frames had distinct frame hashes;
+the decoded audio measured -27.5 dB mean and -14.5 dB peak, ruling out a frozen
+or silent container.
+
+### Current OpenVDN scope
+
+The validated MVP intentionally keeps a narrow correctness surface:
+
+- `stage-dmd-step-250`, default plus turbo adapters, and exactly 8 NFE are
+  validated end to end. `stage-b-step-2000` metadata is validated, but its
+  50-NFE output has not completed end-to-end acceptance.
+- The VDN path always uses all 50 blocks with `--reuse 1`, `--core-reuse 1`, no
+  token reduction, and no int8 row FC2. Unsupported speed combinations fail
+  explicitly rather than being silently ignored.
+- `--prompt-embeds` is required. Raw `-p` text, `--show` denoising previews,
+  first/last frames, and ordered media references are not implemented for VDN.
+- One selected ROCm device is used. Eight devices are enumerated, but multi-GPU
+  layer sharding remains future work.
+- The current attention kernels prioritize mathematical correctness. Large
+  production canvases are valid but have not completed visual-quality or
+  performance acceptance on this port.
+- VDN execution is HIP-only. The separate original MiniMax-H3 Metal path and
+  its CLI behavior remain available on macOS.
+
+For this implementation workspace, the detailed status, numerical hashes, and
+acceptance matrix are maintained in
+`../doc/vdn-minimax-h3-implementation-plan.md`.
+
+## MiniMax-H3 Metal tutorial
 
 ### 1. Build and inspect the model
 
@@ -405,6 +552,8 @@ decoded duration is capped at 15 seconds.
 
 ## Tests and runtime requirements
 
+### Apple Metal
+
 ```sh
 make test
 make parity
@@ -418,6 +567,40 @@ toolchain. The test covers both an F32 diagnosis path and the production BF16
 storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, with
 direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
 checks.
+
+### Linux HIP and OpenVDN
+
+Build and run the deterministic host, backend, and operator suites with:
+
+```sh
+make BACKEND=hip -j16
+make BACKEND=hip h3_tests
+./h3_tests
+make BACKEND=hip \
+  backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
+  vdn-metadata-test vdn-reference-test vdn-block-loader-test \
+  vdn-prompt-test vdn-gpu-ops-test
+```
+
+The real-weight tests are intentionally split so loader, refiner, block stack,
+complete forward, scheduler, and VAE failures remain attributable:
+
+```sh
+make BACKEND=hip vdn-refiner-smoke-test
+make BACKEND=hip vdn-block-smoke-test
+make BACKEND=hip vdn-stack-smoke-test
+make BACKEND=hip vdn-forward-smoke-test
+make BACKEND=hip vdn-denoise-smoke-test
+make BACKEND=hip vdn-video-vae-smoke-test
+make BACKEND=hip vdn-audio-vae-smoke-test
+make BACKEND=hip vdn-e2e-test
+```
+
+These targets expect the pinned snapshot at `models/vdn-minimax-h3` and the
+converted `prompts/example_0.safetensors`. `vdn-e2e-test` injects the
+project-local FFmpeg library path itself and writes
+`outputs/vdn-e2e-smoke.mp4`. The full denoise test performs 400 real transformer
+block evaluations and is not a quick unit test.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and

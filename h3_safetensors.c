@@ -539,6 +539,127 @@ static int h3_has_suffix(const char *value, const char *suffix) {
     return length >= suffix_length && !strcmp(value + length - suffix_length, suffix);
 }
 
+struct h3_st_catalog {
+    h3_st_header *headers;
+    size_t file_count;
+    size_t tensor_count;
+};
+
+void h3_st_catalog_free(h3_st_catalog *catalog) {
+    if (!catalog) return;
+    for (size_t index = 0; index < catalog->file_count; index++)
+        h3_st_free_header(&catalog->headers[index]);
+    free(catalog->headers);
+    free(catalog);
+}
+
+h3_st_catalog *h3_st_catalog_open(const char *directory,
+                                  char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!directory || !*directory) {
+        if (error && error_size)
+            snprintf(error, error_size, "safetensors directory is required");
+        return NULL;
+    }
+    DIR *stream = opendir(directory);
+    if (!stream) {
+        if (error && error_size)
+            snprintf(error, error_size, "%s: %s", directory, strerror(errno));
+        return NULL;
+    }
+    h3_st_catalog *catalog = calloc(1, sizeof(*catalog));
+    if (!catalog) {
+        if (error && error_size) snprintf(error, error_size, "out of memory");
+        closedir(stream);
+        return NULL;
+    }
+    size_t capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) {
+        if (entry->d_name[0] == '.' ||
+            !h3_has_suffix(entry->d_name, ".safetensors")) continue;
+        if (catalog->file_count == capacity) {
+            size_t next = capacity ? capacity * 2 : 8;
+            h3_st_header *grown = realloc(
+                catalog->headers, next * sizeof(*grown));
+            if (!grown) {
+                if (error && error_size)
+                    snprintf(error, error_size, "out of memory");
+                closedir(stream);
+                h3_st_catalog_free(catalog);
+                return NULL;
+            }
+            catalog->headers = grown;
+            capacity = next;
+        }
+        size_t length = strlen(directory) + strlen(entry->d_name) + 2;
+        char *path = malloc(length);
+        if (!path) {
+            if (error && error_size) snprintf(error, error_size, "out of memory");
+            closedir(stream);
+            h3_st_catalog_free(catalog);
+            return NULL;
+        }
+        snprintf(path, length, "%s/%s", directory, entry->d_name);
+        h3_st_header header;
+        int ok = h3_st_read_header(path, &header, error, error_size);
+        free(path);
+        if (!ok) {
+            closedir(stream);
+            h3_st_catalog_free(catalog);
+            return NULL;
+        }
+        catalog->headers[catalog->file_count++] = header;
+        catalog->tensor_count += header.tensor_count;
+    }
+    closedir(stream);
+    if (!catalog->file_count) {
+        if (error && error_size)
+            snprintf(error, error_size, "%s: no safetensors files", directory);
+        h3_st_catalog_free(catalog);
+        return NULL;
+    }
+    for (size_t file = 0; file < catalog->file_count; file++) {
+        const h3_st_header *header = &catalog->headers[file];
+        for (size_t tensor = 0; tensor < header->tensor_count; tensor++) {
+            const char *name = header->tensors[tensor].name;
+            for (size_t prior_file = 0; prior_file <= file; prior_file++) {
+                const h3_st_header *prior = &catalog->headers[prior_file];
+                size_t stop = prior_file == file ? tensor : prior->tensor_count;
+                for (size_t prior_tensor = 0; prior_tensor < stop;
+                     prior_tensor++) {
+                    if (!strcmp(name, prior->tensors[prior_tensor].name)) {
+                        if (error && error_size)
+                            snprintf(error, error_size,
+                                     "duplicate safetensors key: %s", name);
+                        h3_st_catalog_free(catalog);
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
+    return catalog;
+}
+
+size_t h3_st_catalog_file_count(const h3_st_catalog *catalog) {
+    return catalog ? catalog->file_count : 0;
+}
+
+size_t h3_st_catalog_tensor_count(const h3_st_catalog *catalog) {
+    return catalog ? catalog->tensor_count : 0;
+}
+
+const h3_st_tensor *h3_st_catalog_find(const h3_st_catalog *catalog,
+                                       const char *name) {
+    if (!catalog || !name) return NULL;
+    for (size_t file = 0; file < catalog->file_count; file++) {
+        const h3_st_tensor *tensor = h3_st_find(&catalog->headers[file], name);
+        if (tensor) return tensor;
+    }
+    return NULL;
+}
+
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size) {
     if (!directory || !info) return 0;

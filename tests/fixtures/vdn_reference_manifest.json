@@ -1,0 +1,27 @@
+{
+  "source_repository": "https://github.com/OpenVDN/vdn-minimax-h3.git",
+  "source_commit": "b8cb28fbfca0266d1c7742a9f25ab8b58191de97",
+  "model_repository": "OpenVDN/vdn-minimax-h3",
+  "model_revision": "18be6bcc4ee72585eee322ba28b5ccac2cf85ef0",
+  "reference_dtype": "float32",
+  "tolerance": { "absolute": 0.00001, "relative": 0.00001 },
+  "cases": [
+    {
+      "name": "chunk_window_anchor_prune",
+      "frames": 12,
+      "radius": 1,
+      "chunk": 5,
+      "anchor_frames": "both"
+    },
+    {
+      "name": "vdn_solve_bidirectional_text_bridge",
+      "frames": 4,
+      "tokens_per_frame": 3,
+      "key_dim": 2,
+      "value_dim": 2,
+      "delta_rule": "vdn_solve",
+      "bridge": "alpha",
+      "text_state_scale": 0.5
+    }
+  ]
+}

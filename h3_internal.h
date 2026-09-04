@@ -11,6 +11,7 @@ struct h3_video_vae_decoder;
 
 struct h3_ctx {
     char *model_dir;
+    char *vdn_checkpoint_dir;
     char error[512];
     h3_device_info device;
     h3_model_info model;

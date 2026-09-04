@@ -41,6 +41,8 @@ typedef struct {
     size_t tensor_count;
 } h3_st_header;
 
+typedef struct h3_st_catalog h3_st_catalog;
+
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size);
 void h3_st_free_header(h3_st_header *header);
@@ -50,6 +52,15 @@ int h3_st_read_data(const h3_st_header *header, const h3_st_tensor *tensor,
                     void *data, size_t bytes, char *error, size_t error_size);
 size_t h3_dtype_size(h3_dtype dtype);
 const char *h3_dtype_name(h3_dtype dtype);
+
+/* Header-only catalog used by strict checkpoint schema validation. */
+h3_st_catalog *h3_st_catalog_open(const char *directory,
+                                  char *error, size_t error_size);
+void h3_st_catalog_free(h3_st_catalog *catalog);
+size_t h3_st_catalog_file_count(const h3_st_catalog *catalog);
+size_t h3_st_catalog_tensor_count(const h3_st_catalog *catalog);
+const h3_st_tensor *h3_st_catalog_find(const h3_st_catalog *catalog,
+                                       const char *name);
 
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size);

@@ -72,6 +72,7 @@ static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
     CHECK(defaults.use_reference_rope == 0);
+    CHECK(defaults.prompt_embeddings == NULL);
 
     h3_sigma_schedule schedule;
     CHECK(h3_schedule_build(20, &schedule));
@@ -115,7 +116,11 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
-    CHECK(!h3_serving_schedule_build(1, &schedule));
+    CHECK(h3_serving_schedule_build(1, &schedule));
+    CHECK(schedule.steps == 1);
+    CHECK(fabsf(schedule.video[0] - 1.0f) < 1e-7f);
+    CHECK(fabsf(schedule.audio[0] - 1.0f) < 1e-7f);
+    CHECK(schedule.video[1] == 0.0f && schedule.audio[1] == 0.0f);
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
 }
 
@@ -373,14 +378,19 @@ static void test_dit_row_conversions(void) {
     CHECK(memcmp(audio, unpacked, sizeof(audio)) == 0);
 }
 
-static void test_metal_probe(void) {
+static void test_backend_probe(void) {
     h3_device_info info;
     char error[256];
     CHECK(h3_metal_probe(&info, error, sizeof(error)));
     CHECK(info.name[0] != '\0');
     CHECK(info.physical_memory >= UINT64_C(8) * 1024 * 1024 * 1024);
     CHECK(info.max_buffer_length > 0);
+#if defined(__APPLE__)
     CHECK(info.apple_gpu_family > 0);
+#else
+    CHECK(strcmp(info.backend, "hip") == 0);
+    CHECK(info.architecture[0] != '\0');
+#endif
 }
 
 static void test_terminal_zoom(void) {
@@ -407,7 +417,7 @@ int main(void) {
     test_rng_and_solver();
     test_rgb_resize();
     test_dit_row_conversions();
-    test_metal_probe();
+    test_backend_probe();
     test_terminal_zoom();
     printf("ok: %d checks\n", tests_run);
     return 0;

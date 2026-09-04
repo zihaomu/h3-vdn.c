@@ -16,10 +16,15 @@ static void usage(const char *program) {
     fprintf(stderr,
         "Usage: %s -d MODEL_DIR [options]              # interactive\n"
         "       %s -d MODEL_DIR -p PROMPT [-o OUTPUT] [options]\n"
-        "       %s -d MODEL_DIR --info\n\n"
+        "       %s -d MODEL_DIR --info\n"
+        "       %s --list-devices\n\n"
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
+        "      --vdn-checkpoint PATH  OpenVDN stage checkpoint directory\n"
+        "      --device N         Select backend device (default: 0)\n"
+        "      --list-devices     List devices without loading a model\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
+        "      --prompt-embeds PATH  OpenVDN prompt safetensors\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
@@ -27,7 +32,7 @@ static void usage(const char *program) {
         "      --render-height N  Lower internal model height (optional)\n"
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
-        "      --steps N          Denoising passes (default: 20)\n"
+        "      --steps N          Denoising passes (native: 20; VDN: checkpoint)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -55,12 +60,12 @@ static void usage(const char *program) {
         "      --ref-video-audio VIDEO AUDIO  Append video + soundtrack\n"
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
-        "      --show             Display a frame after every denoising step (M5)\n"
+        "      --show             Display a frame after every denoising step\n"
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
-        "      --profile          Print per-phase Metal timing and allocation data\n"
+        "      --profile          Print per-phase backend timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
-        program, program, program);
+        program, program, program, program);
 }
 
 static int parse_int(const char *value, const char *label) {
@@ -126,20 +131,72 @@ static void print_component(const char *label, const h3_component_info *item) {
 static void print_info(const h3_ctx *ctx) {
     const h3_device_info *device = h3_device(ctx);
     const h3_model_info *model = h3_model(ctx);
-    printf("h3-metal %s\n", H3_VERSION);
-    printf("Device: %s (%s)\n", device->name, device->architecture);
+    printf("h3 %s\n", H3_VERSION);
+    printf("Device %d: %s (%s/%s)\n", device->device_index, device->name,
+           device->backend, device->architecture);
     printf("  physical memory       %.1f GiB\n", gib(device->physical_memory));
     printf("  recommended GPU set   %.1f GiB\n", gib(device->recommended_working_set));
-    printf("  max Metal buffer      %.1f GiB\n", gib(device->max_buffer_length));
-    printf("  Apple GPU family      %d\n", device->apple_gpu_family);
-    printf("  Metal 4               %s\n", device->metal4 ? "yes" : "no");
+    printf("  max allocation        %.1f GiB\n", gib(device->max_buffer_length));
+    if (!strcmp(device->backend, "metal")) {
+        printf("  Apple GPU family      %d\n", device->apple_gpu_family);
+        printf("  Metal 4               %s\n", device->metal4 ? "yes" : "no");
+    }
     printf("  unified memory        %s\n", device->unified_memory ? "yes" : "no");
+    if (model->vdn.enabled) {
+        const h3_vdn_info *vdn = &model->vdn;
+        printf("OpenVDN checkpoint: %s\n", vdn->checkpoint_name);
+        printf("  model revision        %s\n",
+               vdn->model_revision[0] ? vdn->model_revision : "not recorded");
+        printf("  model                 %d layers, hidden %d, %d x %d heads\n",
+               vdn->num_layers, vdn->hidden_size,
+               vdn->num_attention_heads, vdn->attention_head_dim);
+        printf("  hybrid attention      window r=%d chunk=%d, %s/%s\n",
+               vdn->transform.softmax_radius, vdn->transform.softmax_chunk,
+               vdn->transform.delta_rule, vdn->transform.bridge);
+        printf("  schedule              %d NFE, video shift %.1f, audio shift %.1f\n",
+               vdn->num_steps, vdn->video_shift, vdn->audio_shift);
+        printf("  adapters              %zu", vdn->adapter_count);
+        for (size_t index = 0; index < vdn->adapter_count; index++) {
+            const h3_vdn_adapter_info *adapter = &vdn->adapters[index];
+            printf("  %s(r=%d,a=%d,targets=%zu)", adapter->name,
+                   adapter->rank, adapter->alpha, adapter->target_count);
+        }
+        putchar('\n');
+        printf("VDN checkpoint inventory (header-only):\n");
+        print_component("base DiT", &vdn->base_transformer);
+        print_component("linear branch", &vdn->linear_branch);
+        print_component("default LoRA", &vdn->default_adapter);
+        if (vdn->adapter_count == 2)
+            print_component("turbo LoRA", &vdn->turbo_adapter);
+        print_component("video VAE", &vdn->video_vae);
+        print_component("audio VAE", &vdn->audio_vae);
+        return;
+    }
     printf("Native checkpoint inventory (header-only):\n");
     print_component("Qwen3-VL encoder", &model->text_encoder);
     print_component("FL2VA DiT", &model->fl2va_transformer);
     print_component("Ref2VA DiT", &model->ref2va_transformer);
     print_component("video VAE", &model->video_vae);
     print_component("audio VAE", &model->audio_vae);
+}
+
+static int list_devices(void) {
+    int count = h3_device_count();
+    if (count < 1) {
+        fprintf(stderr, "h3: %s\n", h3_last_error(NULL));
+        return 1;
+    }
+    for (int index = 0; index < count; index++) {
+        h3_device_info info;
+        char error[256];
+        if (!h3_probe_device(index, &info, error, sizeof(error))) {
+            fprintf(stderr, "h3: %s\n", error);
+            return 1;
+        }
+        printf("%d\t%s\t%s\t%s\t%.1f GiB\n", index, info.backend,
+               info.architecture, info.name, gib(info.physical_memory));
+    }
+    return 0;
 }
 
 typedef struct {
@@ -251,10 +308,15 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO, OPT_DEVICE, OPT_LIST_DEVICES,
+           OPT_VDN_CHECKPOINT, OPT_PROMPT_EMBEDS };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
+        {"vdn-checkpoint", required_argument, NULL, OPT_VDN_CHECKPOINT},
+        {"device", required_argument, NULL, OPT_DEVICE},
+        {"list-devices", no_argument, NULL, OPT_LIST_DEVICES},
         {"prompt", required_argument, NULL, 'p'},
+        {"prompt-embeds", required_argument, NULL, OPT_PROMPT_EMBEDS},
         {"output", required_argument, NULL, 'o'},
         {"width", required_argument, NULL, OPT_WIDTH},
         {"height", required_argument, NULL, OPT_HEIGHT},
@@ -308,6 +370,7 @@ int main(int argc, char **argv) {
         {NULL, 0, NULL, 0}
     };
     const char *model_dir = NULL;
+    const char *vdn_checkpoint = NULL;
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
@@ -317,16 +380,27 @@ int main(int argc, char **argv) {
     int show = 0;
     int profile = 0;
     int info = 0;
+    int device_index = 0;
+    int should_list_devices = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int steps_given = 0;
     int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
             case 'd': model_dir = optarg; break;
+            case OPT_VDN_CHECKPOINT: vdn_checkpoint = optarg; break;
             case 'p': prompt = optarg; break;
+            case OPT_PROMPT_EMBEDS:
+                params.prompt_embeddings = optarg;
+                break;
             case 'o': output = optarg; break;
             case 'h': usage(argv[0]); return 0;
+            case OPT_DEVICE:
+                device_index = parse_int(optarg, "device");
+                break;
+            case OPT_LIST_DEVICES: should_list_devices = 1; break;
             case OPT_WIDTH: params.width = parse_int(optarg, "width"); break;
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
             case OPT_RENDER_WIDTH:
@@ -343,7 +417,10 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                steps_given = 1;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -464,6 +541,7 @@ int main(int argc, char **argv) {
             default: usage(argv[0]); return 2;
         }
     }
+    if (should_list_devices) return list_devices();
     if (!model_dir) {
         usage(argv[0]);
         return 2;
@@ -487,13 +565,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (profile) setenv("H3_PROFILE", "1", 1);
-    h3_ctx *ctx = h3_load_dir(model_dir);
+    h3_ctx *ctx = vdn_checkpoint ?
+        h3_load_vdn_dir(model_dir, vdn_checkpoint, device_index) :
+        h3_load_dir_device(model_dir, device_index);
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));
         return 1;
     }
+    const h3_model_info *loaded_model = h3_model(ctx);
+    if (loaded_model->vdn.enabled && !steps_given)
+        params.steps = loaded_model->vdn.num_steps;
     if (info) print_info(ctx);
-    if (prompt) {
+    if (prompt || params.prompt_embeddings) {
         params.output_path = output;
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;
@@ -521,6 +604,11 @@ int main(int argc, char **argv) {
         if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
+    } else if (!info && loaded_model->vdn.enabled) {
+        fprintf(stderr,
+                "h3: VDN generation requires --prompt-embeds PATH\n");
+        h3_free(ctx);
+        return 2;
     } else if (!info) {
         int cli_status = h3_cli_run(ctx, model_dir, &params, show, seed_given);
         h3_free(ctx);

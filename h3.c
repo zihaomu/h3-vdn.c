@@ -1,9 +1,9 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
+#include "h3_backend.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
-#include "h3_metal.h"
 #include "h3_multimodal.h"
 #include "h3_safetensors.h"
 #include "h3_text_encoder.h"
@@ -11,6 +11,8 @@
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
+#include "h3_vdn.h"
+#include "h3_vdn_pipeline.h"
 
 #include <errno.h>
 #include <math.h>
@@ -130,10 +132,14 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
     if (stat(path, &status) != 0)
         return h3_key_append(key, "|%s=%zu:%s:missing", role,
                              strlen(path), path);
+#if defined(__APPLE__)
+    const struct timespec modified = status.st_mtimespec;
+#else
+    const struct timespec modified = status.st_mtim;
+#endif
     return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
                          path, (long long)status.st_size,
-                         (long long)status.st_mtimespec.tv_sec,
-                         status.st_mtimespec.tv_nsec);
+                         (long long)modified.tv_sec, modified.tv_nsec);
 }
 
 static char *h3_conditioning_key(const char *prompt, const h3_params *params,
@@ -404,7 +410,26 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
     return ok;
 }
 
+int h3_device_count(void) {
+    char detail[256];
+    int count = h3_backend_device_count(detail, sizeof(detail));
+    if (count < 0) {
+        h3_set_error(NULL, "%s", detail);
+        return 0;
+    }
+    return count;
+}
+
+int h3_probe_device(int device_index, h3_device_info *info,
+                    char *error, size_t error_size) {
+    return h3_backend_probe(device_index, info, error, error_size);
+}
+
 h3_ctx *h3_load_dir(const char *model_dir) {
+    return h3_load_dir_device(model_dir, 0);
+}
+
+h3_ctx *h3_load_dir_device(const char *model_dir, int device_index) {
     h3_global_error[0] = '\0';
     if (!model_dir || !*model_dir) {
         h3_set_error(NULL, "model directory is required");
@@ -419,6 +444,14 @@ h3_ctx *h3_load_dir(const char *model_dir) {
     if (!ctx->model_dir) {
         h3_set_error(NULL, "out of memory copying model path");
         free(ctx);
+        return NULL;
+    }
+    char backend_error[256];
+    if (!h3_backend_probe(device_index, &ctx->device,
+                          backend_error, sizeof(backend_error))) {
+        h3_set_error(ctx, "%s", backend_error);
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
         return NULL;
     }
     if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
@@ -449,19 +482,49 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         h3_free(ctx);
         return NULL;
     }
-    char metal_error[256];
-    if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
-        h3_set_error(ctx, "%s", metal_error);
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
-        h3_free(ctx);
+    return ctx;
+}
+
+h3_ctx *h3_load_vdn_dir(const char *base_model_dir,
+                        const char *vdn_checkpoint_dir,
+                        int device_index) {
+    h3_global_error[0] = '\0';
+    if (!base_model_dir || !*base_model_dir ||
+        !vdn_checkpoint_dir || !*vdn_checkpoint_dir) {
+        h3_set_error(NULL, "base model and VDN checkpoint directories are required");
         return NULL;
     }
+    h3_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        h3_set_error(NULL, "out of memory creating H3 context");
+        return NULL;
+    }
+    ctx->model_dir = strdup(base_model_dir);
+    ctx->vdn_checkpoint_dir = strdup(vdn_checkpoint_dir);
+    if (!ctx->model_dir || !ctx->vdn_checkpoint_dir) {
+        h3_set_error(ctx, "out of memory copying VDN model paths");
+        goto failed;
+    }
+    char detail[512];
+    if (!h3_backend_probe(device_index, &ctx->device,
+                          detail, sizeof(detail)) ||
+        !h3_vdn_inspect(base_model_dir, vdn_checkpoint_dir, 1,
+                        &ctx->model.vdn, detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto failed;
+    }
     return ctx;
+
+failed:
+    snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+    h3_free(ctx);
+    return NULL;
 }
 
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
     h3_cache_clear(ctx);
+    free(ctx->vdn_checkpoint_dir);
     free(ctx->model_dir);
     free(ctx);
 }
@@ -849,11 +912,24 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
     ctx->error[0] = '\0';
+    if (!h3_valid_params(ctx, params)) return NULL;
+    if (ctx->model.vdn.enabled) {
+        if (prompt && *prompt) {
+            h3_set_error(ctx,
+                "raw VDN prompt encoding is not available; use prompt_embeddings");
+            return NULL;
+        }
+        return h3_vdn_generate_embedded(ctx, params);
+    }
+    if (params->prompt_embeddings && *params->prompt_embeddings) {
+        h3_set_error(ctx,
+            "prompt_embeddings is only valid with an OpenVDN checkpoint");
+        return NULL;
+    }
     if (!prompt || !*prompt) {
         h3_set_error(ctx, "prompt must not be empty");
         return NULL;
     }
-    if (!h3_valid_params(ctx, params)) return NULL;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :

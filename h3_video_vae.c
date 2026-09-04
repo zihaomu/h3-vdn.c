@@ -147,6 +147,65 @@ static void free_block(vae_block *block) {
     free_tensor(&block->w2_b); free_tensor(&block->scale2);
 }
 
+static int has_weight(vae_context *vae, const char *name) {
+    return h3_weight_find(vae->weights, name, NULL) != NULL;
+}
+
+static int load_diffusers_qkv(vae_context *vae, vae_block *block,
+                              const char *prefix, char *error,
+                              size_t error_size) {
+    char name[192];
+    h3_gpu_tensor *q_w = NULL, *k_w = NULL, *v_w = NULL;
+    h3_gpu_tensor *q_b = NULL, *k_b = NULL, *v_b = NULL;
+#define LOAD_QKV(kind, field) do {                                             \
+    snprintf(name, sizeof(name), "%sattn.to_%s.weight", prefix, kind);       \
+    field##_w = f2(vae, name, INNER, HIDDEN, error, error_size);               \
+    snprintf(name, sizeof(name), "%sattn.to_%s.bias", prefix, kind);         \
+    field##_b = f1(vae, name, INNER, error, error_size);                       \
+    if (!field##_w || !field##_b) goto cleanup;                                \
+} while (0)
+    LOAD_QKV("q", q); LOAD_QKV("k", k); LOAD_QKV("v", v);
+#undef LOAD_QKV
+    block->qkv_w = h3_gpu_tensor_new_f32(
+        vae->gpu, (size_t)INNER * 3 * HIDDEN);
+    block->qkv_b = h3_gpu_tensor_new_f32(vae->gpu, (size_t)INNER * 3);
+    if (!block->qkv_w || !block->qkv_b) {
+        fail(error, error_size, "cannot allocate fused video VAE QKV: %s",
+             h3_gpu_error(vae->gpu));
+        goto cleanup;
+    }
+    if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                "begin video VAE QKV packing")) goto cleanup;
+    h3_gpu_tensor *weights[3] = {q_w, k_w, v_w};
+    h3_gpu_tensor *biases[3] = {q_b, k_b, v_b};
+    size_t weight_chunk = (size_t)HEAD_DIM * HIDDEN;
+    for (uint32_t head = 0; head < HEADS; head++)
+        for (uint32_t kind = 0; kind < 3; kind++) {
+            size_t destination = ((size_t)head * 3 + kind) * weight_chunk;
+            size_t source = (size_t)head * weight_chunk;
+            if (!gpu_op(vae, h3_gpu_copy_f32(
+                    vae->gpu, block->qkv_w, destination, weights[kind],
+                    source, weight_chunk), error, error_size,
+                    "pack video VAE QKV weight")) goto cleanup;
+            destination = ((size_t)head * 3 + kind) * HEAD_DIM;
+            source = (size_t)head * HEAD_DIM;
+            if (!gpu_op(vae, h3_gpu_copy_f32(
+                    vae->gpu, block->qkv_b, destination, biases[kind],
+                    source, HEAD_DIM), error, error_size,
+                    "pack video VAE QKV bias")) goto cleanup;
+        }
+    if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                "submit video VAE QKV packing")) goto cleanup;
+    h3_gpu_tensor_free(v_b); h3_gpu_tensor_free(k_b); h3_gpu_tensor_free(q_b);
+    h3_gpu_tensor_free(v_w); h3_gpu_tensor_free(k_w); h3_gpu_tensor_free(q_w);
+    return 1;
+
+cleanup:
+    h3_gpu_tensor_free(v_b); h3_gpu_tensor_free(k_b); h3_gpu_tensor_free(q_b);
+    h3_gpu_tensor_free(v_w); h3_gpu_tensor_free(k_w); h3_gpu_tensor_free(q_w);
+    return 0;
+}
+
 static void cleanup(vae_context *vae) {
     if (!vae) return;
     for (int index = 0; index < LAYERS; index++) free_block(&vae->blocks[index]);
@@ -182,16 +241,35 @@ static int load_block(vae_context *vae, int index, char *error,
     if (!block->field) return 0;                                                \
 } while (0)
     F1(norm1, "norm1.weight", HIDDEN);
-    F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
-    F1(qkv_b, "attn.to_qkv.bias", INNER * 3);
-    F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
-    F1(out_b, "attn.to_out.bias", HIDDEN);
+    snprintf(name, sizeof(name), "%sattn.to_qkv.weight", prefix);
+    if (has_weight(vae, name)) {
+        F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+        F1(qkv_b, "attn.to_qkv.bias", INNER * 3);
+    } else if (!load_diffusers_qkv(vae, block, prefix, error, error_size)) {
+        return 0;
+    }
+    snprintf(name, sizeof(name), "%sattn.to_out.0.weight", prefix);
+    if (has_weight(vae, name)) {
+        F2(out_w, "attn.to_out.0.weight", HIDDEN, INNER);
+        F1(out_b, "attn.to_out.0.bias", HIDDEN);
+    } else {
+        F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
+        F1(out_b, "attn.to_out.bias", HIDDEN);
+    }
     F1(scale1, "scale1", HIDDEN);
     F1(norm2, "norm2.weight", HIDDEN);
-    F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
-    F1(w1_b, "ff.w1.bias", FFN * 2);
-    F2(w2, "ff.w2.weight", HIDDEN, FFN);
-    F1(w2_b, "ff.w2.bias", HIDDEN);
+    snprintf(name, sizeof(name), "%sff.net.0.proj.weight", prefix);
+    if (has_weight(vae, name)) {
+        F2(w1, "ff.net.0.proj.weight", FFN * 2, HIDDEN);
+        F1(w1_b, "ff.net.0.proj.bias", FFN * 2);
+        F2(w2, "ff.net.2.weight", HIDDEN, FFN);
+        F1(w2_b, "ff.net.2.bias", HIDDEN);
+    } else {
+        F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
+        F1(w1_b, "ff.w1.bias", FFN * 2);
+        F2(w2, "ff.w2.weight", HIDDEN, FFN);
+        F1(w2_b, "ff.w2.bias", HIDDEN);
+    }
     F1(scale2, "scale2", HIDDEN);
 #undef F1
 #undef F2
@@ -205,10 +283,14 @@ static int load_input_weights(vae_context *vae, char *error,
                            error, error_size);
     vae->post_b = f1(vae, "post_quant_conv.bias", LATENT_CHANNELS,
                      error, error_size);
-    vae->embed_w = f2(vae, "decoder.x_embedder.weight", HIDDEN,
-                      LATENT_CHANNELS, error, error_size);
-    vae->embed_b = f1(vae, "decoder.x_embedder.bias", HIDDEN,
+    const char *embed_prefix = has_weight(vae, "decoder.proj_in.weight") ?
+                               "decoder.proj_in" : "decoder.x_embedder";
+    char name[96];
+    snprintf(name, sizeof(name), "%s.weight", embed_prefix);
+    vae->embed_w = f2(vae, name, HIDDEN, LATENT_CHANNELS,
                       error, error_size);
+    snprintf(name, sizeof(name), "%s.bias", embed_prefix);
+    vae->embed_b = f1(vae, name, HIDDEN, error, error_size);
     uint64_t register_shape[] = {1, REGISTERS, HIDDEN};
     vae->registers = load_f32(vae, "decoder.register_tokens", 3,
                               register_shape, error, error_size);
@@ -276,8 +358,12 @@ static int load_latent_normalization(const char *weight_directory,
         fail(error, error_size, "out of memory resolving video VAE config");
         return 0;
     }
-    snprintf(path, path_size, "%s/../config.json", weight_directory);
+    snprintf(path, path_size, "%s/config.json", weight_directory);
     FILE *file = fopen(path, "rb");
+    if (!file) {
+        snprintf(path, path_size, "%s/../config.json", weight_directory);
+        file = fopen(path, "rb");
+    }
     if (!file || fseek(file, 0, SEEK_END)) {
         fail(error, error_size, "cannot open video VAE config %s: %s", path,
              strerror(errno));
