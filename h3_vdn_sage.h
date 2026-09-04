@@ -38,6 +38,7 @@ typedef struct {
 
 typedef struct {
     uint32_t q_begin;
+    /* E27 maps one 64-thread workgroup to at most two 16-row Q waves. */
     uint32_t q_count;
     uint32_t interval_count;
     h3_vdn_key_interval allowed[H3_VDN_SAGE_MAX_INTERVALS];

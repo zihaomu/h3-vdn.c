@@ -965,6 +965,17 @@ int h3_gpu_get_stats(const h3_gpu *opaque, h3_gpu_stats *stats) {
     return 1;
 }
 
+int h3_gpu_get_memory_info(const h3_gpu *opaque, uint64_t *free_bytes,
+                           uint64_t *total_bytes) {
+    if (!opaque || !free_bytes || !total_bytes) return 0;
+    id<MTLDevice> device = GPU((h3_gpu *)(void *)opaque).device;
+    uint64_t total = (uint64_t)device.recommendedMaxWorkingSetSize;
+    uint64_t used = (uint64_t)device.currentAllocatedSize;
+    *total_bytes = total;
+    *free_bytes = used < total ? total - used : 0;
+    return total != 0;
+}
+
 int h3_gpu_get_profile_stats(const h3_gpu *opaque,
                              h3_gpu_profile_stats *stats) {
     if (!opaque || !stats) return 0;

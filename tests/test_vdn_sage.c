@@ -68,6 +68,7 @@ static void verify_geometry(const h3_vdn_sage_geometry *geometry) {
         const h3_vdn_q_task *task = &tasks[task_index];
         CHECK(task->q_begin == next_query);
         CHECK(task->q_count > 0);
+        CHECK(task->q_count <= 32);
         CHECK(task->interval_count > 0);
         CHECK(task->interval_count <= H3_VDN_SAGE_MAX_INTERVALS);
         uint32_t interval_end = 0;
@@ -175,6 +176,15 @@ int main(void) {
         31, 1, 128, 3, 4, 5, 7, 9, 1
     };
     verify_geometry(&production);
+    {
+        char error[256] = {0};
+        h3_vdn_q_task *tasks = NULL;
+        size_t task_count = 0;
+        CHECK(h3_vdn_sage_build_tasks(
+            &production, &tasks, &task_count, error, sizeof(error)));
+        CHECK(task_count == 167);
+        h3_vdn_sage_free_tasks(tasks);
+    }
     verify_geometry(&suffix);
     verify_geometry(&no_anchor);
     verify_geometry(&short_chunk);

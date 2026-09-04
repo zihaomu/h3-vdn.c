@@ -40,7 +40,17 @@ typedef struct {
     h3_gpu_tensor *adaln_weight;
     h3_gpu_tensor *adaln_bias;
     h3_vdn_linear_weights linear;
+    int borrowed;
 } h3_vdn_block_weights;
+
+typedef struct {
+    uint64_t budget_bytes;
+    uint64_t resident_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    unsigned resident_blocks;
+    int admission_limited;
+} h3_vdn_weight_cache_stats;
 
 typedef struct {
     h3_gpu_tensor *norm1;
@@ -81,6 +91,8 @@ h3_vdn_weight_store *h3_vdn_weight_store_open(
     const char *base_model_dir, const char *checkpoint_dir, int use_turbo,
     char *error, size_t error_size);
 void h3_vdn_weight_store_free(h3_vdn_weight_store *store);
+int h3_vdn_weight_store_cache_stats(
+    const h3_vdn_weight_store *store, h3_vdn_weight_cache_stats *stats);
 
 int h3_vdn_block_weights_load(h3_vdn_weight_store *store, h3_gpu *gpu,
                               unsigned block, h3_vdn_block_weights *weights,

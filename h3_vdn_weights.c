@@ -2,6 +2,7 @@
 
 #include "h3_weights.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,12 +26,24 @@ enum {
     VDN_FINAL_ADALN_WIDTH = 10752
 };
 
+#define VDN_RESIDENT_RESERVE_BYTES \
+    (UINT64_C(6) * 1024 * 1024 * 1024)
+
 struct h3_vdn_weight_store {
     h3_weight_store *base;
     h3_weight_store *linear;
     h3_weight_store *default_adapter;
     h3_weight_store *turbo_adapter;
     int use_turbo;
+    h3_gpu *resident_gpu;
+    uint64_t resident_budget_bytes;
+    uint64_t resident_bytes;
+    uint64_t resident_hits;
+    uint64_t resident_misses;
+    unsigned resident_blocks;
+    int resident_admission_limited;
+    unsigned resident_ready[VDN_BLOCKS];
+    h3_vdn_block_weights resident[VDN_BLOCKS];
 };
 
 static int vdn_fail(char *error, size_t error_size, const char *format, ...) {
@@ -69,6 +82,23 @@ h3_vdn_weight_store *h3_vdn_weight_store_open(
     if (!store) {
         vdn_fail(error, error_size, "out of memory creating VDN weight store");
         return NULL;
+    }
+    const char *resident_gib_text = getenv("H3_VDN_RESIDENT_GIB");
+    if (resident_gib_text && *resident_gib_text &&
+        strcmp(resident_gib_text, "0") != 0) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long resident_gib = strtoull(
+            resident_gib_text, &end, 10);
+        if (errno || end == resident_gib_text || *end ||
+            resident_gib < 1 || resident_gib > 20) {
+            vdn_fail(error, error_size,
+                     "H3_VDN_RESIDENT_GIB must be an integer in [0,20]");
+            free(store);
+            return NULL;
+        }
+        store->resident_budget_bytes =
+            (uint64_t)resident_gib * UINT64_C(1024) * 1024 * 1024;
     }
     char *base = vdn_path(base_model_dir, "transformer");
     char *linear = vdn_path(checkpoint_dir, "linear_branch");
@@ -109,11 +139,27 @@ failed:
 
 void h3_vdn_weight_store_free(h3_vdn_weight_store *store) {
     if (!store) return;
+    for (unsigned block = 0; block < VDN_BLOCKS; block++)
+        if (store->resident_ready[block])
+            h3_vdn_block_weights_free(&store->resident[block]);
     h3_weight_store_free(store->turbo_adapter);
     h3_weight_store_free(store->default_adapter);
     h3_weight_store_free(store->linear);
     h3_weight_store_free(store->base);
     free(store);
+}
+
+int h3_vdn_weight_store_cache_stats(
+        const h3_vdn_weight_store *store,
+        h3_vdn_weight_cache_stats *stats) {
+    if (!store || !stats) return 0;
+    stats->budget_bytes = store->resident_budget_bytes;
+    stats->resident_bytes = store->resident_bytes;
+    stats->hits = store->resident_hits;
+    stats->misses = store->resident_misses;
+    stats->resident_blocks = store->resident_blocks;
+    stats->admission_limited = store->resident_admission_limited;
+    return 1;
 }
 
 static h3_gpu_tensor *load_bf16(const h3_weight_store *store, h3_gpu *gpu,
@@ -227,6 +273,10 @@ failed:
 
 void h3_vdn_block_weights_free(h3_vdn_block_weights *weights) {
     if (!weights) return;
+    if (weights->borrowed) {
+        memset(weights, 0, sizeof(*weights));
+        return;
+    }
 #define FREE(field) h3_gpu_tensor_free(weights->field)
     FREE(norm1); FREE(norm2); FREE(q); FREE(k); FREE(v); FREE(q_norm);
     FREE(k_norm); FREE(out); FREE(fc1); FREE(fc2); FREE(adaln_weight);
@@ -242,6 +292,76 @@ void h3_vdn_block_weights_free(h3_vdn_block_weights *weights) {
     memset(weights, 0, sizeof(*weights));
 }
 
+static uint64_t block_weight_bytes(const h3_vdn_block_weights *weights) {
+    uint64_t elements = 0;
+#define COUNT(field) do {                                                     \
+    size_t count = h3_gpu_tensor_elements(weights->field);                    \
+    if (count > UINT64_MAX - elements) return UINT64_MAX;                     \
+    elements += count;                                                        \
+} while (0)
+    COUNT(norm1); COUNT(norm2); COUNT(q); COUNT(k); COUNT(v); COUNT(q_norm);
+    COUNT(k_norm); COUNT(out); COUNT(fc1); COUNT(fc2); COUNT(adaln_weight);
+    COUNT(adaln_bias);
+    COUNT(linear.alpha_a_log); COUNT(linear.alpha_down);
+    COUNT(linear.alpha_dt_bias); COUNT(linear.alpha_up); COUNT(linear.beta);
+    COUNT(linear.norm); COUNT(linear.gate_down); COUNT(linear.gate_up_bias);
+    COUNT(linear.gate_up); COUNT(linear.k_spatial);
+    COUNT(linear.k_temporal); COUNT(linear.v_spatial);
+    COUNT(linear.v_temporal); COUNT(linear.softmax_gate_bias);
+    COUNT(linear.softmax_gate_weight); COUNT(linear.to_out);
+#undef COUNT
+    return elements > UINT64_MAX / sizeof(uint16_t) ? UINT64_MAX :
+           elements * sizeof(uint16_t);
+}
+
+static int clone_block_weights(h3_gpu *gpu,
+                               const h3_vdn_block_weights *source,
+                               h3_vdn_block_weights *destination,
+                               char *error, size_t error_size) {
+    memset(destination, 0, sizeof(*destination));
+#define ALLOC(field) do {                                                      \
+    destination->field = h3_gpu_tensor_new_bf16(                              \
+        gpu, h3_gpu_tensor_elements(source->field));                           \
+    if (!destination->field) goto failed;                                      \
+} while (0)
+    ALLOC(norm1); ALLOC(norm2); ALLOC(q); ALLOC(k); ALLOC(v); ALLOC(q_norm);
+    ALLOC(k_norm); ALLOC(out); ALLOC(fc1); ALLOC(fc2); ALLOC(adaln_weight);
+    ALLOC(adaln_bias);
+    ALLOC(linear.alpha_a_log); ALLOC(linear.alpha_down);
+    ALLOC(linear.alpha_dt_bias); ALLOC(linear.alpha_up); ALLOC(linear.beta);
+    ALLOC(linear.norm); ALLOC(linear.gate_down); ALLOC(linear.gate_up_bias);
+    ALLOC(linear.gate_up); ALLOC(linear.k_spatial);
+    ALLOC(linear.k_temporal); ALLOC(linear.v_spatial);
+    ALLOC(linear.v_temporal); ALLOC(linear.softmax_gate_bias);
+    ALLOC(linear.softmax_gate_weight); ALLOC(linear.to_out);
+#undef ALLOC
+    if (!h3_gpu_begin(gpu)) goto failed;
+#define COPY(field) do {                                                       \
+    if (!h3_gpu_copy_bf16(                                                     \
+            gpu, destination->field, 0, source->field, 0,                     \
+            h3_gpu_tensor_elements(source->field))) goto failed;               \
+} while (0)
+    COPY(norm1); COPY(norm2); COPY(q); COPY(k); COPY(v); COPY(q_norm);
+    COPY(k_norm); COPY(out); COPY(fc1); COPY(fc2); COPY(adaln_weight);
+    COPY(adaln_bias);
+    COPY(linear.alpha_a_log); COPY(linear.alpha_down);
+    COPY(linear.alpha_dt_bias); COPY(linear.alpha_up); COPY(linear.beta);
+    COPY(linear.norm); COPY(linear.gate_down); COPY(linear.gate_up_bias);
+    COPY(linear.gate_up); COPY(linear.k_spatial);
+    COPY(linear.k_temporal); COPY(linear.v_spatial);
+    COPY(linear.v_temporal); COPY(linear.softmax_gate_bias);
+    COPY(linear.softmax_gate_weight); COPY(linear.to_out);
+#undef COPY
+    if (!h3_gpu_submit(gpu)) goto failed;
+    return 1;
+
+failed:
+    vdn_fail(error, error_size, "cannot clone resident VDN block: %s",
+             h3_gpu_error(gpu));
+    h3_vdn_block_weights_free(destination);
+    return 0;
+}
+
 int h3_vdn_block_weights_load(h3_vdn_weight_store *store, h3_gpu *gpu,
                               unsigned block, h3_vdn_block_weights *weights,
                               char *error, size_t error_size) {
@@ -250,6 +370,19 @@ int h3_vdn_block_weights_load(h3_vdn_weight_store *store, h3_gpu *gpu,
         return vdn_fail(error, error_size,
                         "invalid VDN block weight load arguments");
     memset(weights, 0, sizeof(*weights));
+    if (store->resident_budget_bytes) {
+        if (store->resident_gpu && store->resident_gpu != gpu)
+            return vdn_fail(error, error_size,
+                            "VDN resident cache cannot span GPU contexts");
+        store->resident_gpu = gpu;
+        if (store->resident_ready[block]) {
+            store->resident_hits++;
+            return clone_block_weights(gpu, &store->resident[block],
+                                       weights, error, error_size);
+        } else {
+            store->resident_misses++;
+        }
+    }
     char base[224];
     char target[224];
     char linear[256];
@@ -348,6 +481,25 @@ int h3_vdn_block_weights_load(h3_vdn_weight_store *store, h3_gpu *gpu,
 #undef LINEAR1
 #undef EFFECTIVE
 #undef BASE1
+    if (store->resident_budget_bytes && !store->resident_ready[block]) {
+        uint64_t bytes = block_weight_bytes(weights);
+        uint64_t free_bytes = 0;
+        uint64_t total_bytes = 0;
+        int within_budget = bytes != UINT64_MAX &&
+            bytes <= store->resident_budget_bytes - store->resident_bytes;
+        int has_reserve = within_budget &&
+            h3_gpu_get_memory_info(gpu, &free_bytes, &total_bytes) &&
+            free_bytes >= VDN_RESIDENT_RESERVE_BYTES;
+        if (has_reserve) {
+            store->resident[block] = *weights;
+            store->resident_ready[block] = 1;
+            store->resident_bytes += bytes;
+            store->resident_blocks++;
+            weights->borrowed = 1;
+        } else if (within_budget) {
+            store->resident_admission_limited = 1;
+        }
+    }
     return 1;
 
 failed:

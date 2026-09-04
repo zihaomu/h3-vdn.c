@@ -39,12 +39,14 @@ LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 LIB_C += h3_tokenizer_stub.c
 LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c h3_vdn_sage.c
 LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp
-BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sage.o
+LIB_HIP := h3_vdn_sage_gfx12.hip
+BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sage.o h3_vdn_sage_gfx12.o
 else
 $(error unsupported BACKEND=$(BACKEND); use metal or hip)
 endif
 
-LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(LIB_CPP:.cpp=.o)
+LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(LIB_CPP:.cpp=.o) \
+	$(LIB_HIP:.hip=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
@@ -253,6 +255,9 @@ vdn-audio-vae-smoke-test: h3_vdn_audio_vae_smoke_tests
 h3_vdn_e2e_tests: tests/test_vdn_e2e.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_vdn_int8_gemm_bench: tests/bench_vdn_int8_gemm.o
+	$(LINK) -o $@ $^ $(LDLIBS)
+
 vdn-e2e-test: h3_vdn_e2e_tests
 	mkdir -p outputs
 	LD_LIBRARY_PATH=$(CURDIR)/.tools/ffmpeg/usr/lib/x86_64-linux-gnu$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} \
@@ -430,6 +435,9 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -I. -c $< -o $@
 
+%.o: %.hip
+	$(CXX) $(CXXFLAGS) -I. -x hip -c $< -o $@
+
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -450,6 +458,7 @@ clean:
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
 		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
+		h3_vdn_int8_gemm_bench \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

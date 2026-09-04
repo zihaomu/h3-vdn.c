@@ -16,10 +16,11 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
 | VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
 | Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks |
-| Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline, with diagnostic legacy fallbacks |
+| Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline; optional bounded resident effective-weight sources for repeated NFE |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | 26-run attention/staging stress matrix and two byte-identical production E2E renders |
-| Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
+| Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
+| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention is explicit opt-in; it is much faster but failed the frozen 8-NFE audio latent gate and is not part of the stable/default path |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
 The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
@@ -34,6 +35,33 @@ production A/B, total generation fell from 486.705699 to 354.399810 seconds
 (-27.184%, 1.373x), while all five internal hashes and the final MP4 SHA-256
 remained byte-identical. Set `H3_F32_SDPA_SCALAR=1` to force the generic scalar
 oracle for diagnosis.
+
+Systems with sufficient free VRAM may additionally set
+`H3_VDN_RESIDENT_GIB=12`. This keeps the first nine effective blocks as
+immutable GPU-side sources and clones them into the normal per-NFE working
+lifetime, avoiding their repeated disk read, H2D transfer, and LoRA merge. The
+production run reduced logical read/H2D traffic by 15.70% and DiT time by
+1.48%, while the 64x32 public-CLI smoke improved by 9.26%; all frozen hashes
+remained exact. It is intentionally opt-in because it raises peak allocation
+from about 4.97 GiB to 16.51 GiB for a modest production-resolution gain. The
+integer budget accepts 1--20 GiB, retains at least 6 GiB of runtime free VRAM,
+and falls back to ordinary streaming when admission is unsafe. Unset or `0`
+preserves the default streaming path.
+
+The branch also carries an explicitly experimental native gfx12 Sage-style
+attention path selected with `H3_VDN_SDPA=sage-i8-bf16`. Its current E27
+task-split kernel reduced a same-process production 8-NFE DiT comparison from
+241.002963 to 118.216247 seconds (-50.95%). Video latent quality passed the
+frozen gate (0.233513% relative RMSE, 0.999997274 cosine), but audio latent
+relative RMSE was 11.499490%, above the 5% limit. The run therefore stopped
+before the three-prompt decoded-media gate. This mode remains research-only;
+unset/`auto` continues to use the bitwise-exact BF16 wave32 path.
+
+An isolated ROCm model-weight probe also found 1.29x--1.77x all-in INT8 GEMM
+speedups for production AdalN/MLP shapes while approximately halving their
+weight bytes. No INT8 checkpoint format or loader is exposed yet: this is only
+evidence for a future versioned offline-cache experiment, and BF16 remains the
+supported model format.
 
 ### ROCm compatibility
 
@@ -172,8 +200,9 @@ checkpoint and prompt paths, backend/device/PCI BDF, seed, NFE, 12/3
 video/audio shifts, tensor geometry, five FNV-1a output hashes, peak GPU/RSS,
 process counters, and mutually exclusive pipeline phase timings. When profiling
 is enabled, every NFE also records forward subphases, GPU command statistics,
-inclusive linear/SDPA/solve/scan event totals, and streamed-weight read/H2D
-bytes and time. Inclusive event/I/O totals may overlap and must not be added to
+inclusive linear/SDPA/solve/scan/LoRA event totals, streamed-weight read/H2D
+bytes and time, and resident-cache budget/bytes/blocks/hits/misses/admission
+state. Inclusive event/I/O totals may overlap and must not be added to
 critical-path wall time; the JSON reports explicit accounted, residual, and
 coverage fields for that reason.
 
@@ -282,6 +311,21 @@ run fell from about 170.7 to 92.66 seconds. After pinned-buffer pipelining and
 distributed wave softmax, the latest run completed in 74.71 seconds. Every
 acceptance reproduced the exact 73,528-byte MP4 SHA-256 above; isolated crossed
 A/B results are used for individual optimization claims.
+
+`H3_VDN_RESIDENT_GIB=12` is an independent, bounded reuse option for repeated
+NFE. In the final design, cached tensors are never passed directly through
+successive block executions: every hit performs a device-to-device clone and
+then follows the ordinary block lifetime. A 10-run 8-NFE stress test was
+10/10 exact and reduced median small-workload time from 69.396 to 61.594
+seconds (-11.24%). Production DiT improved from 241.253 to a 237.690-second
+mean (-1.48%) while read/H2D payload fell from 523.048 to 440.927 GiB. Direct
+pointer reuse was rejected after exhibiting nondeterminism under sustained
+allocation pressure. Offline LoRA premerge was also rejected: adapters are
+only 1.64% of the per-NFE stream and 571 merges cost 0.729 seconds, while an
+effective-weight cache would expand storage by roughly 56x. Block prefetch and
+a userspace host cache were rejected because the measured physical read volume
+was only 0.356 GiB for 440.927 GiB of logical reads; Linux page cache already
+serves more than 99.9% of that stream.
 
 ### OpenVDN v0.1.0 stable scope
 

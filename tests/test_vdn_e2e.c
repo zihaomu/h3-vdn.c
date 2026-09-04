@@ -46,6 +46,24 @@ static int env_u32(const char *name, uint32_t fallback, uint32_t *value,
     return 1;
 }
 
+static int env_u64(const char *name, uint64_t fallback, uint64_t *value,
+                   char *error, size_t error_size) {
+    const char *text = getenv(name);
+    if (!text || !*text) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno || !end || *end) {
+        snprintf(error, error_size, "invalid %s=%s", name, text);
+        return 0;
+    }
+    *value = (uint64_t)parsed;
+    return 1;
+}
+
 static int checked_mul_size(size_t left, size_t right, size_t *result) {
     if (!result || (right && left > SIZE_MAX / right)) return 0;
     *result = left * right;
@@ -97,6 +115,7 @@ int main(int argc, char **argv) {
     uint32_t latent_h = DEFAULT_LATENT_H;
     uint32_t latent_w = DEFAULT_LATENT_W;
     uint32_t evaluations = DEFAULT_NFE;
+    uint64_t seed = 0;
     if (!env_u32("VDN_E2E_FRAMES", requested_frames, &requested_frames,
                  error, sizeof(error)) ||
         !env_u32("VDN_E2E_LATENT_H", latent_h, &latent_h,
@@ -104,6 +123,8 @@ int main(int argc, char **argv) {
         !env_u32("VDN_E2E_LATENT_W", latent_w, &latent_w,
                  error, sizeof(error)) ||
         !env_u32("VDN_E2E_NFE", evaluations, &evaluations,
+                 error, sizeof(error)) ||
+        !env_u64("VDN_E2E_SEED", seed, &seed,
                  error, sizeof(error))) {
         fprintf(stderr, "VDN native E2E failed: %s\n", error);
         return 2;
@@ -132,15 +153,18 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr,
             "VDN E2E geometry: requested=%u output=%d latent=%dx%ux%u "
-            "audio=%u NFE=%u\n",
+            "audio=%u NFE=%u seed=%llu\n",
             requested_frames, temporal.frame_count, temporal.video_t,
-            latent_h, latent_w, audio_latents, evaluations);
+            latent_h, latent_w, audio_latents, evaluations,
+            (unsigned long long)seed);
     h3_gpu *gpu = h3_gpu_create(NULL, error, sizeof(error));
     h3_vdn_weight_store *store = NULL;
     h3_vdn_model_weights model;
+    h3_vdn_weight_cache_stats cache_stats;
     h3_text_embedding prompt;
     h3_vdn_layout layout;
     memset(&model, 0, sizeof(model));
+    memset(&cache_stats, 0, sizeof(cache_stats));
     memset(&prompt, 0, sizeof(prompt));
     memset(&layout, 0, sizeof(layout));
     h3_gpu_tensor *refined = NULL, *video = NULL, *audio = NULL;
@@ -179,7 +203,7 @@ int main(int argc, char **argv) {
         goto failed;
     }
     h3_rng rng;
-    h3_rng_seed(&rng, 0);
+    h3_rng_seed(&rng, seed);
     h3_rng_fill_normal(&rng, video_rows, video_row_elements);
     h3_rng_fill_normal(&rng, audio_rows, audio_row_elements);
     video = h3_gpu_tensor_from_f32(gpu, video_rows, video_row_elements);
@@ -189,7 +213,8 @@ int main(int argc, char **argv) {
             1, 5,
             layer_progress, nfe_progress, NULL, NULL, error, sizeof(error)) ||
         !h3_gpu_tensor_read_f32(video, video_rows, video_row_elements) ||
-        !h3_gpu_tensor_read_f32(audio, audio_rows, audio_row_elements)) {
+        !h3_gpu_tensor_read_f32(audio, audio_rows, audio_row_elements) ||
+        !h3_vdn_weight_store_cache_stats(store, &cache_stats)) {
         if (!error[0]) snprintf(error, sizeof(error),
                                 "cannot read denoised E2E latents: %s",
                                 h3_gpu_error(gpu));
@@ -300,6 +325,15 @@ int main(int argc, char **argv) {
            (unsigned long long)hash_bytes(frames.rgb, frame_f32_bytes),
            (unsigned long long)hash_bytes(waveform.pcm, waveform_bytes),
            (unsigned long long)hash_bytes(rgb, rgb_bytes));
+    if (cache_stats.budget_bytes)
+        printf("VDN E2E resident cache: budget=%.3f GiB resident=%.3f GiB "
+               "blocks=%u hits=%llu misses=%llu admission_limited=%d\n",
+               (double)cache_stats.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)cache_stats.resident_bytes / (1024.0 * 1024.0 * 1024.0),
+               cache_stats.resident_blocks,
+               (unsigned long long)cache_stats.hits,
+               (unsigned long long)cache_stats.misses,
+               cache_stats.admission_limited);
     if (!h3_ffmpeg_write_av_rgb24_f32(
             argv[4], rgb, frames.frames, frames.width, frames.height, 24,
             waveform.pcm, waveform.samples, waveform.channels,

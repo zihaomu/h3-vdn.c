@@ -99,6 +99,8 @@ static void dit_profile_stats_delta(const h3_gpu_profile_stats *start,
     delta->enabled = stop->enabled;
     delta->linear_calls = dit_counter_delta(
         stop->linear_calls, start->linear_calls);
+    delta->lora_calls = dit_counter_delta(
+        stop->lora_calls, start->lora_calls);
     delta->sdpa_calls = dit_counter_delta(
         stop->sdpa_calls, start->sdpa_calls);
     delta->solve_calls = dit_counter_delta(
@@ -107,6 +109,8 @@ static void dit_profile_stats_delta(const h3_gpu_profile_stats *start,
         stop->scan_calls, start->scan_calls);
     delta->linear_seconds = dit_seconds_delta(
         stop->linear_seconds, start->linear_seconds);
+    delta->lora_seconds = dit_seconds_delta(
+        stop->lora_seconds, start->lora_seconds);
     delta->sdpa_seconds = dit_seconds_delta(
         stop->sdpa_seconds, start->sdpa_seconds);
     delta->solve_seconds = dit_seconds_delta(

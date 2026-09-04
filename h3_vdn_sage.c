@@ -135,11 +135,20 @@ static int build_video_task(const h3_vdn_sage_geometry *geometry,
         append_interval(task, video_end, geometry->sequence);
 }
 
-static int append_task(h3_vdn_q_task *tasks, size_t *count,
+static int append_task(h3_vdn_q_task *tasks, size_t capacity, size_t *count,
                        const h3_vdn_q_task *task) {
     if (!task->q_count || !task->interval_count) return 0;
-    tasks[*count] = *task;
-    (*count)++;
+    uint32_t offset = 0;
+    while (offset < task->q_count) {
+        if (*count >= capacity) return 0;
+        h3_vdn_q_task tile = *task;
+        tile.q_begin += offset;
+        uint32_t remaining = task->q_count - offset;
+        tile.q_count = remaining < 32 ? remaining : 32;
+        tasks[*count] = tile;
+        (*count)++;
+        offset += tile.q_count;
+    }
     return 1;
 }
 
@@ -154,13 +163,18 @@ int h3_vdn_sage_build_tasks(const h3_vdn_sage_geometry *geometry,
     *task_count = 0;
     uint32_t video_end;
     if (!validate_geometry(geometry, &video_end, error, error_size)) return 0;
+    size_t padded_sequence;
     size_t capacity;
-    if (!checked_add((size_t)geometry->frames, 2, &capacity) ||
-        !checked_mul(capacity, sizeof(h3_vdn_q_task), &capacity)) {
+    size_t allocation_bytes;
+    if (!checked_add((size_t)geometry->sequence, 31, &padded_sequence) ||
+        !checked_add(padded_sequence / 32, (size_t)geometry->frames,
+                     &capacity) ||
+        !checked_add(capacity, 2, &capacity) ||
+        !checked_mul(capacity, sizeof(h3_vdn_q_task), &allocation_bytes)) {
         set_error(error, error_size, "VDN Sage task allocation overflow");
         return 0;
     }
-    h3_vdn_q_task *tasks = calloc(1, capacity);
+    h3_vdn_q_task *tasks = calloc(1, allocation_bytes);
     if (!tasks) {
         set_error(error, error_size, "out of memory building VDN Sage tasks");
         return 0;
@@ -171,18 +185,21 @@ int h3_vdn_sage_build_tasks(const h3_vdn_sage_geometry *geometry,
         memset(&task, 0, sizeof(task));
         task.q_count = geometry->video_start;
         if (!append_interval(&task, 0, geometry->sequence) ||
-            !append_task(tasks, &count, &task)) goto internal_error;
+            !append_task(tasks, capacity, &count, &task))
+            goto internal_error;
     }
     for (uint32_t frame = 0; frame < geometry->frames; frame++) {
         if (!build_video_task(geometry, video_end, frame, &task) ||
-            !append_task(tasks, &count, &task)) goto internal_error;
+            !append_task(tasks, capacity, &count, &task))
+            goto internal_error;
     }
     if (video_end < geometry->sequence) {
         memset(&task, 0, sizeof(task));
         task.q_begin = video_end;
         task.q_count = geometry->sequence - video_end;
         if (!append_interval(&task, 0, geometry->sequence) ||
-            !append_task(tasks, &count, &task)) goto internal_error;
+            !append_task(tasks, capacity, &count, &task))
+            goto internal_error;
     }
     *tasks_out = tasks;
     *task_count = count;
@@ -240,8 +257,12 @@ int h3_vdn_sage_workspace_size(const h3_vdn_sage_geometry *geometry,
          !checked_mul(geometry->heads, geometry->head_dim, &scale_count) ||
          !checked_mul(scale_count, sizeof(float), &scale_count) ||
          !checked_add(total, scale_count, &total))) goto overflow;
+    size_t padded_sequence;
     size_t task_bytes;
-    if (!checked_add((size_t)geometry->frames, 2, &task_bytes) ||
+    if (!checked_add((size_t)geometry->sequence, 31, &padded_sequence) ||
+        !checked_add(padded_sequence / 32, (size_t)geometry->frames,
+                     &task_bytes) ||
+        !checked_add(task_bytes, 2, &task_bytes) ||
         !checked_mul(task_bytes, sizeof(h3_vdn_q_task), &task_bytes) ||
         !checked_add(total, task_bytes, &total)) goto overflow;
     *bytes = total;

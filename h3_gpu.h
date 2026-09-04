@@ -43,10 +43,12 @@ typedef struct {
 typedef struct {
     int enabled;
     uint64_t linear_calls;
+    uint64_t lora_calls;
     uint64_t sdpa_calls;
     uint64_t solve_calls;
     uint64_t scan_calls;
     double linear_seconds;
+    double lora_seconds;
     double sdpa_seconds;
     double solve_seconds;
     double scan_seconds;
@@ -121,6 +123,10 @@ int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
+/* Return runtime-visible free and total device memory. This is intended for
+ * bounded optional caches; callers must still retain workload headroom. */
+int h3_gpu_get_memory_info(const h3_gpu *gpu, uint64_t *free_bytes,
+                           uint64_t *total_bytes);
 int h3_gpu_get_profile_stats(const h3_gpu *gpu,
                              h3_gpu_profile_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown

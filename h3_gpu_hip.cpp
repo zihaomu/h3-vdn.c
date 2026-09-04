@@ -1,5 +1,6 @@
 #include "h3_gpu.h"
 #include "h3_vdn_sage.h"
+#include "h3_vdn_sage_gfx12.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -51,6 +52,7 @@ struct h3_gpu {
     size_t profile_count;
     int profile_event_open;
     double profile_linear_ms;
+    double profile_lora_ms;
     double profile_sdpa_ms;
     double profile_solve_ms;
     double profile_scan_ms;
@@ -67,6 +69,10 @@ struct h3_gpu {
     int staging_events_initialized;
     void *sage_workspace;
     size_t sage_workspace_bytes;
+    h3_vdn_sage_geometry sage_geometry;
+    size_t sage_tasks_offset;
+    uint32_t sage_task_count;
+    int sage_tasks_valid;
 };
 
 struct h3_gpu_tensor {
@@ -226,9 +232,10 @@ static int h3_gpu_finish_staging_copy(h3_gpu *gpu, unsigned slot,
 
 enum h3_gpu_profile_category {
     H3_HIP_PROFILE_LINEAR = 0,
-    H3_HIP_PROFILE_SDPA = 1,
-    H3_HIP_PROFILE_SOLVE = 2,
-    H3_HIP_PROFILE_SCAN = 3
+    H3_HIP_PROFILE_LORA = 1,
+    H3_HIP_PROFILE_SDPA = 2,
+    H3_HIP_PROFILE_SOLVE = 3,
+    H3_HIP_PROFILE_SCAN = 4
 };
 
 static double h3_gpu_now(void) {
@@ -317,6 +324,11 @@ static void h3_gpu_profile_flush_ops(h3_gpu *gpu) {
             gpu->profile_totals.linear_seconds += milliseconds / 1000.0;
             gpu->profile_totals.linear_calls++;
             break;
+        case H3_HIP_PROFILE_LORA:
+            gpu->profile_lora_ms += milliseconds;
+            gpu->profile_totals.lora_seconds += milliseconds / 1000.0;
+            gpu->profile_totals.lora_calls++;
+            break;
         case H3_HIP_PROFILE_SDPA:
             gpu->profile_sdpa_ms += milliseconds;
             gpu->profile_totals.sdpa_seconds += milliseconds / 1000.0;
@@ -383,15 +395,17 @@ static void h3_gpu_profile_emit(h3_gpu *gpu, const char *phase,
 
 static void h3_gpu_profile_emit_ops(h3_gpu *gpu) {
     if (!gpu || !h3_gpu_profile_enabled()) return;
-    double total = gpu->profile_linear_ms + gpu->profile_sdpa_ms +
+    double total = gpu->profile_linear_ms + gpu->profile_lora_ms +
+                   gpu->profile_sdpa_ms +
                    gpu->profile_solve_ms + gpu->profile_scan_ms;
     if (total <= 0.0) return;
     std::fprintf(stderr,
         "h3 profile: %-20s %-14s measured=%8.3fs linear=%8.3fs "
-        "sdpa=%8.3fs solve=%8.3fs scan=%8.3fs\n",
+        "lora=%8.3fs sdpa=%8.3fs solve=%8.3fs scan=%8.3fs\n",
         gpu->profile_label[0] ? gpu->profile_label : "HIP context",
         "gpu-op-classes", total / 1000.0, gpu->profile_linear_ms / 1000.0,
-        gpu->profile_sdpa_ms / 1000.0, gpu->profile_solve_ms / 1000.0,
+        gpu->profile_lora_ms / 1000.0, gpu->profile_sdpa_ms / 1000.0,
+        gpu->profile_solve_ms / 1000.0,
         gpu->profile_scan_ms / 1000.0);
 }
 
@@ -475,10 +489,78 @@ static int h3_gpu_ensure_sage_workspace(h3_gpu *gpu, size_t bytes) {
     }
     gpu->sage_workspace = replacement;
     gpu->sage_workspace_bytes = bytes;
+    gpu->sage_tasks_valid = 0;
     gpu->stats.allocated_bytes += bytes;
     gpu->stats.live_bytes += bytes;
     if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
         gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
+}
+
+static int h3_gpu_same_sage_geometry(
+        const h3_vdn_sage_geometry *left,
+        const h3_vdn_sage_geometry *right) {
+    return left->sequence == right->sequence &&
+        left->heads == right->heads &&
+        left->head_dim == right->head_dim &&
+        left->video_start == right->video_start &&
+        left->frames == right->frames &&
+        left->tokens_per_frame == right->tokens_per_frame &&
+        left->radius == right->radius && left->chunk == right->chunk &&
+        left->anchor_both == right->anchor_both;
+}
+
+static int h3_gpu_prepare_sage_tasks(
+        h3_gpu *gpu, const h3_vdn_sage_geometry *geometry,
+        size_t tasks_offset, h3_vdn_q_task **device_tasks,
+        uint32_t *task_count) {
+    if (!gpu || !geometry || !device_tasks || !task_count) return 0;
+    if (gpu->sage_tasks_valid && gpu->sage_tasks_offset == tasks_offset &&
+        h3_gpu_same_sage_geometry(&gpu->sage_geometry, geometry)) {
+        *device_tasks = reinterpret_cast<h3_vdn_q_task *>(
+            static_cast<uint8_t *>(gpu->sage_workspace) + tasks_offset);
+        *task_count = gpu->sage_task_count;
+        return 1;
+    }
+
+    h3_vdn_q_task *host_tasks = nullptr;
+    size_t host_task_count = 0;
+    char task_error[256] = {};
+    if (!h3_vdn_sage_build_tasks(
+            geometry, &host_tasks, &host_task_count, task_error,
+            sizeof(task_error))) {
+        h3_gpu_set_error(gpu, "cannot build VDN Sage tasks: %s",
+                         task_error[0] ? task_error : "unknown error");
+        return 0;
+    }
+    if (host_task_count > UINT32_MAX ||
+        host_task_count > (SIZE_MAX - tasks_offset) /
+                              sizeof(h3_vdn_q_task)) {
+        h3_vdn_sage_free_tasks(host_tasks);
+        h3_gpu_set_error(gpu, "VDN Sage task workspace size overflow");
+        return 0;
+    }
+    const size_t task_bytes = host_task_count * sizeof(h3_vdn_q_task);
+    const size_t required_bytes = tasks_offset + task_bytes;
+    if (!h3_gpu_ensure_sage_workspace(gpu, required_bytes)) {
+        h3_vdn_sage_free_tasks(host_tasks);
+        return 0;
+    }
+    h3_vdn_q_task *destination = reinterpret_cast<h3_vdn_q_task *>(
+        static_cast<uint8_t *>(gpu->sage_workspace) + tasks_offset);
+    const hipError_t copy_status = hipMemcpyAsync(
+        destination, host_tasks, task_bytes, hipMemcpyHostToDevice,
+        gpu->stream);
+    h3_vdn_sage_free_tasks(host_tasks);
+    if (!h3_gpu_check(gpu, copy_status,
+                      "hipMemcpyAsync VDN Sage task metadata")) return 0;
+
+    gpu->sage_geometry = *geometry;
+    gpu->sage_tasks_offset = tasks_offset;
+    gpu->sage_task_count = static_cast<uint32_t>(host_task_count);
+    gpu->sage_tasks_valid = 1;
+    *device_tasks = destination;
+    *task_count = gpu->sage_task_count;
     return 1;
 }
 
@@ -1685,7 +1767,8 @@ __device__ __forceinline__ static void h3_hip_vdn_sage_qk_wmma_16x16(
  * waves compute one 16-column BF16 P*V tile each. The first pass obtains the
  * exact softmax normalizer without an SxS score buffer, while the second pass
  * recomputes QK and immediately consumes BF16 probabilities. */
-__global__ static void h3_hip_vdn_sage_attention_i8_bf16_kernel(
+[[maybe_unused]] __global__ static void
+h3_hip_vdn_sage_attention_i8_bf16_kernel(
         const int8_t *query, const int8_t *key,
         const float *query_scales, const float *key_scales,
         const hip_bfloat16 *value, hip_bfloat16 *output,
@@ -3180,6 +3263,19 @@ extern "C" int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats) {
     return 1;
 }
 
+extern "C" int h3_gpu_get_memory_info(const h3_gpu *gpu,
+                                        uint64_t *free_bytes,
+                                        uint64_t *total_bytes) {
+    if (!gpu || !free_bytes || !total_bytes) return 0;
+    if (hipSetDevice(gpu->device) != hipSuccess) return 0;
+    size_t free_size = 0;
+    size_t total_size = 0;
+    if (hipMemGetInfo(&free_size, &total_size) != hipSuccess) return 0;
+    *free_bytes = (uint64_t)free_size;
+    *total_bytes = (uint64_t)total_size;
+    return 1;
+}
+
 extern "C" int h3_gpu_get_profile_stats(
         const h3_gpu *gpu, h3_gpu_profile_stats *stats) {
     if (!gpu || !stats) return 0;
@@ -3203,6 +3299,7 @@ extern "C" void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase) {
                         gpu->profile_mark_wall);
     h3_gpu_profile_emit_ops(gpu);
     gpu->profile_linear_ms = 0.0;
+    gpu->profile_lora_ms = 0.0;
     gpu->profile_sdpa_ms = 0.0;
     gpu->profile_solve_ms = 0.0;
     gpu->profile_scan_ms = 0.0;
@@ -3811,6 +3908,7 @@ extern "C" int h3_gpu_lora_merge_bf16(
                        const h3_gpu_tensor *lora_b,
                        uint32_t input_dim, uint32_t output_dim,
                        uint32_t rank, float scale) {
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_LORA);
     size_t weight_count;
     size_t a_count;
     size_t b_count;
@@ -4526,20 +4624,22 @@ extern "C" int h3_gpu_vdn_sage_attention_i8_bf16(
                                "VDN Sage attention value") ||
         !h3_gpu_require_tensor(gpu, output_bf16, elements, H3_GPU_BF16,
                                "VDN Sage attention output")) return 0;
-    dim3 grid((sequence + 15) / 16, heads);
-    hipLaunchKernelGGL(h3_hip_vdn_sage_attention_i8_bf16_kernel,
-                       grid, dim3(256), 0, gpu->stream,
-                       static_cast<const int8_t *>(query_i8->data),
-                       static_cast<const int8_t *>(key_i8->data),
-                       static_cast<const float *>(query_scales->data),
-                       static_cast<const float *>(key_scales->data),
-                       static_cast<const hip_bfloat16 *>(value_bf16->data),
-                       static_cast<hip_bfloat16 *>(output_bf16->data),
-                       sequence, heads, video_start,
-                       static_cast<uint32_t>(video_end_wide), frames,
-                       tokens_per_frame, radius, chunk, anchor_both, scale,
-                       query_groups, key_groups);
-    if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
+    const h3_vdn_sage_geometry geometry = {
+        sequence, heads, head_dim, video_start, frames, tokens_per_frame,
+        radius, chunk, anchor_both};
+    h3_vdn_q_task *device_tasks = nullptr;
+    uint32_t task_count = 0;
+    if (!h3_gpu_prepare_sage_tasks(
+            gpu, &geometry, 0, &device_tasks, &task_count)) return 0;
+    const hipError_t launch_status = h3_vdn_sage_gfx12_launch_i8_bf16(
+        static_cast<const int8_t *>(query_i8->data),
+        static_cast<const int8_t *>(key_i8->data),
+        static_cast<const float *>(query_scales->data),
+        static_cast<const float *>(key_scales->data), value_bf16->data,
+        output_bf16->data, device_tasks, task_count, sequence, heads,
+        query_groups, key_groups, scale, gpu->stream);
+    if (!h3_gpu_check(gpu, launch_status,
+                      "VDN Sage E27 attention kernel")) return 0;
     gpu->stats.direct_dispatches++;
     return 1;
 }
@@ -4601,8 +4701,9 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
         if (head_dim != 128 || gpu->warp_size != 32 ||
             std::strncmp(gpu->gcn_arch_name, "gfx12", 5) != 0) {
             h3_gpu_set_error(
-                gpu, "H3_VDN_SDPA=sage-i8-bf16 requires gfx12 wave32 "
+                gpu, "H3_VDN_SDPA=%s requires gfx12 wave32 "
                 "and head_dim=128 (got %s wave%d D=%u)",
+                h3_vdn_sdpa_mode_name(mode),
                 gpu->gcn_arch_name[0] ? gpu->gcn_arch_name : "unknown",
                 gpu->warp_size, head_dim);
             return 0;
@@ -4617,9 +4718,16 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
             h3_gpu_set_error(gpu, "VDN Sage workspace size overflow");
             return 0;
         }
-        size_t workspace_bytes = elements * 2 +
-                                 scale_elements * sizeof(float);
-        if (!h3_gpu_ensure_sage_workspace(gpu, workspace_bytes)) return 0;
+        const size_t tasks_offset = elements * 2 +
+                                    scale_elements * sizeof(float);
+        const h3_vdn_sage_geometry geometry = {
+            sequence, heads, head_dim, video_start, frames,
+            tokens_per_frame, radius, chunk, anchor_both};
+        h3_vdn_q_task *device_tasks = nullptr;
+        uint32_t task_count = 0;
+        if (!h3_gpu_prepare_sage_tasks(
+                gpu, &geometry, tasks_offset, &device_tasks, &task_count))
+            return 0;
         uint8_t *workspace = static_cast<uint8_t *>(gpu->sage_workspace);
         h3_gpu_tensor query_i8 = {
             gpu, workspace, elements, elements, H3_GPU_I8};
@@ -4636,14 +4744,22 @@ extern "C" int h3_gpu_vdn_window_sdpa_bf16(
         h3_gpu_tensor key_scales = {
             gpu, scale_data + query_scale_elements, key_scale_elements,
             key_scale_elements * sizeof(float), H3_GPU_F32};
-        return h3_gpu_vdn_sage_quant_qk_bf16(
-                   gpu, &query_i8, &key_i8, &query_scales, &key_scales,
-                   query, key, sequence, heads, head_dim) &&
-               h3_gpu_vdn_sage_attention_i8_bf16(
-                   gpu, output, &query_i8, &key_i8, &query_scales,
-                   &key_scales, value, sequence, heads, head_dim,
-                   video_start, frames, tokens_per_frame, radius, chunk,
-                   anchor_both, scale);
+        if (!h3_gpu_vdn_sage_quant_qk_bf16(
+                gpu, &query_i8, &key_i8, &query_scales, &key_scales,
+                query, key, sequence, heads, head_dim)) return 0;
+        const hipError_t launch_status =
+            h3_vdn_sage_gfx12_launch_i8_bf16(
+                static_cast<const int8_t *>(query_i8.data),
+                static_cast<const int8_t *>(key_i8.data),
+                static_cast<const float *>(query_scales.data),
+                static_cast<const float *>(key_scales.data), value->data,
+                output->data, device_tasks, task_count, sequence, heads,
+                query_groups, key_groups, scale, gpu->stream);
+        if (!h3_gpu_check(gpu, launch_status,
+                          "VDN Sage E27 attention kernel")) return 0;
+        gpu->stats.direct_dispatches++;
+        gpu->stats.mps_sdpa_dispatches++;
+        return 1;
     }
     const char *scalar_value = std::getenv("H3_VDN_SCALAR_SDPA");
     const char *reload_query_value = std::getenv("H3_VDN_RELOAD_QUERY");

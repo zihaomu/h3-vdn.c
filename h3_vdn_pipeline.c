@@ -177,6 +177,7 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
                         int render_width, int render_height,
                         const h3_gpu_stats *dit,
                         const h3_gpu_profile_stats *gpu_profile,
+                        const h3_vdn_weight_cache_stats *cache_stats,
                         const h3_vdn_denoise_timing *denoise_profile,
                         const h3_video_frames *frames,
                         const h3_audio_waveform *waveform,
@@ -220,6 +221,10 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         (double)gpu_profile->weight_upload_bytes /
             (1024.0 * 1024.0 * 1024.0) /
             gpu_profile->weight_upload_seconds : 0.0;
+    const char *attention_mode = getenv("H3_VDN_SDPA");
+    if (!attention_mode || !*attention_mode) attention_mode = "auto";
+    int approximate_attention =
+        strncmp(attention_mode, "sage-", 5) == 0;
     int ok = fprintf(file,
         "{\n  \"schema_version\": 2,\n"
         "  \"engine_version\": \"%s\",\n  \"model_revision\": ",
@@ -236,8 +241,12 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         json_string(file, ctx->device.name) &&
         fputs(",\n  \"pci_bus_id\": ", file) != EOF &&
         json_string(file, ctx->device.pci_bus_id) &&
+        fputs(",\n  \"attention\": {\"requested_mode\": ", file) != EOF &&
+        json_string(file, attention_mode) &&
+        fprintf(file, ", \"approximate\": %s},\n",
+                approximate_attention ? "true" : "false") >= 0 &&
         fprintf(file,
-        ",\n  \"device_index\": %d,\n"
+        "  \"device_index\": %d,\n"
         "  \"dtype\": \"BF16\",\n"
         "  \"seed\": %" PRIu64 ",\n"
         "  \"nfe\": %d,\n"
@@ -265,9 +274,9 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         "\"voluntary_context_switches\": %" PRIu64 ", "
         "\"involuntary_context_switches\": %" PRIu64 "},\n"
         "  \"gpu_profile_enabled\": %s,\n"
-        "  \"inclusive_gpu_seconds\": {\"linear\": %.6f, \"sdpa\": %.6f, "
+        "  \"inclusive_gpu_seconds\": {\"linear\": %.6f, \"lora\": %.6f, \"sdpa\": %.6f, "
         "\"solve\": %.6f, \"scan\": %.6f},\n"
-        "  \"gpu_profile_calls\": {\"linear\": %" PRIu64 ", "
+        "  \"gpu_profile_calls\": {\"linear\": %" PRIu64 ", \"lora\": %" PRIu64 ", "
         "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
         "\"scan\": %" PRIu64 "},\n"
         "  \"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
@@ -275,6 +284,10 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
         "\"h2d_gib_per_second\": %.6f, \"staging_hits\": %" PRIu64 ", "
         "\"staging_misses\": %" PRIu64 "},\n"
+        "  \"resident_weight_cache\": {\"budget_bytes\": %" PRIu64 ", "
+        "\"resident_bytes\": %" PRIu64 ", \"blocks\": %u, "
+        "\"hits\": %" PRIu64 ", \"misses\": %" PRIu64 ", "
+        "\"admission_limited\": %s},\n"
         "  \"nfe_timings\": [\n",
         ctx->device.device_index, params->seed, params->steps,
         ctx->model.vdn.video_shift, ctx->model.vdn.audio_shift,
@@ -299,14 +312,19 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         process->voluntary_context_switches,
         process->involuntary_context_switches,
         gpu_profile->enabled ? "true" : "false",
-        gpu_profile->linear_seconds, gpu_profile->sdpa_seconds,
+        gpu_profile->linear_seconds, gpu_profile->lora_seconds,
+        gpu_profile->sdpa_seconds,
         gpu_profile->solve_seconds, gpu_profile->scan_seconds,
-        gpu_profile->linear_calls, gpu_profile->sdpa_calls,
+        gpu_profile->linear_calls, gpu_profile->lora_calls,
+        gpu_profile->sdpa_calls,
         gpu_profile->solve_calls, gpu_profile->scan_calls,
         gpu_profile->weight_read_bytes, gpu_profile->weight_read_seconds,
         read_gibps, gpu_profile->weight_upload_bytes,
         gpu_profile->weight_upload_seconds, upload_gibps,
-        gpu_profile->staging_hits, gpu_profile->staging_misses) >= 0;
+        gpu_profile->staging_hits, gpu_profile->staging_misses,
+        cache_stats->budget_bytes, cache_stats->resident_bytes,
+        cache_stats->resident_blocks, cache_stats->hits, cache_stats->misses,
+        cache_stats->admission_limited ? "true" : "false") >= 0;
     for (unsigned index = 0; ok && index < denoise_profile->count; index++) {
         const h3_vdn_nfe_timing *entry = &denoise_profile->entries[index];
         double forward_accounted = entry->forward.prepare_seconds +
@@ -342,9 +360,9 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             "\"submissions\": %" PRIu64 ", \"direct_dispatches\": %" PRIu64 ", "
             "\"linear_dispatches\": %" PRIu64 ", \"attention_dispatches\": %" PRIu64 ", "
             "\"peak_live_bytes\": %" PRIu64 "}, "
-            "\"inclusive_gpu_seconds\": {\"linear\": %.6f, "
+            "\"inclusive_gpu_seconds\": {\"linear\": %.6f, \"lora\": %.6f, "
             "\"sdpa\": %.6f, \"solve\": %.6f, \"scan\": %.6f}, "
-            "\"gpu_profile_calls\": {\"linear\": %" PRIu64 ", "
+            "\"gpu_profile_calls\": {\"linear\": %" PRIu64 ", \"lora\": %" PRIu64 ", "
             "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
             "\"scan\": %" PRIu64 "}, "
             "\"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
@@ -364,9 +382,11 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             entry->gpu.command_wait_seconds, entry->gpu.submissions,
             entry->gpu.direct_dispatches, entry->gpu.mps_linear_dispatches,
             entry->gpu.mps_sdpa_dispatches, entry->gpu.peak_live_bytes,
-            entry->profile.linear_seconds, entry->profile.sdpa_seconds,
+            entry->profile.linear_seconds, entry->profile.lora_seconds,
+            entry->profile.sdpa_seconds,
             entry->profile.solve_seconds, entry->profile.scan_seconds,
-            entry->profile.linear_calls, entry->profile.sdpa_calls,
+            entry->profile.linear_calls, entry->profile.lora_calls,
+            entry->profile.sdpa_calls,
             entry->profile.solve_calls, entry->profile.scan_calls,
             entry->profile.weight_read_bytes,
             entry->profile.weight_read_seconds, nfe_read_gibps,
@@ -400,6 +420,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     char *video_path = NULL, *audio_path = NULL;
     h3_gpu_stats dit_stats;
     h3_gpu_profile_stats dit_profile;
+    h3_vdn_weight_cache_stats cache_stats;
     h3_vdn_denoise_timing denoise_profile;
     h3_vdn_pipeline_timing timing;
     h3_vdn_process_stats process;
@@ -412,6 +433,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     memset(&waveform, 0, sizeof(waveform));
     memset(&dit_stats, 0, sizeof(dit_stats));
     memset(&dit_profile, 0, sizeof(dit_profile));
+    memset(&cache_stats, 0, sizeof(cache_stats));
     memset(&denoise_profile, 0, sizeof(denoise_profile));
     memset(&timing, 0, sizeof(timing));
     memset(&process, 0, sizeof(process));
@@ -517,7 +539,8 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     if (!h3_gpu_tensor_read_f32(video, video_rows, video_elements) ||
         !h3_gpu_tensor_read_f32(audio, audio_rows, audio_elements) ||
         !h3_gpu_get_stats(gpu, &dit_stats) ||
-        !h3_gpu_get_profile_stats(gpu, &dit_profile)) {
+        !h3_gpu_get_profile_stats(gpu, &dit_profile) ||
+        !h3_vdn_weight_store_cache_stats(store, &cache_stats)) {
         snprintf(detail, sizeof(detail), "cannot read denoised VDN latents: %s",
                  h3_gpu_error(gpu));
         goto failed;
@@ -659,7 +682,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     process_stats(&usage_start, &usage_stop, &process);
     if (!write_record(
             ctx, params, &temporal, render_width, render_height, &dit_stats,
-            &dit_profile, &denoise_profile, &frames, &waveform, &timing,
+            &dit_profile, &cache_stats, &denoise_profile, &frames, &waveform, &timing,
             &process, &hashes, detail, sizeof(detail))) {
         free(result);
         result = NULL;

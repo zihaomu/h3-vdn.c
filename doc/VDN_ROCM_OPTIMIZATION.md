@@ -499,14 +499,16 @@ zero group uses scale 1. GPU output matched the CPU quantization oracle exactly,
 including non-aligned tails and zero groups. The production S=5338/H=56/D=128
 quantization itself averaged 0.001098 seconds.
 
-One 256-thread fused block owns 16 queries from one head. Wave 0 evaluates I8
-QK tiles; pass one accumulates softmax normalizers, pass two recomputes scores
-and immediately consumes BF16 probabilities. Eight waves concurrently compute
-the eight 16-column P*V tiles with BF16 WMMA, so no SxS score or mask tensor is
-materialized. The existing packed text/audio/video mask is evaluated per score;
-query, key, and value tails are zero-padded in LDS. A targeted test crosses
-frame and Q32/K64 scale boundaries and changes only values in a masked frame;
-the protected output reports zero BF16 mismatches.
+The current E27 gfx12 kernel maps one 64-thread workgroup to two 16-query waves
+from one head. Host-built query tasks split arbitrary text/audio/video geometry
+into at most 32 query rows and an ordered list of allowed key intervals, then
+cache that table in the device workspace. Each wave uses I8 WMMA for QK,
+updates the online softmax, converts probabilities with RNE, and immediately
+uses BF16 WMMA for all eight 16-column P*V fragments. No SxS score or mask
+tensor is materialized, and masked gaps are skipped rather than tested in the
+hot score loop. A targeted test crosses frame and Q32/K64 scale boundaries and
+changes only values in a masked frame; the protected output reports zero BF16
+mismatches.
 
 Five crossed production-shape standalone groups gave:
 
@@ -516,6 +518,14 @@ Five crossed production-shape standalone groups gave:
 | Synthetic relative RMSE | — | 0.00379933 | approximate |
 | Synthetic cosine | — | 0.999992786 | finite |
 | Stable output hash | `2a54af9f76d9adbe` | `98fc5281025a8eba` | repeatable |
+
+The later E27 interval-task rewrite was revalidated after a clean build. One
+GPU-4 production-shape B-then-S run measured 0.411735 seconds for exact wave32
+and 0.014938 seconds for Sage including Q/K quantization (27.562x). Its maximum
+absolute error was 0.00012207, relative RMSE 0.00361013, cosine 0.999993586,
+and there were no non-finite values. The E27 approximate hash was
+`b9a74fa3e1008c63`; the full 8-NFE gate below is the acceptance-level speed and
+quality result.
 
 Disassembly contains both `v_wmma_i32_16x16x16_iu8` and
 `v_wmma_f32_16x16x16_bf16`. The fused kernel uses wave32, 72 VGPR, 68 SGPR,
@@ -542,6 +552,139 @@ at layer 22, and ended at 0.00896422 at layer 50; all layers were finite.
 This is a research keep, not a stable default. It must next pass the three-
 prompt video, audio, and complete E2E quality gate. BF16 exact fallback remains
 mandatory regardless of that result.
+
+### REJECT: offline default/turbo LoRA premerge
+
+Dedicated profiling measured 571 LoRA merge calls in one production-token
+forward (550 in the 50 block stream) at 0.728726 seconds total. Exact
+safetensors accounting found only 1.066780 GiB of adapter payload per NFE,
+1.64% of the 65.176 GiB stream. Materializing all effective BF16 matrices would
+require 60.1135 GiB for the blocks and about 61.6029 GiB including setup, a
+roughly 56x storage amplification for a critical-path ceiling near 0.8 seconds
+per NFE. The cache builder and its invalidation/manifest surface are not
+justified, so no derived checkpoint was generated.
+
+### KEEP (opt-in): bounded resident effective-weight sources
+
+`H3_VDN_RESIDENT_GIB=N` enables a generation-lifetime cache with an integer
+budget from 1 through 20 GiB. Lowest-numbered blocks fill deterministically;
+admission queries runtime-visible free VRAM and always reserves at least 6 GiB.
+An unsupported query or insufficient headroom stops cache growth and retains
+normal streaming. Unset or `0` preserves the existing default path. Profile
+output records the budget, resident bytes, blocks, hits, misses, and whether
+admission was limited.
+
+A first implementation directly reused cached GPU tensor pointers. Although it
+was fast, it produced one changed final hash in a three-run 12 GiB stress and
+one text-state Cholesky failure in two 16 GiB runs. Ten independent one-forward
+runs were exact; keeping 11.540 GiB allocated while bypassing reuse was exact
+3/3. Full fingerprints showed the nine cached blocks unchanged after 8 NFE and
+bitwise identical to independently reloaded/merged blocks. Direct pointer reuse
+is permanently rejected.
+
+The kept design treats resident tensors only as immutable sources. Every hit
+allocates the normal per-block working tensors, clones source data device to
+device in one ordered submission, and releases those tensors after the block.
+It still removes disk read, H2D, and LoRA merge for a hit while preserving the
+original temporary-buffer lifecycle. The final 12 GiB small-token 8-NFE stress
+passed 10/10 with fixed hashes, `admission_limited=0`, 9 blocks/11.540 GiB,
+63 hits/337 misses, and a 14.977 GiB peak. Its wall median was 61.594 seconds
+versus a 69.396-second streaming control median (-11.24%).
+
+Two production 8-NFE DiT runs were 238.027 and 237.353 seconds (237.690-second
+mean), 1.48% below the P0 241.253-second reference. Logical read/H2D fell from
+523.048 to 440.927 GiB (-15.70%); DiT peak rose from 4.969 to 16.509 GiB. A
+complete 512x512/56-frame render passed all five frozen internal hashes, the
+2,315,918-byte MP4, ffprobe, and SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+Because exact production is compute-dominated and gains only about 1.5% in
+DiT, the cache stays opt-in rather than consuming 11.54 GiB by default. It may
+become more valuable with the experimental faster attention path.
+
+### REJECT: block prefetch and userspace host weight cache
+
+The production resident run issued 440.927 GiB of logical reads, while
+`/proc/<pid>/io` recorded only 382,509,056 bytes of physical reads for the whole
+E2E and zero major faults. Disk samples were normally idle. Linux page cache is
+already serving more than 99.9% of the stream, so readahead cannot hide a
+material physical-I/O wait.
+
+The remaining `pread` cost is page-cache-to-host/pinned copying. A next-block
+buffer is about 1.28 GiB: ordinary memory would add another copy before H2D,
+while pinning the block would expand the proven 16 MiB staging footprint about
+80x. Upload also needs new cross-stream ordering. A separate 8/16/32 GiB
+userspace host cache would duplicate Linux page cache, increase RSS and NUMA
+complexity, and leave H2D bytes unchanged. Neither design has a safe expected
+gain over the kept per-tensor double staging, so both are rejected without
+adding runtime code.
+
+### P4 REJECT for stable: Sage 8-NFE audio latent gate
+
+The reduced-precision gate was frozen before inspecting production candidate
+media. Each video and audio latent arm after 8 NFE requires cosine at least
+0.999 and relative RMSE at most 5%. A GPU-4-only same-process run reset the
+production latent and evaluated exact wave32 followed by the current E27
+`sage-i8-bf16` mode:
+
+| Metric | exact wave32 | E27 Sage | Result |
+|---|---:|---:|---|
+| 8-NFE DiT wall | 241.002963 s | 118.216247 s | -50.95% |
+| Stable NFE wall | 30.0--30.3 s | 14.77--14.79 s | about -51% |
+| Stable SDPA event/NFE | 16.1--16.3 s | 0.783--0.789 s | about -95% |
+| Video relative RMSE / cosine | — | 0.233513% / 0.999997274256 | pass |
+| Audio relative RMSE / cosine | — | 11.499490% / 0.993377193997 | **fail RMSE** |
+| Peak live allocation | 4.969 GiB | 5.040 GiB | +71 MiB |
+
+The wrapper recorded BDF `0000:e3:00.0`, `gfx1201`, exit status zero, and an
+empty concurrency guard. No output was non-finite. Performance is more than
+sufficient, but the audio latent error fails before decoded-media evaluation;
+the three-prompt production render was therefore not run. Sage remains an
+explicit experimental/research option and `auto` remains exact BF16 wave32.
+
+`scripts/compare_vdn_media.py` provides the frozen decoded-video, temporal,
+PCM/SI-SDR, container, and A/V checks. `scripts/run_vdn_sage_quality_gate.sh`
+runs exact/candidate/candidate-repeat sequentially through the physical-GPU-4
+guard, but the higher-level runner is intentionally not invoked after a lower
+8-NFE latent gate fails.
+
+### P4 KEEP as research: ROCm INT8 model-weight GEMM probe
+
+The fixed checkpoint carries 65.175770 GiB/NFE of block payload. AdalN and MLP
+account for about 45.76 GiB/NFE; offline per-output-channel INT8 plus F32 scale
+would halve those bytes. Before defining a derived checkpoint, a gfx1201 probe
+measured rocBLAS BF16 against per-row activation quantization, I8xI8-to-I32
+GEMM, and output-scale dequantization:
+
+| Matrix `(M,N,K)` | BF16 | INT8 all-in | Speedup | BF16/I8 weight GiB |
+|---|---:|---:|---:|---:|
+| AdalN `(3,96768,2688)` | 0.887813 ms | 0.502589 ms | 1.766479x | 0.484497 / 0.242609 |
+| FC1 `(5338,28672,5376)` | 9.786150 ms | 7.603232 ms | 1.287104x | 0.287109 / 0.143661 |
+| FC2 `(5338,5376,14336)` | 5.629123 ms | 3.784621 ms | 1.487368x | 0.143555 / 0.071797 |
+
+All three were isolated GPU 4 runs with empty concurrency guards. The three
+GEMMs alone save only an estimated 0.220632 seconds/NFE across 50 blocks; the
+larger opportunity is halving loader copies and H2D bytes. This is a GO for a
+future versioned offline cache/loader experiment, not a shipped runtime format
+or speed claim. BF16 stays the default and fallback.
+
+### P5 REJECT: separate-C bidirectional scan
+
+The low-risk scan candidate used separate C/D pointers in
+`rocblas_gemm_strided_batched_ex`, reading injection directly instead of doing
+two D2D copies per frame. Operator prefix/suffix and two production 50-layer
+outputs were bitwise exact. Crossed measurements were:
+
+| Order | separate-C scan | legacy scan | first wall | second wall |
+|---|---:|---:|---:|---:|
+| legacy then separate-C | 0.091 s | 0.106 s | 30.272 s | 30.484 s |
+| separate-C then legacy | 0.090 s | 0.108 s | 29.967 s | 30.210 s |
+
+The GPU event saves 15--18 ms per 50-layer forward, only about 0.05% of wall.
+Whichever arm ran first was about 0.2 seconds faster because SDPA drift was
+larger than the scan signal, so the candidate did not meet the requirement for
+both stable event and end-to-end wall improvement. Its runtime switch and A/B
+hooks were removed. More complex dual-stream or custom scan GEMM work is not
+justified by the roughly 0.1-second/NFE ceiling.
 
 ## Test gates
 
@@ -603,18 +746,28 @@ For timing, alternate scalar and wave32 runs rather than executing all samples
 of one arm first. Record the exact commit, environment, shape, GPU, cache state,
 wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
+The final clean-build regression passed 1,774 core checks, 28,512,043 Sage
+mask/workspace checks, backend/storage/core/DiT/VDN operator suites, INT8
+quantization and WMMA oracles, default and 2 GiB resident-loader parity, input
+contracts, refiner/block smoke, and both VAEs. The default production 50-layer
+forward completed in 29.612809 seconds with frozen video/audio hashes
+`b3d3500676d3fb12` and `5fbd7afb3d78a277`. The public 64x32/56-frame/8-NFE
+CLI completed in 72.754850 seconds and reproduced all five frozen internal
+hashes plus the 73,528-byte MP4 SHA-256
+`7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`.
+Its schema-v2 record reported `attention.requested_mode=auto`,
+`approximate=false`, eight NFE entries, LoRA timing, and a zeroed default
+resident-cache record. Every formal GPU gate used BDF `0000:e3:00.0` and had
+an empty concurrency guard.
+
 ## Next priorities
 
-1. Evaluate a tiled/matrix-instruction VDN SDPA kernel against the new
-   0.4153-second wave32 baseline, preserving the scalar oracle.
-2. Consider layer-level host prefetch only if it preserves bounded memory and
-   improves on double-buffered per-tensor staging; do not pursue an explicit
-   block workspace unless allocator behavior changes materially.
-3. Do not add an FD-only cache: its crossed A/B improved the median by just
-   0.8%. Further I/O work must reduce the 66.8 GiB payload itself. Do not revive
-   per-tensor events or page-lock the entire streamed model.
-4. Fuse the bidirectional scan launches, preserving the CPU oracle.
-5. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
-   perceptual output gates before making reduced precision the default.
-6. Keep this phase single-card. Multi-GPU sharding is explicitly deferred; use
-   bounded hot-block residency and prefetch only after measuring available VRAM.
+1. Keep exact BF16 as the stable default; any new Sage candidate must first
+   reduce 8-NFE audio latent RMSE below 5% before decoded-media work resumes.
+2. If model-weight quantization continues, define a versioned offline cache and
+   measure real loader/H2D savings plus full quality gates; the microbenchmark
+   alone is not runtime support.
+3. Do not revisit scan fusion without a new profile showing a materially larger
+   hotspot than the current roughly 0.1 seconds/NFE.
+4. Keep all formal acceptance on physical GPU 4. Multi-GPU sharding remains
+   deferred.

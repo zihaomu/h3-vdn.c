@@ -175,6 +175,18 @@ int main(int argc, char **argv) {
     CHECK(fabsf(from_bf16(actual_bits) - expected) <= 0.015625f);
 
     h3_vdn_block_weights_free(&block);
+    h3_vdn_weight_cache_stats cache_stats;
+    CHECK(h3_vdn_weight_store_cache_stats(vdn, &cache_stats));
+    if (cache_stats.budget_bytes) {
+        CHECK(cache_stats.resident_blocks == 1);
+        CHECK(cache_stats.hits == 0 && cache_stats.misses == 1);
+        CHECK(h3_vdn_block_weights_load(
+            vdn, gpu, 0, &block, error, sizeof(error)));
+        CHECK(h3_vdn_weight_store_cache_stats(vdn, &cache_stats));
+        CHECK(cache_stats.hits == 1 && cache_stats.misses == 1);
+        CHECK(h3_gpu_tensor_read_bf16(block.q, &actual_bits, 1));
+        h3_vdn_block_weights_free(&block);
+    }
     CHECK(h3_vdn_model_weights_load(vdn, gpu, &model, error, sizeof(error)));
     CHECK(h3_gpu_tensor_elements(model.context_weight) ==
           (size_t)5376 * 5120);
@@ -206,6 +218,8 @@ cleanup:
     h3_weight_store_free(base);
     h3_vdn_model_weights_free(&model);
     h3_vdn_block_weights_free(&block);
+    h3_vdn_weight_store_free(vdn);
+    vdn = NULL;
     if (gpu) {
         h3_gpu_stats final_stats;
         if (!h3_gpu_get_stats(gpu, &final_stats) || final_stats.live_bytes != 0) {
@@ -213,7 +227,6 @@ cleanup:
             ok = 0;
         }
     }
-    h3_vdn_weight_store_free(vdn);
     h3_gpu_free(gpu);
     free(turbo_path);
     free(default_path);

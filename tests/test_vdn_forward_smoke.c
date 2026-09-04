@@ -143,6 +143,14 @@ static void nfe_progress(unsigned completed, unsigned total, void *opaque) {
     fprintf(stderr, "VDN denoise: NFE %u/%u\n", completed, total);
 }
 
+static double denoise_wall_seconds(const h3_vdn_denoise_timing *timing) {
+    double total = 0.0;
+    if (!timing) return total;
+    for (unsigned index = 0; index < timing->count; index++)
+        total += timing->entries[index].wall_seconds;
+    return total;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s H3_BASE STAGE_DMD PROMPT\n", argv[0]);
@@ -159,6 +167,7 @@ int main(int argc, char **argv) {
     h3_vdn_forward_timing forward_timing;
     h3_vdn_forward_timing baseline_forward_timing;
     h3_vdn_denoise_timing denoise_timing;
+    h3_vdn_denoise_timing baseline_denoise_timing;
     memset(&model, 0, sizeof(model));
     memset(&prompt, 0, sizeof(prompt));
     memset(&layout, 0, sizeof(layout));
@@ -166,6 +175,7 @@ int main(int argc, char **argv) {
     memset(&forward_timing, 0, sizeof(forward_timing));
     memset(&baseline_forward_timing, 0, sizeof(baseline_forward_timing));
     memset(&denoise_timing, 0, sizeof(denoise_timing));
+    memset(&baseline_denoise_timing, 0, sizeof(baseline_denoise_timing));
     h3_gpu_tensor *refined = NULL, *video = NULL, *audio = NULL;
     float *video_host = NULL, *audio_host = NULL;
     float *video_output = NULL, *audio_output = NULL;
@@ -176,12 +186,15 @@ int main(int argc, char **argv) {
     uint32_t latent_h = DEFAULT_LATENT_H;
     uint32_t latent_w = DEFAULT_LATENT_W;
     uint32_t audio_latents = DEFAULT_AUDIO_LATENTS;
+    uint64_t random_seed = 0;
+    int random_fixture = 0;
     int denoise = getenv("VDN_SMOKE_DENOISE") != NULL;
     int compare_sdpa = !denoise &&
         getenv("VDN_SMOKE_COMPARE_SDPA") != NULL;
-    int compare_sage = !denoise &&
-        getenv("VDN_SMOKE_COMPARE_SAGE") != NULL;
-    int compare_sage_layers = compare_sage &&
+    int compare_sage = getenv("VDN_SMOKE_COMPARE_SAGE") != NULL;
+    const char *sage_mode = getenv("VDN_SMOKE_SAGE_MODE");
+    if (!sage_mode || !*sage_mode) sage_mode = "sage-i8-bf16";
+    int compare_sage_layers = !denoise && compare_sage &&
         getenv("VDN_SMOKE_SAGE_LAYER_ERRORS") != NULL;
     if (!env_u32("VDN_SMOKE_FRAMES", frames, &frames,
                  error, sizeof(error)) ||
@@ -191,6 +204,19 @@ int main(int argc, char **argv) {
                  error, sizeof(error)) ||
         !env_u32("VDN_SMOKE_AUDIO_LATENTS", audio_latents, &audio_latents,
                  error, sizeof(error))) goto failed;
+    const char *random_seed_text = getenv("VDN_SMOKE_RANDOM_SEED");
+    if (random_seed_text && *random_seed_text) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(random_seed_text, &end, 10);
+        if (errno || !end || *end) {
+            snprintf(error, sizeof(error),
+                     "invalid VDN_SMOKE_RANDOM_SEED=%s", random_seed_text);
+            goto failed;
+        }
+        random_seed = (uint64_t)parsed;
+        random_fixture = 1;
+    }
     if (!gpu) goto failed;
     store = h3_vdn_weight_store_open(argv[1], argv[2], 1,
                                      error, sizeof(error));
@@ -213,10 +239,17 @@ int main(int argc, char **argv) {
         snprintf(error, sizeof(error), "out of host memory for forward fixture");
         goto failed;
     }
-    for (size_t index = 0; index < video_elements; index++)
-        video_host[index] = sinf((float)index * 0.017f) * 0.75f;
-    for (size_t index = 0; index < audio_elements; index++)
-        audio_host[index] = cosf((float)index * 0.031f) * 0.6f;
+    if (random_fixture) {
+        h3_rng rng;
+        h3_rng_seed(&rng, random_seed);
+        h3_rng_fill_normal(&rng, video_host, video_elements);
+        h3_rng_fill_normal(&rng, audio_host, audio_elements);
+    } else {
+        for (size_t index = 0; index < video_elements; index++)
+            video_host[index] = sinf((float)index * 0.017f) * 0.75f;
+        for (size_t index = 0; index < audio_elements; index++)
+            audio_host[index] = cosf((float)index * 0.031f) * 0.6f;
+    }
     video = h3_gpu_tensor_from_f32(gpu, video_host, video_elements);
     audio = h3_gpu_tensor_from_f32(gpu, audio_host, audio_elements);
     int ok = video && audio;
@@ -267,17 +300,27 @@ int main(int argc, char **argv) {
     }
     if (compare_sdpa || compare_sage) {
         baseline_forward_timing = forward_timing;
+        baseline_denoise_timing = denoise_timing;
         video_compare = malloc(video_elements * sizeof(*video_compare));
         audio_compare = malloc(audio_elements * sizeof(*audio_compare));
         h3_vdn_velocity_free(&velocity);
         setenv("H3_VDN_SCALAR_SDPA", "0", 1);
         if (compare_sage)
-            setenv("H3_VDN_SDPA", "sage-i8-bf16", 1);
+            setenv("H3_VDN_SDPA", sage_mode, 1);
         ok = video_compare && audio_compare &&
              h3_gpu_tensor_write_f32(video, video_host, video_elements) &&
              h3_gpu_tensor_write_f32(audio, audio_host, audio_elements);
         layers.capture = 0;
-        if (ok && compare_sage_layers)
+        if (ok && denoise)
+            ok = h3_vdn_denoise(
+                gpu, store, &model, refined, &layout, video, audio, 8, 1, 5,
+                layer_progress, nfe_progress, NULL, &denoise_timing,
+                error, sizeof(error)) &&
+                 h3_gpu_tensor_read_f32(video, video_compare,
+                                        video_elements) &&
+                 h3_gpu_tensor_read_f32(audio, audio_compare,
+                                        audio_elements);
+        else if (ok && compare_sage_layers)
             ok = h3_vdn_forward_observed(
                 gpu, store, &model, refined, &layout, video, audio,
                 0.125f, 0.375f, 1, 5, layer_progress, NULL,
@@ -288,20 +331,27 @@ int main(int argc, char **argv) {
                 gpu, store, &model, refined, &layout, video, audio,
                 0.125f, 0.375f, 1, 5, layer_progress, NULL,
                 &velocity, &forward_timing, error, sizeof(error));
-        ok = ok &&
-             h3_gpu_tensor_read_f32(velocity.video, video_compare,
-                                    video_elements) &&
-             h3_gpu_tensor_read_f32(velocity.audio, audio_compare,
-                                    audio_elements);
+        if (!denoise)
+            ok = ok &&
+                 h3_gpu_tensor_read_f32(velocity.video, video_compare,
+                                        video_elements) &&
+                 h3_gpu_tensor_read_f32(velocity.audio, audio_compare,
+                                        audio_elements);
         if (!ok) goto failed;
         double squared = 0.0, reference_squared = 0.0;
         double candidate_squared = 0.0, dot_product = 0.0;
+        double video_squared = 0.0, video_reference_squared = 0.0;
+        double video_candidate_squared = 0.0, video_dot_product = 0.0;
+        double audio_squared = 0.0, audio_reference_squared = 0.0;
+        double audio_candidate_squared = 0.0, audio_dot_product = 0.0;
         float maximum = 0.0f;
+        float video_maximum = 0.0f, audio_maximum = 0.0f;
         size_t candidate_invalid = 0;
         size_t compared = video_elements + audio_elements;
         for (size_t index = 0; index < video_elements; index++) {
             float difference = fabsf(video_output[index] - video_compare[index]);
             if (difference > maximum) maximum = difference;
+            if (difference > video_maximum) video_maximum = difference;
             squared += (double)difference * difference;
             reference_squared +=
                 (double)video_output[index] * video_output[index];
@@ -309,17 +359,32 @@ int main(int argc, char **argv) {
                 (double)video_compare[index] * video_compare[index];
             dot_product +=
                 (double)video_output[index] * video_compare[index];
+            video_squared += (double)difference * difference;
+            video_reference_squared +=
+                (double)video_output[index] * video_output[index];
+            video_candidate_squared +=
+                (double)video_compare[index] * video_compare[index];
+            video_dot_product +=
+                (double)video_output[index] * video_compare[index];
             candidate_invalid += !isfinite(video_compare[index]);
         }
         for (size_t index = 0; index < audio_elements; index++) {
             float difference = fabsf(audio_output[index] - audio_compare[index]);
             if (difference > maximum) maximum = difference;
+            if (difference > audio_maximum) audio_maximum = difference;
             squared += (double)difference * difference;
             reference_squared +=
                 (double)audio_output[index] * audio_output[index];
             candidate_squared +=
                 (double)audio_compare[index] * audio_compare[index];
             dot_product +=
+                (double)audio_output[index] * audio_compare[index];
+            audio_squared += (double)difference * difference;
+            audio_reference_squared +=
+                (double)audio_output[index] * audio_output[index];
+            audio_candidate_squared +=
+                (double)audio_compare[index] * audio_compare[index];
+            audio_dot_product +=
                 (double)audio_output[index] * audio_compare[index];
             candidate_invalid += !isfinite(audio_compare[index]);
         }
@@ -333,12 +398,34 @@ int main(int argc, char **argv) {
                "invalid=%zu candidate_video=%016llx "
                "candidate_audio=%016llx baseline_wall=%.6f "
                "candidate_wall=%.6f\n",
-               compare_sage ? "wave32/sage-i8-bf16" : "scalar/wave32",
+               compare_sage ? sage_mode : "scalar/wave32",
                maximum, rmse, relative_rmse, cosine, candidate_invalid,
                (unsigned long long)hash_f32(video_compare, video_elements),
                (unsigned long long)hash_f32(audio_compare, audio_elements),
-               baseline_forward_timing.total_seconds,
-               forward_timing.total_seconds);
+               denoise ? denoise_wall_seconds(&baseline_denoise_timing) :
+                         baseline_forward_timing.total_seconds,
+               denoise ? denoise_wall_seconds(&denoise_timing) :
+                         forward_timing.total_seconds);
+        printf("VDN Sage modality error[video]: max_abs=%.9g "
+               "relative_rmse=%.9g cosine=%.12g\n",
+               video_maximum,
+               video_reference_squared > 0.0 ?
+                   sqrt(video_squared / video_reference_squared) : 0.0,
+               video_reference_squared > 0.0 &&
+                       video_candidate_squared > 0.0 ?
+                   video_dot_product /
+                       sqrt(video_reference_squared *
+                            video_candidate_squared) : 0.0);
+        printf("VDN Sage modality error[audio]: max_abs=%.9g "
+               "relative_rmse=%.9g cosine=%.12g\n",
+               audio_maximum,
+               audio_reference_squared > 0.0 ?
+                   sqrt(audio_squared / audio_reference_squared) : 0.0,
+               audio_reference_squared > 0.0 &&
+                       audio_candidate_squared > 0.0 ?
+                   audio_dot_product /
+                       sqrt(audio_reference_squared *
+                            audio_candidate_squared) : 0.0);
         if (candidate_invalid) {
             snprintf(error, sizeof(error),
                      "Sage VDN SDPA output contains non-finite values");
@@ -374,6 +461,12 @@ int main(int argc, char **argv) {
     }
     const char *profile_value = getenv("H3_PROFILE");
     if (profile_value && *profile_value && strcmp(profile_value, "0")) {
+        h3_gpu_profile_stats profile_stats;
+        memset(&profile_stats, 0, sizeof(profile_stats));
+        if (!h3_gpu_get_profile_stats(gpu, &profile_stats)) goto failed;
+        printf("VDN profile totals: lora_calls=%llu lora_seconds=%.6f\n",
+               (unsigned long long)profile_stats.lora_calls,
+               profile_stats.lora_seconds);
         if (denoise) {
             for (unsigned index = 0; index < denoise_timing.count; index++) {
                 const h3_vdn_nfe_timing *entry =
@@ -404,6 +497,8 @@ int main(int argc, char **argv) {
     }
     h3_gpu_stats stats;
     if (!h3_gpu_get_stats(gpu, &stats)) goto failed;
+    h3_vdn_weight_cache_stats cache_stats;
+    if (!h3_vdn_weight_store_cache_stats(store, &cache_stats)) goto failed;
     printf("VDN complete %s passed: sequence=%u, "
            "video=F32[%u,96] hash=%016llx, audio=F32[%u,32] "
            "hash=%016llx, peak=%.3f GiB\n",
@@ -413,6 +508,17 @@ int main(int argc, char **argv) {
            layout.audio_rows,
            (unsigned long long)hash_f32(audio_output, audio_elements),
            (double)stats.peak_live_bytes / (1024.0 * 1024.0 * 1024.0));
+    if (cache_stats.budget_bytes)
+        printf("VDN resident cache: budget=%.3f GiB resident=%.3f GiB "
+               "blocks=%u hits=%llu misses=%llu admission_limited=%d\n",
+               (double)cache_stats.budget_bytes /
+                   (1024.0 * 1024.0 * 1024.0),
+               (double)cache_stats.resident_bytes /
+                   (1024.0 * 1024.0 * 1024.0),
+               cache_stats.resident_blocks,
+               (unsigned long long)cache_stats.hits,
+               (unsigned long long)cache_stats.misses,
+               cache_stats.admission_limited);
     status = 0;
     goto cleanup;
 
