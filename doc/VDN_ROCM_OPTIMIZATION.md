@@ -408,6 +408,50 @@ penalty was detected. Two post-schema production outputs passed the PCI BDF,
 five frozen internal hashes, 2,315,918-byte MP4 SHA-256, and ffprobe gates.
 P0 is complete; all later candidates use this schema and baseline.
 
+### KEEP: exact wave32 F32/D64 video-VAE SDPA
+
+The production video VAE was the largest single measured hotspot: its generic
+F32 attention used a 256-thread block for D=64 and synchronized the complete
+block once per key. The kept specialization assigns one wave32 to each
+query/head pair. Every lane owns dimensions `d` and `d+32`; it combines those
+two products at the same node where the scalar 256-thread tree reaches stride
+32, then performs the identical 16/8/4/2/1 reduction. Key traversal, online
+softmax, and output FMA order are unchanged, so the result is bitwise exact.
+
+Five crossed `S=2273, H=32, D=64` microbenchmark groups produced scalar and
+wave32 medians of 0.422021 and 0.123266 seconds (3.42x, -70.8%). Every one of
+23,275,520 F32 outputs matched bit for bit. Boundary fixtures at S=1, 7, 65,
+and 509 with nonstandard head counts and tails also reported zero mismatches.
+
+| Production result | Scalar | wave32 | Change |
+|---|---:|---:|---:|
+| Isolated video-VAE wall, crossed mean | 243.587705 s | 109.497752 s | -55.05% |
+| Video-VAE SDPA event, crossed mean | ~186.684 s | ~52.954 s | -71.6% |
+| Full 8-NFE E2E, crossed mean | 486.705699 s | 354.399810 s | -27.184% / 1.373x |
+| Peak live GPU allocation | 9.454 GiB | 9.454 GiB | unchanged |
+
+Both production candidate renders reproduced the five frozen internal hashes,
+the 2,315,918-byte MP4, and SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+The small VAE scalar/wave decoded-F32 hash was identically
+`4e1406b60b207415`; the production isolated hash was identically
+`aafcf45d65a16b31`.
+
+The gfx1201 code object reports wavefront size 32, 39 VGPR, 30 SGPR, no VGPR
+or SGPR spills, zero private segment, and no dynamic stack. Disassembly
+contains wave permutation and exponential instructions and no block barrier.
+The exact specialization is the default only for non-causal F32/D64 on a
+wave32 device. Unsupported cases automatically retain the generic kernel;
+`H3_F32_SDPA_SCALAR=1` forces that oracle explicitly.
+
+After the default switch, a clean-build public CLI run with no SDPA environment
+override completed the 64x32/56-frame/8-NFE gate in 73.402279 seconds. Its
+video VAE was 1.181242 seconds and reported 0.004 seconds of SDPA. Schema v2,
+PCI BDF `0000:e3:00.0`, all five frozen small-output hashes, the 73,528-byte
+MP4 SHA-256 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`,
+and ffprobe all passed. A separate smoke run forced the scalar fallback and
+reproduced decoded-F32 hash `4e1406b60b207415`.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -415,12 +459,20 @@ Build and run the local gates with:
 ```sh
 make BACKEND=hip -j16 \
   h3_vdn_gpu_ops_tests h3_vdn_feature_tests \
-  h3_vdn_solve_tests h3_vdn_scan_tests h3_vdn_forward_smoke_tests
+  h3_vdn_solve_tests h3_vdn_scan_tests h3_vdn_forward_smoke_tests \
+  h3_f32_sdpa_bench h3_vdn_video_vae_smoke_tests
 
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_gpu_ops_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_feature_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_solve_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_scan_tests
+
+# Generic F32/D64 oracle versus the default exact wave32 specialization.
+HIP_VISIBLE_DEVICES=4 ./h3_f32_sdpa_bench
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_video_vae_smoke_tests \
+  models/vdn-minimax-h3/h3-base/vae
+HIP_VISIBLE_DEVICES=4 H3_F32_SDPA_SCALAR=1 \
+  ./h3_vdn_video_vae_smoke_tests models/vdn-minimax-h3/h3-base/vae
 
 HIP_VISIBLE_DEVICES=4 VDN_SMOKE_COMPARE_SDPA=1 \
   ./h3_vdn_forward_smoke_tests \
@@ -458,21 +510,16 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
 ## Next priorities
 
-1. First specialize the video VAE's generic F32 SDPA for its measured D=64,
-   approximately 2,273-token tile shape. It accounts for 184.609 seconds of
-   production E2E, versus 130.219 seconds for DiT SDPA. Preserve the generic
-   scalar reduction/softmax/PV order and validate decoded/RGB/MP4 hashes before
-   enabling any candidate by default.
-2. Evaluate a tiled/matrix-instruction VDN SDPA kernel against the new
+1. Evaluate a tiled/matrix-instruction VDN SDPA kernel against the new
    0.4153-second wave32 baseline, preserving the scalar oracle.
-3. Consider layer-level host prefetch only if it preserves bounded memory and
+2. Consider layer-level host prefetch only if it preserves bounded memory and
    improves on double-buffered per-tensor staging; do not pursue an explicit
    block workspace unless allocator behavior changes materially.
-4. Do not add an FD-only cache: its crossed A/B improved the median by just
+3. Do not add an FD-only cache: its crossed A/B improved the median by just
    0.8%. Further I/O work must reduce the 66.8 GiB payload itself. Do not revive
    per-tensor events or page-lock the entire streamed model.
-5. Fuse the bidirectional scan launches, preserving the CPU oracle.
-6. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
+4. Fuse the bidirectional scan launches, preserving the CPU oracle.
+5. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
    perceptual output gates before making reduced precision the default.
-7. Keep this phase single-card. Multi-GPU sharding is explicitly deferred; use
+6. Keep this phase single-card. Multi-GPU sharding is explicitly deferred; use
    bounded hot-block residency and prefetch only after measuring available VRAM.

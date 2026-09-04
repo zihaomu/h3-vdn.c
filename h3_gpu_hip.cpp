@@ -2186,6 +2186,68 @@ __global__ static void h3_hip_sdpa_kernel(
     }
 }
 
+/* Exact specialization for the video VAE shape. The scalar
+ * D=64 kernel starts with 256 threads, but only lanes 0..63 contribute. Its
+ * 128/64 reduction steps add zero before d and d+32 are paired. One wave can
+ * therefore reproduce the same tree as (p[d] + p[d+32]), followed by the
+ * original 16/8/4/2/1 reductions. Each lane owns those same two PV output
+ * dimensions and retains the original key/FMA order. */
+__global__ static void h3_hip_sdpa_f32_d64_wave32_kernel(
+        const float *query, const float *key, const float *value,
+        float *output, uint32_t batch, uint32_t sequence, uint32_t heads,
+        float scale, int causal) {
+    uint32_t query_row = blockIdx.x;
+    uint32_t head_batch = blockIdx.y;
+    uint32_t lane = threadIdx.x;
+    uint32_t head = head_batch % heads;
+    uint32_t batch_index = head_batch / heads;
+    if (query_row >= sequence || batch_index >= batch || lane >= 32) return;
+    extern __shared__ float scores[];
+    constexpr uint32_t head_dim = 64;
+    size_t batch_base = static_cast<size_t>(batch_index) * sequence * heads *
+                        head_dim;
+    size_t query_base = batch_base +
+        (static_cast<size_t>(query_row) * heads + head) * head_dim;
+    uint32_t key_count = causal ? query_row + 1 : sequence;
+    for (uint32_t key_row = 0; key_row < key_count; key_row++) {
+        size_t key_base = batch_base +
+            (static_cast<size_t>(key_row) * heads + head) * head_dim;
+        float product0 = fmaf(query[query_base + lane],
+                              key[key_base + lane], 0.0f);
+        float product32 = fmaf(query[query_base + lane + 32],
+                               key[key_base + lane + 32], 0.0f);
+        float partial = product0 + product32;
+#pragma unroll
+        for (uint32_t offset = 16; offset; offset >>= 1)
+            partial += __shfl_down(partial, offset, 32);
+        if (lane == 0) scores[key_row] = partial * scale;
+    }
+    float inverse = 0.0f;
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        for (uint32_t key_row = 0; key_row < key_count; key_row++)
+            maximum = fmaxf(maximum, scores[key_row]);
+        float denominator = 0.0f;
+        for (uint32_t key_row = 0; key_row < key_count; key_row++) {
+            scores[key_row] = expf(scores[key_row] - maximum);
+            denominator += scores[key_row];
+        }
+        inverse = 1.0f / denominator;
+    }
+    inverse = __shfl(inverse, 0, 32);
+    float sum0 = 0.0f;
+    float sum32 = 0.0f;
+    for (uint32_t key_row = 0; key_row < key_count; key_row++) {
+        size_t value_base = batch_base +
+            (static_cast<size_t>(key_row) * heads + head) * head_dim;
+        float probability = scores[key_row] * inverse;
+        sum0 = fmaf(probability, value[value_base + lane], sum0);
+        sum32 = fmaf(probability, value[value_base + lane + 32], sum32);
+    }
+    output[query_base + lane] = sum0;
+    output[query_base + lane + 32] = sum32;
+}
+
 static int h3_gpu_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight,
@@ -2327,7 +2389,24 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
     }
     h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     dim3 grid(sequence, batch * heads);
-    if (dtype == H3_GPU_F32) {
+    const char *wave_value = std::getenv("H3_F32_SDPA_WAVE32");
+    const char *scalar_value = std::getenv("H3_F32_SDPA_SCALAR");
+    int force_scalar = scalar_value && *scalar_value &&
+                       std::strcmp(scalar_value, "0");
+    int disable_wave32 = wave_value && *wave_value &&
+                         !std::strcmp(wave_value, "0");
+    int use_f32_d64_wave32 = dtype == H3_GPU_F32 && head_dim == 64 && !causal &&
+        gpu->warp_size == 32 && !force_scalar && !disable_wave32;
+    if (use_f32_d64_wave32) {
+        hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_wave32_kernel, grid,
+                           dim3(32), static_cast<size_t>(sequence) *
+                           sizeof(float), gpu->stream,
+                           static_cast<const float *>(query->data),
+                           static_cast<const float *>(key->data),
+                           static_cast<const float *>(value->data),
+                           static_cast<float *>(output->data), batch, sequence,
+                           heads, scale, causal);
+    } else if (dtype == H3_GPU_F32) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(h3_hip_sdpa_kernel<float>), grid,
                            dim3(H3_HIP_THREADS), shared_bytes, gpu->stream,
                            static_cast<const float *>(query->data),

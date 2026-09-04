@@ -15,7 +15,7 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Native ROCm execution | HIP kernels plus rocBLAS/rocSOLVER; no CUDA runtime in the VDN inference path |
 | Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
 | VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
-| Hybrid attention | Window softmax plus VDN linear branch, with an optimized `gfx1201` wave32 path and scalar correctness fallback |
+| Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks |
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline, with diagnostic legacy fallbacks |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | 26-run attention/staging stress matrix and two byte-identical production E2E renders |
@@ -27,6 +27,13 @@ The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
 2,315,918-byte MP4 files with SHA-256
 `ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
 Their denoised latent, decoded F32 video, PCM, and RGB24 hashes also matched.
+
+The current branch additionally enables an exact wave32 F32/D64 video-VAE
+attention specialization by default on supported devices. In crossed
+production A/B, total generation fell from 486.705699 to 354.399810 seconds
+(-27.184%, 1.373x), while all five internal hashes and the final MP4 SHA-256
+remained byte-identical. Set `H3_F32_SDPA_SCALAR=1` to force the generic scalar
+oracle for diagnosis.
 
 ### ROCm compatibility
 
@@ -196,7 +203,7 @@ The E2E test also accepts `VDN_E2E_FRAMES`, `VDN_E2E_LATENT_H`,
 the fast 64x32 defaults. The stable-release production gate uses:
 
 ```sh
-HIP_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES=4 \
 VDN_E2E_FRAMES=56 VDN_E2E_LATENT_H=32 VDN_E2E_LATENT_W=32 \
 VDN_E2E_AUDIO_LATENTS=93 VDN_E2E_NFE=8 \
 ./h3_vdn_e2e_tests \
@@ -221,6 +228,17 @@ eight therefore does not report NFE latency: individual NFE were approximately
 30 seconds, while the one-time video VAE consumed almost the same wall time as
 the complete denoiser. A no-continuous-sampling control was 488.35 seconds, so
 the diagnostic sampler showed no measurable overhead above the 1% threshold.
+
+The exact F32/D64 wave32 specialization reduced crossed isolated video-VAE
+wall time from 243.587705 to 109.497752 seconds (-55.05%); its SDPA event time
+fell from about 186.684 to 52.954 seconds (-71.6%). Crossed production E2E
+means were 486.705699 seconds for the scalar path and 354.399810 seconds for
+the default wave32 path. Both candidate renders reproduced the frozen five
+internal hashes, 2,315,918-byte MP4, and SHA-256 above. Unsupported shapes,
+causal attention, and non-wave32 devices automatically use the scalar path.
+An unmodified-default 64x32 public-CLI regression completed in 73.402279
+seconds, with a 1.181242-second video VAE, schema-v2/BDF validation, all five
+frozen internal hashes, and the exact 73,528-byte smoke MP4 SHA-256.
 
 With `--profile`, the HIP backend also reports weight-read/H2D throughput,
 command wait time, allocation/dispatch counters, and GPU event time for linear,

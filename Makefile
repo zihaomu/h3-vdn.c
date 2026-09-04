@@ -161,6 +161,10 @@ h3_vdn_sdpa_bench: tests/bench_vdn_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_f32_sdpa_bench: tests/bench_f32_sdpa.o $(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
 vdn-gpu-ops-test: h3_vdn_gpu_ops_tests h3_vdn_feature_tests \
 		h3_vdn_solve_tests h3_vdn_scan_tests
 	./h3_vdn_gpu_ops_tests
@@ -434,5 +438,5 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 h3_vdn_sdpa_bench \
+	h3_dit_bench h3_dit_bench_864 h3_vdn_sdpa_bench h3_f32_sdpa_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d
