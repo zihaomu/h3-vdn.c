@@ -957,6 +957,13 @@ int h3_gpu_get_stats(const h3_gpu *opaque, h3_gpu_stats *stats) {
     return 1;
 }
 
+int h3_gpu_get_profile_stats(const h3_gpu *opaque,
+                             h3_gpu_profile_stats *stats) {
+    if (!opaque || !stats) return 0;
+    memset(stats, 0, sizeof(*stats));
+    return 1;
+}
+
 void h3_gpu_profile_set_label(h3_gpu *opaque, const char *label) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !label || !*label) return;

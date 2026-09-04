@@ -36,6 +36,28 @@ typedef struct {
     double gpu_seconds;
 } h3_gpu_stats;
 
+/* Cumulative HIP event and streamed-weight counters. These counters are
+ * populated only while H3_PROFILE is enabled. Unlike the human-readable
+ * profile marks, snapshots are never reset, so callers can subtract two
+ * snapshots to obtain an exact phase or NFE interval. */
+typedef struct {
+    int enabled;
+    uint64_t linear_calls;
+    uint64_t sdpa_calls;
+    uint64_t solve_calls;
+    uint64_t scan_calls;
+    double linear_seconds;
+    double sdpa_seconds;
+    double solve_seconds;
+    double scan_seconds;
+    double weight_read_seconds;
+    double weight_upload_seconds;
+    uint64_t weight_read_bytes;
+    uint64_t weight_upload_bytes;
+    uint64_t staging_hits;
+    uint64_t staging_misses;
+} h3_gpu_profile_stats;
+
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
@@ -97,6 +119,8 @@ int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
+int h3_gpu_get_profile_stats(const h3_gpu *gpu,
+                             h3_gpu_profile_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
  * print wall time alongside command-buffer GPU time and allocation counters. */
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);

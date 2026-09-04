@@ -8,13 +8,15 @@ compared with the scalar BF16 path.
 ## Fixed inputs
 
 - Target start: `3cc97ec5f0c880486bdbb85335ba5d44ca5df562`
-- GPU: AMD Radeon AI PRO R9700, `gfx1201`, wave32
+- GPU: physical GPU 4, AMD Radeon AI PRO R9700, `gfx1201`, wave32;
+  `HIP_VISIBLE_DEVICES=4` exposes it as logical device 0, PCI BDF
+  `0000:e3:00.0` (`amd-smi` GPU 7 on the test host)
 - ROCm: 7.2.3; HIP 7.2.53211; AMD clang 22.0.0git
 - Checkpoint: OpenVDN `stage-dmd-step-250`, default and turbo adapters
 - Reference implementation: `alexhegit/h3-hip.c` at
   `377ad3698d9d82fdb9ab5a22afc9fdc2c521adc3`
 - Microbenchmark: 17 latent frames, 2x4 latent canvas, 6 audio rows,
-  sequence 840, all 50 blocks, GPU 0
+  sequence 840, all 50 blocks, logical GPU 0 after the physical-GPU-4 filter
 
 The reference implementation is used to identify optimization techniques, not
 as a source of performance claims for this model. Its FD cache, parallel
@@ -367,6 +369,45 @@ only `render.prompt_file`; it has no first/last-frame or ordered-media config.
 The native API tests these unsupported paths for early, nonzero, actionable
 failure rather than borrowing the different FL2VA/Ref2VA model semantics.
 
+### KEEP: continuous per-NFE and pipeline profiling
+
+The cumulative HIP profile API now survives human-readable profile marks, so
+two snapshots can delimit one NFE without losing event totals. Schema-v2
+`<output>.inference.json` records the PCI BDF, five FNV-1a output hashes,
+critical-path phases, residual/coverage, per-NFE forward subphases, GPU command
+counters, inclusive linear/SDPA/solve/scan events, read/H2D bytes and time, RSS,
+faults, and context switches. `scripts/profile_vdn_gpu4.sh` enforces the physical
+GPU-4 filter, maps the HIP BDF to the matching `amd-smi` ID, rejects a busy
+device, and captures approximately 1 Hz GPU, disk, and process telemetry.
+
+The first 512x512/56-frame public-CLI profile explained 99.9999997% of its
+486.528789-second critical path:
+
+| Phase | Wall |
+|---|---:|
+| setup + readback/teardown | 1.513 s |
+| 8-NFE denoise | 241.253 s |
+| video VAE | 241.640 s |
+| audio VAE | 1.579 s |
+| RGB + mux | 0.543 s |
+
+The eight NFE times were 30.752, 30.026, 30.047, 30.082, 30.071, 30.099,
+30.083, and 30.093 seconds. Each true NFE streamed exactly 65.176 GiB read and
+H2D; aggregate DiT read/H2D was 523.048 GiB in 39.463/33.094 seconds. DiT SDPA
+was 130.219 seconds inclusive, while the video VAE independently spent
+184.609 seconds in SDPA and 54.095 seconds in linear operations. This proves
+that the historical 60.9 seconds/NFE quotient includes a nearly equal-size,
+one-time video-VAE phase; it is not evidence that sustained NFE latency doubles.
+
+The correct BDF telemetry showed no monotonic NFE slowdown, no major faults,
+and no sustained clock collapse as the hotspot warmed. A no-telemetry single-NFE
+control was not slower than the approximately 1 Hz diagnostic samples. The
+full no-continuous-sampling control was 488.349333 seconds versus a
+486.857837-second sampled-run mean: it was 0.31% slower, so no >1% sampler
+penalty was detected. Two post-schema production outputs passed the PCI BDF,
+five frozen internal hashes, 2,315,918-byte MP4 SHA-256, and ffprobe gates.
+P0 is complete; all later candidates use this schema and baseline.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -376,12 +417,12 @@ make BACKEND=hip -j16 \
   h3_vdn_gpu_ops_tests h3_vdn_feature_tests \
   h3_vdn_solve_tests h3_vdn_scan_tests h3_vdn_forward_smoke_tests
 
-HIP_VISIBLE_DEVICES=0 ./h3_vdn_gpu_ops_tests
-HIP_VISIBLE_DEVICES=0 ./h3_vdn_feature_tests
-HIP_VISIBLE_DEVICES=0 ./h3_vdn_solve_tests
-HIP_VISIBLE_DEVICES=0 ./h3_vdn_scan_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_gpu_ops_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_feature_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_solve_tests
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_scan_tests
 
-HIP_VISIBLE_DEVICES=0 VDN_SMOKE_COMPARE_SDPA=1 \
+HIP_VISIBLE_DEVICES=4 VDN_SMOKE_COMPARE_SDPA=1 \
   ./h3_vdn_forward_smoke_tests \
   models/vdn-minimax-h3/h3-base \
   models/vdn-minimax-h3/stage-dmd-step-250 \
@@ -389,10 +430,10 @@ HIP_VISIBLE_DEVICES=0 VDN_SMOKE_COMPARE_SDPA=1 \
 
 # 512x512 / 56-frame attention geometry; add H3_VDN_SCALAR_SDPA=1 for oracle
 make BACKEND=hip h3_vdn_sdpa_bench
-HIP_VISIBLE_DEVICES=0 ./h3_vdn_sdpa_bench
+HIP_VISIBLE_DEVICES=4 ./h3_vdn_sdpa_bench
 
 # One complete 50-layer production-token profile (one NFE, no VAE/mux)
-HIP_VISIBLE_DEVICES=0 H3_PROFILE=1 \
+HIP_VISIBLE_DEVICES=4 H3_PROFILE=1 \
   VDN_SMOKE_FRAMES=17 VDN_SMOKE_LATENT_H=32 \
   VDN_SMOKE_LATENT_W=32 VDN_SMOKE_AUDIO_LATENTS=93 \
   ./h3_vdn_forward_smoke_tests \
@@ -401,7 +442,7 @@ HIP_VISIBLE_DEVICES=0 H3_PROFILE=1 \
   models/vdn-minimax-h3/prompts/example_0.safetensors
 
 # Full stable-release production E2E (56 frames, 512x512, 8 NFE)
-HIP_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES=4 \
   VDN_E2E_FRAMES=56 VDN_E2E_LATENT_H=32 VDN_E2E_LATENT_W=32 \
   VDN_E2E_AUDIO_LATENTS=93 VDN_E2E_NFE=8 \
   ./h3_vdn_e2e_tests \
@@ -417,16 +458,21 @@ wall time, per-class GPU time, peak memory, hashes, and KEEP/REJECT decision.
 
 ## Next priorities
 
-1. Evaluate a tiled/matrix-instruction production SDPA kernel against the new
+1. First specialize the video VAE's generic F32 SDPA for its measured D=64,
+   approximately 2,273-token tile shape. It accounts for 184.609 seconds of
+   production E2E, versus 130.219 seconds for DiT SDPA. Preserve the generic
+   scalar reduction/softmax/PV order and validate decoded/RGB/MP4 hashes before
+   enabling any candidate by default.
+2. Evaluate a tiled/matrix-instruction VDN SDPA kernel against the new
    0.4153-second wave32 baseline, preserving the scalar oracle.
-2. Consider layer-level host prefetch only if it preserves bounded memory and
+3. Consider layer-level host prefetch only if it preserves bounded memory and
    improves on double-buffered per-tensor staging; do not pursue an explicit
    block workspace unless allocator behavior changes materially.
-3. Do not add an FD-only cache: its crossed A/B improved the median by just
+4. Do not add an FD-only cache: its crossed A/B improved the median by just
    0.8%. Further I/O work must reduce the 66.8 GiB payload itself. Do not revive
    per-tensor events or page-lock the entire streamed model.
-4. Fuse the bidirectional scan launches, preserving the CPU oracle.
-5. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
+5. Fuse the bidirectional scan launches, preserving the CPU oracle.
+6. Evaluate BF16/INT8/FP8 only behind the existing BF16 scalar oracle and add
    perceptual output gates before making reduced precision the default.
-6. Add topology-aware multi-GPU layer sharding and persistent per-device block
-   weights to remove the repeated 66.8 GiB read/upload payload from each NFE.
+7. Keep this phase single-card. Multi-GPU sharding is explicitly deferred; use
+   bounded hot-block residency and prefetch only after measuring available VRAM.

@@ -51,10 +51,7 @@ struct h3_gpu {
     double profile_sdpa_ms;
     double profile_solve_ms;
     double profile_scan_ms;
-    double profile_load_read_seconds;
-    double profile_load_upload_seconds;
-    uint64_t profile_load_read_bytes;
-    uint64_t profile_load_upload_bytes;
+    h3_gpu_profile_stats profile_totals;
     pthread_mutex_t staging_lock;
     int staging_lock_initialized;
     int staging_cache_enabled;
@@ -213,9 +210,9 @@ static int h3_gpu_finish_staging_copy(h3_gpu *gpu, unsigned slot,
                                          gpu->staging_copy_start[slot],
                                          gpu->staging_copy_end[slot]),
                 "hipEventElapsedTime weight upload")) return 0;
-        gpu->profile_load_upload_seconds +=
+        gpu->profile_totals.weight_upload_seconds +=
             static_cast<double>(milliseconds) / 1000.0;
-        gpu->profile_load_upload_bytes +=
+        gpu->profile_totals.weight_upload_bytes +=
             static_cast<uint64_t>(*pending_bytes);
     }
     *pending_bytes = 0;
@@ -310,10 +307,26 @@ static void h3_gpu_profile_flush_ops(h3_gpu *gpu) {
                                 gpu->profile_events[index * 2 + 1]) !=
             hipSuccess) continue;
         switch (gpu->profile_categories[index]) {
-        case H3_HIP_PROFILE_LINEAR: gpu->profile_linear_ms += milliseconds; break;
-        case H3_HIP_PROFILE_SDPA: gpu->profile_sdpa_ms += milliseconds; break;
-        case H3_HIP_PROFILE_SOLVE: gpu->profile_solve_ms += milliseconds; break;
-        case H3_HIP_PROFILE_SCAN: gpu->profile_scan_ms += milliseconds; break;
+        case H3_HIP_PROFILE_LINEAR:
+            gpu->profile_linear_ms += milliseconds;
+            gpu->profile_totals.linear_seconds += milliseconds / 1000.0;
+            gpu->profile_totals.linear_calls++;
+            break;
+        case H3_HIP_PROFILE_SDPA:
+            gpu->profile_sdpa_ms += milliseconds;
+            gpu->profile_totals.sdpa_seconds += milliseconds / 1000.0;
+            gpu->profile_totals.sdpa_calls++;
+            break;
+        case H3_HIP_PROFILE_SOLVE:
+            gpu->profile_solve_ms += milliseconds;
+            gpu->profile_totals.solve_seconds += milliseconds / 1000.0;
+            gpu->profile_totals.solve_calls++;
+            break;
+        case H3_HIP_PROFILE_SCAN:
+            gpu->profile_scan_ms += milliseconds;
+            gpu->profile_totals.scan_seconds += milliseconds / 1000.0;
+            gpu->profile_totals.scan_calls++;
+            break;
         }
     }
     gpu->profile_count = 0;
@@ -379,22 +392,22 @@ static void h3_gpu_profile_emit_ops(h3_gpu *gpu) {
 
 static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
     if (!gpu || !h3_gpu_profile_enabled() ||
-        !gpu->profile_load_read_bytes) return;
+        !gpu->profile_totals.weight_read_bytes) return;
     constexpr double gib = 1024.0 * 1024.0 * 1024.0;
     std::fprintf(stderr,
         "h3 profile: %-20s %-14s read=%8.3fs (%7.3fGiB, %6.2fGiB/s) "
         "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s) staging-hit=%llu/%llu\n",
         gpu->profile_label[0] ? gpu->profile_label : "HIP context",
-        "weight-load", gpu->profile_load_read_seconds,
-        static_cast<double>(gpu->profile_load_read_bytes) / gib,
-        gpu->profile_load_read_seconds > 0.0 ?
-            static_cast<double>(gpu->profile_load_read_bytes) / gib /
-                gpu->profile_load_read_seconds : 0.0,
-        gpu->profile_load_upload_seconds,
-        static_cast<double>(gpu->profile_load_upload_bytes) / gib,
-        gpu->profile_load_upload_seconds > 0.0 ?
-            static_cast<double>(gpu->profile_load_upload_bytes) / gib /
-                gpu->profile_load_upload_seconds : 0.0,
+        "weight-load", gpu->profile_totals.weight_read_seconds,
+        static_cast<double>(gpu->profile_totals.weight_read_bytes) / gib,
+        gpu->profile_totals.weight_read_seconds > 0.0 ?
+            static_cast<double>(gpu->profile_totals.weight_read_bytes) / gib /
+                gpu->profile_totals.weight_read_seconds : 0.0,
+        gpu->profile_totals.weight_upload_seconds,
+        static_cast<double>(gpu->profile_totals.weight_upload_bytes) / gib,
+        gpu->profile_totals.weight_upload_seconds > 0.0 ?
+            static_cast<double>(gpu->profile_totals.weight_upload_bytes) / gib /
+                gpu->profile_totals.weight_upload_seconds : 0.0,
         static_cast<unsigned long long>(gpu->staging_hits),
         static_cast<unsigned long long>(gpu->staging_hits +
                                         gpu->staging_misses));
@@ -545,8 +558,10 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                             static_cast<off_t>(file_offset + completed));
             } while (got < 0 && errno == EINTR);
             if (profile && got > 0) {
-                gpu->profile_load_read_seconds += h3_gpu_now() - read_start;
-                gpu->profile_load_read_bytes += static_cast<uint64_t>(got);
+                gpu->profile_totals.weight_read_seconds +=
+                    h3_gpu_now() - read_start;
+                gpu->profile_totals.weight_read_bytes +=
+                    static_cast<uint64_t>(got);
             }
             if (got <= 0) {
                 if (error && error_size)
@@ -597,8 +612,10 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                         static_cast<off_t>(file_offset + completed));
         } while (got < 0 && errno == EINTR);
         if (profile && got > 0) {
-            gpu->profile_load_read_seconds += h3_gpu_now() - read_start;
-            gpu->profile_load_read_bytes += static_cast<uint64_t>(got);
+            gpu->profile_totals.weight_read_seconds +=
+                h3_gpu_now() - read_start;
+            gpu->profile_totals.weight_read_bytes +=
+                static_cast<uint64_t>(got);
         }
         if (got <= 0) {
             if (error && error_size) {
@@ -627,8 +644,10 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
             return 0;
         }
         if (profile) {
-            gpu->profile_load_upload_seconds += h3_gpu_now() - upload_start;
-            gpu->profile_load_upload_bytes += static_cast<uint64_t>(got);
+            gpu->profile_totals.weight_upload_seconds +=
+                h3_gpu_now() - upload_start;
+            gpu->profile_totals.weight_upload_bytes +=
+                static_cast<uint64_t>(got);
         }
         completed += static_cast<size_t>(got);
     }
@@ -2669,6 +2688,16 @@ extern "C" const char *h3_gpu_error(const h3_gpu *gpu) {
 extern "C" int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats) {
     if (!gpu || !stats) return 0;
     *stats = gpu->stats;
+    return 1;
+}
+
+extern "C" int h3_gpu_get_profile_stats(
+        const h3_gpu *gpu, h3_gpu_profile_stats *stats) {
+    if (!gpu || !stats) return 0;
+    *stats = gpu->profile_totals;
+    stats->enabled = h3_gpu_profile_enabled();
+    stats->staging_hits = gpu->staging_hits;
+    stats->staging_misses = gpu->staging_misses;
     return 1;
 }
 

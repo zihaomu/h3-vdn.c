@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 
 enum {
@@ -35,10 +36,85 @@ typedef struct {
     int cancelled;
 } h3_vdn_progress;
 
+typedef struct {
+    double setup_seconds;
+    double denoise_seconds;
+    double readback_unpack_seconds;
+    double dit_teardown_seconds;
+    double video_vae_seconds;
+    double audio_vae_seconds;
+    double rgb_seconds;
+    double mux_seconds;
+    double total_seconds;
+} h3_vdn_pipeline_timing;
+
+typedef struct {
+    uint64_t max_rss_bytes;
+    double user_seconds;
+    double system_seconds;
+    uint64_t minor_faults;
+    uint64_t major_faults;
+    uint64_t voluntary_context_switches;
+    uint64_t involuntary_context_switches;
+} h3_vdn_process_stats;
+
+typedef struct {
+    uint64_t denoised_video_rows_f32;
+    uint64_t denoised_audio_rows_f32;
+    uint64_t decoded_video_f32;
+    uint64_t decoded_audio_pcm_f32;
+    uint64_t output_rgb24;
+} h3_vdn_output_hashes;
+
 static double elapsed(const struct timespec *start,
                       const struct timespec *stop) {
     return (double)(stop->tv_sec - start->tv_sec) +
            (double)(stop->tv_nsec - start->tv_nsec) / 1.0e9;
+}
+
+static uint64_t hash_bytes(const void *data, size_t bytes) {
+    const uint8_t *values = data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= values[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static double timeval_seconds(const struct timeval *value) {
+    return (double)value->tv_sec + (double)value->tv_usec / 1.0e6;
+}
+
+static uint64_t nonnegative_long_delta(long value, long start) {
+    return value >= start ? (uint64_t)(value - start) : 0;
+}
+
+static void process_stats(const struct rusage *start,
+                          const struct rusage *stop,
+                          h3_vdn_process_stats *stats) {
+    memset(stats, 0, sizeof(*stats));
+#if defined(__APPLE__)
+    stats->max_rss_bytes = stop->ru_maxrss > 0 ?
+        (uint64_t)stop->ru_maxrss : 0;
+#else
+    stats->max_rss_bytes = stop->ru_maxrss > 0 ?
+        (uint64_t)stop->ru_maxrss * UINT64_C(1024) : 0;
+#endif
+    stats->user_seconds = timeval_seconds(&stop->ru_utime) -
+                          timeval_seconds(&start->ru_utime);
+    stats->system_seconds = timeval_seconds(&stop->ru_stime) -
+                            timeval_seconds(&start->ru_stime);
+    if (stats->user_seconds < 0.0) stats->user_seconds = 0.0;
+    if (stats->system_seconds < 0.0) stats->system_seconds = 0.0;
+    stats->minor_faults = nonnegative_long_delta(
+        stop->ru_minflt, start->ru_minflt);
+    stats->major_faults = nonnegative_long_delta(
+        stop->ru_majflt, start->ru_majflt);
+    stats->voluntary_context_switches = nonnegative_long_delta(
+        stop->ru_nvcsw, start->ru_nvcsw);
+    stats->involuntary_context_switches = nonnegative_long_delta(
+        stop->ru_nivcsw, start->ru_nivcsw);
 }
 
 static void emit(h3_vdn_progress *state, const char *phase,
@@ -100,11 +176,13 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
                         const h3_temporal_shape *temporal,
                         int render_width, int render_height,
                         const h3_gpu_stats *dit,
+                        const h3_gpu_profile_stats *gpu_profile,
+                        const h3_vdn_denoise_timing *denoise_profile,
                         const h3_video_frames *frames,
                         const h3_audio_waveform *waveform,
-                        double dit_seconds, double video_seconds,
-                        double audio_seconds, double mux_seconds,
-                        double total_seconds,
+                        const h3_vdn_pipeline_timing *timing,
+                        const h3_vdn_process_stats *process,
+                        const h3_vdn_output_hashes *hashes,
                         char *error, size_t error_size) {
     if (!params->output_path || !*params->output_path) return 1;
     char *path = joined_path(params->output_path, ".inference.json");
@@ -124,8 +202,27 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         peak = frames->gpu_stats.peak_live_bytes;
     if (waveform->gpu_stats.peak_live_bytes > peak)
         peak = waveform->gpu_stats.peak_live_bytes;
+    double dit_seconds = timing->setup_seconds + timing->denoise_seconds +
+                         timing->readback_unpack_seconds +
+                         timing->dit_teardown_seconds;
+    double accounted = dit_seconds + timing->video_vae_seconds +
+                       timing->audio_vae_seconds + timing->rgb_seconds +
+                       timing->mux_seconds;
+    double residual = timing->total_seconds - accounted;
+    if (residual < 0.0) residual = 0.0;
+    double coverage = timing->total_seconds > 0.0 ?
+        accounted / timing->total_seconds : 0.0;
+    double read_gibps = gpu_profile->weight_read_seconds > 0.0 ?
+        (double)gpu_profile->weight_read_bytes /
+            (1024.0 * 1024.0 * 1024.0) /
+            gpu_profile->weight_read_seconds : 0.0;
+    double upload_gibps = gpu_profile->weight_upload_seconds > 0.0 ?
+        (double)gpu_profile->weight_upload_bytes /
+            (1024.0 * 1024.0 * 1024.0) /
+            gpu_profile->weight_upload_seconds : 0.0;
     int ok = fprintf(file,
-        "{\n  \"engine_version\": \"%s\",\n  \"model_revision\": ",
+        "{\n  \"schema_version\": 2,\n"
+        "  \"engine_version\": \"%s\",\n  \"model_revision\": ",
         H3_VERSION) >= 0 &&
         json_string(file, ctx->model.vdn.model_revision) &&
         fputs(",\n  \"base_model\": ", file) != EOF &&
@@ -137,6 +234,8 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         fprintf(file,
         ",\n  \"backend\": \"%s\",\n  \"device\": ", ctx->device.backend) >= 0 &&
         json_string(file, ctx->device.name) &&
+        fputs(",\n  \"pci_bus_id\": ", file) != EOF &&
+        json_string(file, ctx->device.pci_bus_id) &&
         fprintf(file,
         ",\n  \"device_index\": %d,\n"
         "  \"dtype\": \"BF16\",\n"
@@ -148,9 +247,35 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         "  \"render_shape\": {\"frames\": %d, \"width\": %d, \"height\": %d},\n"
         "  \"latent_shape\": {\"video_t\": %d, \"audio_t\": %d, \"width\": %d, \"height\": %d},\n"
         "  \"output\": {\"frames\": %d, \"fps\": %d, \"sample_rate\": %d, \"channels\": %d},\n"
+        "  \"output_hashes_fnv1a64\": {\"denoised_video_rows_f32\": \"%016" PRIx64
+        "\", \"denoised_audio_rows_f32\": \"%016" PRIx64
+        "\", \"decoded_video_f32\": \"%016" PRIx64
+        "\", \"decoded_audio_pcm_f32\": \"%016" PRIx64
+        "\", \"output_rgb24\": \"%016" PRIx64 "\"},\n"
         "  \"peak_gpu_bytes\": %" PRIu64 ",\n"
-        "  \"timing_seconds\": {\"dit\": %.6f, \"video_vae\": %.6f, \"audio_vae\": %.6f, \"mux\": %.6f, \"total\": %.6f}\n"
-        "}\n",
+        "  \"max_rss_bytes\": %" PRIu64 ",\n"
+        "  \"timing_seconds\": {\"dit\": %.6f, \"setup\": %.6f, "
+        "\"denoise\": %.6f, \"readback_unpack\": %.6f, "
+        "\"dit_teardown\": %.6f, \"video_vae\": %.6f, "
+        "\"audio_vae\": %.6f, \"rgb\": %.6f, \"mux\": %.6f, "
+        "\"accounted\": %.6f, \"residual\": %.6f, "
+        "\"coverage\": %.9f, \"total\": %.6f},\n"
+        "  \"process\": {\"user_seconds\": %.6f, \"system_seconds\": %.6f, "
+        "\"minor_faults\": %" PRIu64 ", \"major_faults\": %" PRIu64 ", "
+        "\"voluntary_context_switches\": %" PRIu64 ", "
+        "\"involuntary_context_switches\": %" PRIu64 "},\n"
+        "  \"gpu_profile_enabled\": %s,\n"
+        "  \"inclusive_gpu_seconds\": {\"linear\": %.6f, \"sdpa\": %.6f, "
+        "\"solve\": %.6f, \"scan\": %.6f},\n"
+        "  \"gpu_profile_calls\": {\"linear\": %" PRIu64 ", "
+        "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
+        "\"scan\": %" PRIu64 "},\n"
+        "  \"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
+        "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
+        "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
+        "\"h2d_gib_per_second\": %.6f, \"staging_hits\": %" PRIu64 ", "
+        "\"staging_misses\": %" PRIu64 "},\n"
+        "  \"nfe_timings\": [\n",
         ctx->device.device_index, params->seed, params->steps,
         ctx->model.vdn.video_shift, ctx->model.vdn.audio_shift,
         params->frames, params->width, params->height,
@@ -159,8 +284,98 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         render_width / H3_VAE_SPATIAL_RATIO,
         render_height / H3_VAE_SPATIAL_RATIO,
         frames->frames, H3_FPS, waveform->sample_rate, waveform->channels,
-        peak, dit_seconds, video_seconds, audio_seconds, mux_seconds,
-        total_seconds) >= 0;
+        hashes->denoised_video_rows_f32,
+        hashes->denoised_audio_rows_f32,
+        hashes->decoded_video_f32, hashes->decoded_audio_pcm_f32,
+        hashes->output_rgb24,
+        peak, process->max_rss_bytes,
+        dit_seconds, timing->setup_seconds, timing->denoise_seconds,
+        timing->readback_unpack_seconds, timing->dit_teardown_seconds,
+        timing->video_vae_seconds, timing->audio_vae_seconds,
+        timing->rgb_seconds, timing->mux_seconds, accounted, residual,
+        coverage, timing->total_seconds,
+        process->user_seconds, process->system_seconds,
+        process->minor_faults, process->major_faults,
+        process->voluntary_context_switches,
+        process->involuntary_context_switches,
+        gpu_profile->enabled ? "true" : "false",
+        gpu_profile->linear_seconds, gpu_profile->sdpa_seconds,
+        gpu_profile->solve_seconds, gpu_profile->scan_seconds,
+        gpu_profile->linear_calls, gpu_profile->sdpa_calls,
+        gpu_profile->solve_calls, gpu_profile->scan_calls,
+        gpu_profile->weight_read_bytes, gpu_profile->weight_read_seconds,
+        read_gibps, gpu_profile->weight_upload_bytes,
+        gpu_profile->weight_upload_seconds, upload_gibps,
+        gpu_profile->staging_hits, gpu_profile->staging_misses) >= 0;
+    for (unsigned index = 0; ok && index < denoise_profile->count; index++) {
+        const h3_vdn_nfe_timing *entry = &denoise_profile->entries[index];
+        double forward_accounted = entry->forward.prepare_seconds +
+            entry->forward.input_projection_seconds +
+            entry->forward.timestep_seconds + entry->forward.blocks_seconds +
+            entry->forward.output_head_seconds + entry->forward.cleanup_seconds;
+        double forward_residual = entry->forward.total_seconds -
+                                  forward_accounted;
+        if (forward_residual < 0.0) forward_residual = 0.0;
+        double nfe_accounted = entry->forward.total_seconds +
+                               entry->scheduler_seconds +
+                               entry->euler_seconds;
+        double nfe_residual = entry->wall_seconds - nfe_accounted;
+        if (nfe_residual < 0.0) nfe_residual = 0.0;
+        double nfe_read_gibps = entry->profile.weight_read_seconds > 0.0 ?
+            (double)entry->profile.weight_read_bytes /
+                (1024.0 * 1024.0 * 1024.0) /
+                entry->profile.weight_read_seconds : 0.0;
+        double nfe_upload_gibps = entry->profile.weight_upload_seconds > 0.0 ?
+            (double)entry->profile.weight_upload_bytes /
+                (1024.0 * 1024.0 * 1024.0) /
+                entry->profile.weight_upload_seconds : 0.0;
+        ok = fprintf(file,
+            "    {\"index\": %u, \"video_timestep\": %.9g, "
+            "\"audio_timestep\": %.9g, \"wall_seconds\": %.6f, "
+            "\"critical_path_seconds\": {\"forward\": %.6f, "
+            "\"prepare\": %.6f, \"input_projection\": %.6f, "
+            "\"timestep\": %.6f, \"blocks\": %.6f, "
+            "\"output_head\": %.6f, \"cleanup\": %.6f, "
+            "\"forward_residual\": %.6f, \"scheduler\": %.9f, "
+            "\"euler\": %.6f, \"residual\": %.6f}, "
+            "\"gpu\": {\"encode_seconds\": %.6f, \"wait_seconds\": %.6f, "
+            "\"submissions\": %" PRIu64 ", \"direct_dispatches\": %" PRIu64 ", "
+            "\"linear_dispatches\": %" PRIu64 ", \"attention_dispatches\": %" PRIu64 ", "
+            "\"peak_live_bytes\": %" PRIu64 "}, "
+            "\"inclusive_gpu_seconds\": {\"linear\": %.6f, "
+            "\"sdpa\": %.6f, \"solve\": %.6f, \"scan\": %.6f}, "
+            "\"gpu_profile_calls\": {\"linear\": %" PRIu64 ", "
+            "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
+            "\"scan\": %" PRIu64 "}, "
+            "\"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
+            "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
+            "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
+            "\"h2d_gib_per_second\": %.6f, \"staging_hits\": %" PRIu64 ", "
+            "\"staging_misses\": %" PRIu64 "}}%s\n",
+            entry->index, entry->video_timestep, entry->audio_timestep,
+            entry->wall_seconds, entry->forward.total_seconds,
+            entry->forward.prepare_seconds,
+            entry->forward.input_projection_seconds,
+            entry->forward.timestep_seconds, entry->forward.blocks_seconds,
+            entry->forward.output_head_seconds, entry->forward.cleanup_seconds,
+            forward_residual, entry->scheduler_seconds,
+            entry->euler_seconds, nfe_residual,
+            entry->gpu.command_encode_seconds,
+            entry->gpu.command_wait_seconds, entry->gpu.submissions,
+            entry->gpu.direct_dispatches, entry->gpu.mps_linear_dispatches,
+            entry->gpu.mps_sdpa_dispatches, entry->gpu.peak_live_bytes,
+            entry->profile.linear_seconds, entry->profile.sdpa_seconds,
+            entry->profile.solve_seconds, entry->profile.scan_seconds,
+            entry->profile.linear_calls, entry->profile.sdpa_calls,
+            entry->profile.solve_calls, entry->profile.scan_calls,
+            entry->profile.weight_read_bytes,
+            entry->profile.weight_read_seconds, nfe_read_gibps,
+            entry->profile.weight_upload_bytes,
+            entry->profile.weight_upload_seconds, nfe_upload_gibps,
+            entry->profile.staging_hits, entry->profile.staging_misses,
+            index + 1 < denoise_profile->count ? "," : "") >= 0;
+    }
+    if (ok) ok = fputs("  ]\n}\n", file) != EOF;
     if (fclose(file) != 0) ok = 0;
     if (!ok) snprintf(error, error_size, "cannot write inference record %s",
                       path);
@@ -184,15 +399,30 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     uint8_t *rgb = NULL;
     char *video_path = NULL, *audio_path = NULL;
     h3_gpu_stats dit_stats;
+    h3_gpu_profile_stats dit_profile;
+    h3_vdn_denoise_timing denoise_profile;
+    h3_vdn_pipeline_timing timing;
+    h3_vdn_process_stats process;
+    h3_vdn_output_hashes hashes;
+    struct rusage usage_start, usage_stop;
     memset(&model, 0, sizeof(model));
     memset(&prompt, 0, sizeof(prompt));
     memset(&layout, 0, sizeof(layout));
     memset(&frames, 0, sizeof(frames));
     memset(&waveform, 0, sizeof(waveform));
     memset(&dit_stats, 0, sizeof(dit_stats));
-    struct timespec total_start, dit_start, dit_stop, video_stop, audio_stop,
-                    mux_stop;
+    memset(&dit_profile, 0, sizeof(dit_profile));
+    memset(&denoise_profile, 0, sizeof(denoise_profile));
+    memset(&timing, 0, sizeof(timing));
+    memset(&process, 0, sizeof(process));
+    memset(&hashes, 0, sizeof(hashes));
+    memset(&usage_start, 0, sizeof(usage_start));
+    memset(&usage_stop, 0, sizeof(usage_stop));
+    struct timespec total_start, setup_stop, denoise_stop, readback_stop,
+                    teardown_stop, video_stop, audio_stop, rgb_stop,
+                    mux_stop, total_stop;
     clock_gettime(CLOCK_MONOTONIC, &total_start);
+    (void)getrusage(RUSAGE_SELF, &usage_start);
 
     if (!params->prompt_embeddings || !*params->prompt_embeddings) {
         h3_set_error(ctx, "VDN generation requires prompt_embeddings");
@@ -234,7 +464,6 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
     h3_vdn_progress progress = {ctx, params, 0};
 
-    clock_gettime(CLOCK_MONOTONIC, &dit_start);
     gpu = h3_gpu_create(NULL, detail, sizeof(detail));
     if (gpu) h3_gpu_profile_set_label(gpu, "OpenVDN DiT");
     store = h3_vdn_weight_store_open(
@@ -266,18 +495,37 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     video = h3_gpu_tensor_from_f32(gpu, video_rows, video_elements);
     audio = h3_gpu_tensor_from_f32(gpu, audio_rows, audio_elements);
     if (video && audio) h3_gpu_profile_mark(gpu, "setup");
-    if (!video || !audio || !h3_vdn_denoise(
-            gpu, store, &model, refined, &layout, video, audio,
-            (unsigned)params->steps, 1, 5, layer_progress, nfe_progress,
-            &progress, detail, sizeof(detail)) || progress.cancelled ||
-        !h3_gpu_tensor_read_f32(video, video_rows, video_elements) ||
-        !h3_gpu_tensor_read_f32(audio, audio_rows, audio_elements) ||
-        !h3_gpu_get_stats(gpu, &dit_stats)) {
-        if (!detail[0] && !progress.cancelled)
-            snprintf(detail, sizeof(detail), "cannot read denoised VDN latents: %s",
+    if (!video || !audio) {
+        if (!detail[0])
+            snprintf(detail, sizeof(detail),
+                     "cannot allocate VDN latent tensors: %s",
                      h3_gpu_error(gpu));
         goto failed;
     }
+    clock_gettime(CLOCK_MONOTONIC, &setup_stop);
+    if (!h3_vdn_denoise(
+            gpu, store, &model, refined, &layout, video, audio,
+            (unsigned)params->steps, 1, 5, layer_progress, nfe_progress,
+            &progress, &denoise_profile, detail, sizeof(detail)) ||
+        progress.cancelled) {
+        if (!detail[0] && !progress.cancelled)
+            snprintf(detail, sizeof(detail), "cannot denoise VDN latents: %s",
+                     h3_gpu_error(gpu));
+        goto failed;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &denoise_stop);
+    if (!h3_gpu_tensor_read_f32(video, video_rows, video_elements) ||
+        !h3_gpu_tensor_read_f32(audio, audio_rows, audio_elements) ||
+        !h3_gpu_get_stats(gpu, &dit_stats) ||
+        !h3_gpu_get_profile_stats(gpu, &dit_profile)) {
+        snprintf(detail, sizeof(detail), "cannot read denoised VDN latents: %s",
+                 h3_gpu_error(gpu));
+        goto failed;
+    }
+    hashes.denoised_video_rows_f32 = hash_bytes(
+        video_rows, video_elements * sizeof(*video_rows));
+    hashes.denoised_audio_rows_f32 = hash_bytes(
+        audio_rows, audio_elements * sizeof(*audio_rows));
     size_t video_latent_elements = (size_t)H3_VDN_VIDEO_CHANNELS *
         (size_t)temporal.video_t * (size_t)latent_h * (size_t)latent_w;
     size_t audio_latent_elements = (size_t)H3_VDN_AUDIO_CHANNELS * 2 *
@@ -294,7 +542,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
         snprintf(detail, sizeof(detail), "cannot unpack denoised VDN latents");
         goto failed;
     }
-    clock_gettime(CLOCK_MONOTONIC, &dit_stop);
+    clock_gettime(CLOCK_MONOTONIC, &readback_stop);
 
     h3_gpu_tensor_free(audio); audio = NULL;
     h3_gpu_tensor_free(video); video = NULL;
@@ -304,6 +552,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     h3_vdn_prompt_free(&prompt);
     h3_vdn_weight_store_free(store); store = NULL;
     h3_gpu_free(gpu); gpu = NULL;
+    clock_gettime(CLOCK_MONOTONIC, &teardown_stop);
 
     video_path = joined_path(ctx->model_dir, "/vae");
     audio_path = joined_path(ctx->model_dir, "/audio_vae");
@@ -336,7 +585,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
             goto failed;
         }
         value = fminf(1.0f, fmaxf(0.0f, value));
-        rgb[index] = (uint8_t)lrintf(value * 255.0f);
+        rgb[index] = (uint8_t)lroundf(value * 255.0f);
     }
     int output_width = frames.width, output_height = frames.height;
     if (output_width != params->width || output_height != params->height) {
@@ -352,6 +601,14 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
         output_width = params->width;
         output_height = params->height;
     }
+    hashes.decoded_video_f32 = hash_bytes(
+        frames.rgb, pixels * 3 * sizeof(*frames.rgb));
+    hashes.decoded_audio_pcm_f32 = hash_bytes(
+        waveform.pcm, (size_t)waveform.samples * (size_t)waveform.channels *
+                      sizeof(*waveform.pcm));
+    hashes.output_rgb24 = hash_bytes(
+        rgb, (size_t)frames.frames * (size_t)output_width *
+             (size_t)output_height * 3);
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
         for (int index = 0; index < frames.frames; index++) {
@@ -365,6 +622,7 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
             }
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &rgb_stop);
     if (params->output_path && *params->output_path) {
         emit(&progress, "FFmpeg", 0, frames.frames);
         if (!h3_ffmpeg_write_av_rgb24_f32(
@@ -387,12 +645,22 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
+    clock_gettime(CLOCK_MONOTONIC, &total_stop);
+    timing.setup_seconds = elapsed(&total_start, &setup_stop);
+    timing.denoise_seconds = elapsed(&setup_stop, &denoise_stop);
+    timing.readback_unpack_seconds = elapsed(&denoise_stop, &readback_stop);
+    timing.dit_teardown_seconds = elapsed(&readback_stop, &teardown_stop);
+    timing.video_vae_seconds = elapsed(&teardown_stop, &video_stop);
+    timing.audio_vae_seconds = elapsed(&video_stop, &audio_stop);
+    timing.rgb_seconds = elapsed(&audio_stop, &rgb_stop);
+    timing.mux_seconds = elapsed(&rgb_stop, &mux_stop);
+    timing.total_seconds = elapsed(&total_start, &total_stop);
+    (void)getrusage(RUSAGE_SELF, &usage_stop);
+    process_stats(&usage_start, &usage_stop, &process);
     if (!write_record(
             ctx, params, &temporal, render_width, render_height, &dit_stats,
-            &frames, &waveform, elapsed(&dit_start, &dit_stop),
-            elapsed(&dit_stop, &video_stop), elapsed(&video_stop, &audio_stop),
-            elapsed(&audio_stop, &mux_stop), elapsed(&total_start, &mux_stop),
-            detail, sizeof(detail))) {
+            &dit_profile, &denoise_profile, &frames, &waveform, &timing,
+            &process, &hashes, detail, sizeof(detail))) {
         free(result);
         result = NULL;
         goto failed;

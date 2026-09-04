@@ -23,9 +23,11 @@ int main(void) {
         CHECK(info.name[0] != '\0');
         CHECK(info.architecture[0] != '\0');
         CHECK(info.physical_memory > 0);
-        printf("device %d: %s %s %s (%llu bytes)\n", index, info.backend,
+        if (!strcmp(info.backend, "hip")) CHECK(info.pci_bus_id[0] != '\0');
+        printf("device %d: %s %s %s (%llu bytes, PCI %s)\n", index, info.backend,
                info.architecture, info.name,
-               (unsigned long long)info.physical_memory);
+               (unsigned long long)info.physical_memory,
+               info.pci_bus_id[0] ? info.pci_bus_id : "n/a");
     }
 
     h3_device_info invalid;

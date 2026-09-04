@@ -85,6 +85,18 @@ int main(void) {
                               4 * sizeof(uint16_t) * 2);
     CHECK(stats.peak_live_bytes == stats.live_bytes);
     CHECK(stats.blit_copies == 1);
+    h3_gpu_profile_stats profile;
+    CHECK(h3_gpu_get_profile_stats(gpu, &profile));
+    const char *profile_value = getenv("H3_PROFILE");
+    int profile_enabled = profile_value && *profile_value &&
+                          strcmp(profile_value, "0");
+    CHECK(profile.enabled == profile_enabled);
+    if (profile_enabled) {
+        CHECK(profile.weight_read_bytes == sizeof(bf16_values));
+        CHECK(profile.weight_upload_bytes == sizeof(bf16_values));
+        CHECK(profile.weight_read_seconds >= 0.0);
+        CHECK(profile.weight_upload_seconds >= 0.0);
+    }
     result = 0;
 
 failed:

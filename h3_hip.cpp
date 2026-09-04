@@ -59,6 +59,10 @@ extern "C" int h3_backend_probe(int device_index, h3_device_info *info,
     std::snprintf(info->name, sizeof(info->name), "%s", properties.name);
     std::snprintf(info->architecture, sizeof(info->architecture), "%s",
                   properties.gcnArchName[0] ? properties.gcnArchName : "unknown");
+    status = hipDeviceGetPCIBusId(info->pci_bus_id,
+                                  static_cast<int>(sizeof(info->pci_bus_id)),
+                                  device_index);
+    if (status != hipSuccess) info->pci_bus_id[0] = '\0';
     info->device_index = device_index;
     info->physical_memory = static_cast<uint64_t>(properties.totalGlobalMem);
     info->recommended_working_set = info->physical_memory > UINT64_C(2147483648)

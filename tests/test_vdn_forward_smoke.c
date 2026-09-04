@@ -75,10 +75,14 @@ int main(int argc, char **argv) {
     h3_text_embedding prompt;
     h3_vdn_layout layout;
     h3_vdn_velocity velocity;
+    h3_vdn_forward_timing forward_timing;
+    h3_vdn_denoise_timing denoise_timing;
     memset(&model, 0, sizeof(model));
     memset(&prompt, 0, sizeof(prompt));
     memset(&layout, 0, sizeof(layout));
     memset(&velocity, 0, sizeof(velocity));
+    memset(&forward_timing, 0, sizeof(forward_timing));
+    memset(&denoise_timing, 0, sizeof(denoise_timing));
     h3_gpu_tensor *refined = NULL, *video = NULL, *audio = NULL;
     float *video_host = NULL, *audio_host = NULL;
     float *video_output = NULL, *audio_output = NULL;
@@ -131,14 +135,15 @@ int main(int argc, char **argv) {
     if (ok && denoise)
         ok = h3_vdn_denoise(
             gpu, store, &model, refined, &layout, video, audio, 8, 1, 5,
-            layer_progress, nfe_progress, NULL, error, sizeof(error)) &&
+            layer_progress, nfe_progress, NULL, &denoise_timing,
+            error, sizeof(error)) &&
              h3_gpu_tensor_read_f32(video, video_output, video_elements) &&
              h3_gpu_tensor_read_f32(audio, audio_output, audio_elements);
     else if (ok)
         ok = h3_vdn_forward(
                  gpu, store, &model, refined, &layout, video, audio,
                  0.125f, 0.375f, 1, 5, layer_progress, NULL,
-                 &velocity, error, sizeof(error)) &&
+                 &velocity, &forward_timing, error, sizeof(error)) &&
              h3_gpu_tensor_read_f32(velocity.video, video_output,
                                     video_elements) &&
              h3_gpu_tensor_read_f32(velocity.audio, audio_output,
@@ -160,7 +165,7 @@ int main(int argc, char **argv) {
              h3_vdn_forward(
                  gpu, store, &model, refined, &layout, video, audio,
                  0.125f, 0.375f, 1, 5, layer_progress, NULL,
-                 &velocity, error, sizeof(error)) &&
+                 &velocity, &forward_timing, error, sizeof(error)) &&
              h3_gpu_tensor_read_f32(velocity.video, video_compare,
                                     video_elements) &&
              h3_gpu_tensor_read_f32(velocity.audio, audio_compare,
@@ -217,6 +222,36 @@ int main(int argc, char **argv) {
                  "invalid full-forward output: invalid=%zu nonzero=%zu changed=%zu",
                  invalid, nonzero, changed);
         goto failed;
+    }
+    const char *profile_value = getenv("H3_PROFILE");
+    if (profile_value && *profile_value && strcmp(profile_value, "0")) {
+        if (denoise) {
+            for (unsigned index = 0; index < denoise_timing.count; index++) {
+                const h3_vdn_nfe_timing *entry =
+                    &denoise_timing.entries[index];
+                printf("VDN NFE timing[%u]: wall=%.6f forward=%.6f "
+                       "blocks=%.6f scheduler=%.9f euler=%.6f "
+                       "read=%llu h2d=%llu sdpa=%.6f\n",
+                       index, entry->wall_seconds,
+                       entry->forward.total_seconds,
+                       entry->forward.blocks_seconds,
+                       entry->scheduler_seconds, entry->euler_seconds,
+                       (unsigned long long)entry->profile.weight_read_bytes,
+                       (unsigned long long)entry->profile.weight_upload_bytes,
+                       entry->profile.sdpa_seconds);
+            }
+        } else {
+            printf("VDN forward timing: total=%.6f prepare=%.6f "
+                   "input=%.6f timestep=%.6f blocks=%.6f "
+                   "output=%.6f cleanup=%.6f\n",
+                   forward_timing.total_seconds,
+                   forward_timing.prepare_seconds,
+                   forward_timing.input_projection_seconds,
+                   forward_timing.timestep_seconds,
+                   forward_timing.blocks_seconds,
+                   forward_timing.output_head_seconds,
+                   forward_timing.cleanup_seconds);
+        }
     }
     h3_gpu_stats stats;
     if (!h3_gpu_get_stats(gpu, &stats)) goto failed;

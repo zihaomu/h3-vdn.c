@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
     if (!video || !audio || !h3_vdn_denoise(
             gpu, store, &model, refined, &layout, video, audio, evaluations,
             1, 5,
-            layer_progress, nfe_progress, NULL, error, sizeof(error)) ||
+            layer_progress, nfe_progress, NULL, NULL, error, sizeof(error)) ||
         !h3_gpu_tensor_read_f32(video, video_rows, video_row_elements) ||
         !h3_gpu_tensor_read_f32(audio, audio_rows, audio_row_elements)) {
         if (!error[0]) snprintf(error, sizeof(error),

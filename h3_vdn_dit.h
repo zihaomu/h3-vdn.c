@@ -39,6 +39,33 @@ typedef struct {
     h3_gpu_tensor *audio;
 } h3_vdn_velocity;
 
+typedef struct {
+    double prepare_seconds;
+    double input_projection_seconds;
+    double timestep_seconds;
+    double blocks_seconds;
+    double output_head_seconds;
+    double cleanup_seconds;
+    double total_seconds;
+} h3_vdn_forward_timing;
+
+typedef struct {
+    unsigned index;
+    float video_timestep;
+    float audio_timestep;
+    double wall_seconds;
+    double scheduler_seconds;
+    double euler_seconds;
+    h3_vdn_forward_timing forward;
+    h3_gpu_stats gpu;
+    h3_gpu_profile_stats profile;
+} h3_vdn_nfe_timing;
+
+typedef struct {
+    unsigned count;
+    h3_vdn_nfe_timing entries[H3_MAX_STEPS];
+} h3_vdn_denoise_timing;
+
 typedef void (*h3_vdn_layer_progress)(unsigned completed, unsigned total,
                                       void *opaque);
 
@@ -54,6 +81,7 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
                    uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress progress, void *progress_opaque,
                    h3_vdn_velocity *velocity,
+                   h3_vdn_forward_timing *timing,
                    char *error, size_t error_size);
 void h3_vdn_velocity_free(h3_vdn_velocity *velocity);
 
@@ -70,6 +98,7 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                    unsigned evaluations, uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress layer_progress,
                    h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
+                   h3_vdn_denoise_timing *timing,
                    char *error, size_t error_size);
 
 /* Project and refine an official variable-length prompt. The returned BF16

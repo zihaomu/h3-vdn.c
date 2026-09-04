@@ -147,6 +147,8 @@ typedef struct {
     int apple_gpu_family;
     int metal4;
     int unified_memory;
+    /* Stable PCI identity for discrete accelerators, empty when unavailable. */
+    char pci_bus_id[32];
 } h3_device_info;
 
 typedef struct {

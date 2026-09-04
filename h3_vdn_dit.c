@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     VDN_TEXT_WIDTH = 5120,
@@ -45,6 +46,85 @@ static int dit_op(h3_gpu *gpu, int ok, const char *label,
     if (ok) return 1;
     dit_fail(error, error_size, "%s: %s", label, h3_gpu_error(gpu));
     return 0;
+}
+
+static double dit_now(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec / 1.0e9;
+}
+
+static uint64_t dit_counter_delta(uint64_t value, uint64_t start) {
+    return value >= start ? value - start : 0;
+}
+
+static double dit_seconds_delta(double value, double start) {
+    return value >= start ? value - start : 0.0;
+}
+
+static void dit_gpu_stats_delta(const h3_gpu_stats *start,
+                                const h3_gpu_stats *stop,
+                                h3_gpu_stats *delta) {
+    memset(delta, 0, sizeof(*delta));
+    delta->allocated_bytes = dit_counter_delta(
+        stop->allocated_bytes, start->allocated_bytes);
+    delta->live_bytes = stop->live_bytes;
+    delta->peak_live_bytes = stop->peak_live_bytes;
+    delta->tensor_allocations = dit_counter_delta(
+        stop->tensor_allocations, start->tensor_allocations);
+    delta->direct_dispatches = dit_counter_delta(
+        stop->direct_dispatches, start->direct_dispatches);
+    delta->mps_linear_dispatches = dit_counter_delta(
+        stop->mps_linear_dispatches, start->mps_linear_dispatches);
+    delta->mps_conv_dispatches = dit_counter_delta(
+        stop->mps_conv_dispatches, start->mps_conv_dispatches);
+    delta->mps_sdpa_dispatches = dit_counter_delta(
+        stop->mps_sdpa_dispatches, start->mps_sdpa_dispatches);
+    delta->blit_copies = dit_counter_delta(
+        stop->blit_copies, start->blit_copies);
+    delta->submissions = dit_counter_delta(
+        stop->submissions, start->submissions);
+    delta->command_encode_seconds = dit_seconds_delta(
+        stop->command_encode_seconds, start->command_encode_seconds);
+    delta->command_wait_seconds = dit_seconds_delta(
+        stop->command_wait_seconds, start->command_wait_seconds);
+    delta->gpu_seconds = dit_seconds_delta(
+        stop->gpu_seconds, start->gpu_seconds);
+}
+
+static void dit_profile_stats_delta(const h3_gpu_profile_stats *start,
+                                    const h3_gpu_profile_stats *stop,
+                                    h3_gpu_profile_stats *delta) {
+    memset(delta, 0, sizeof(*delta));
+    delta->enabled = stop->enabled;
+    delta->linear_calls = dit_counter_delta(
+        stop->linear_calls, start->linear_calls);
+    delta->sdpa_calls = dit_counter_delta(
+        stop->sdpa_calls, start->sdpa_calls);
+    delta->solve_calls = dit_counter_delta(
+        stop->solve_calls, start->solve_calls);
+    delta->scan_calls = dit_counter_delta(
+        stop->scan_calls, start->scan_calls);
+    delta->linear_seconds = dit_seconds_delta(
+        stop->linear_seconds, start->linear_seconds);
+    delta->sdpa_seconds = dit_seconds_delta(
+        stop->sdpa_seconds, start->sdpa_seconds);
+    delta->solve_seconds = dit_seconds_delta(
+        stop->solve_seconds, start->solve_seconds);
+    delta->scan_seconds = dit_seconds_delta(
+        stop->scan_seconds, start->scan_seconds);
+    delta->weight_read_seconds = dit_seconds_delta(
+        stop->weight_read_seconds, start->weight_read_seconds);
+    delta->weight_upload_seconds = dit_seconds_delta(
+        stop->weight_upload_seconds, start->weight_upload_seconds);
+    delta->weight_read_bytes = dit_counter_delta(
+        stop->weight_read_bytes, start->weight_read_bytes);
+    delta->weight_upload_bytes = dit_counter_delta(
+        stop->weight_upload_bytes, start->weight_upload_bytes);
+    delta->staging_hits = dit_counter_delta(
+        stop->staging_hits, start->staging_hits);
+    delta->staging_misses = dit_counter_delta(
+        stop->staging_misses, start->staging_misses);
 }
 
 void h3_vdn_layout_free(h3_vdn_layout *layout) {
@@ -747,9 +827,13 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
                    uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress progress, void *progress_opaque,
                    h3_vdn_velocity *velocity,
+                   h3_vdn_forward_timing *timing,
                    char *error, size_t error_size) {
+    double timing_start = dit_now();
+    double timing_phase = timing_start;
     if (error && error_size) error[0] = '\0';
     if (velocity) memset(velocity, 0, sizeof(*velocity));
+    if (timing) memset(timing, 0, sizeof(*timing));
     size_t packed_elements = layout ?
         (size_t)layout->sequence * VDN_HIDDEN : 0;
     size_t video_elements = layout ?
@@ -836,6 +920,8 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
                  h3_gpu_error(gpu));
         goto cleanup;
     }
+    if (timing) timing->prepare_seconds = dit_now() - timing_phase;
+    timing_phase = dit_now();
     ok = dit_op(gpu, h3_gpu_begin(gpu), "begin VDN input packing",
                 error, error_size) &&
          dit_op(gpu, h3_gpu_copy_bf16(
@@ -861,10 +947,15 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
              dit_op(gpu, h3_gpu_submit(gpu), "submit VDN input packing",
                     error, error_size);
     if (!ok) goto cleanup;
+    if (timing)
+        timing->input_projection_seconds = dit_now() - timing_phase;
+    timing_phase = dit_now();
 
     time_embedding = h3_vdn_time_embedding(
         gpu, weights, timesteps, time_rows, error, error_size);
     if (!time_embedding) { ok = 0; goto cleanup; }
+    if (timing) timing->timestep_seconds = dit_now() - timing_phase;
+    timing_phase = dit_now();
     for (unsigned layer = 0; layer < VDN_BLOCKS; layer++) {
         if (!h3_vdn_block_weights_load(store, gpu, layer, &block,
                                        error, error_size)) {
@@ -884,6 +975,8 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
         h3_vdn_block_weights_free(&block);
         if (progress) progress(layer + 1, VDN_BLOCKS, progress_opaque);
     }
+    if (timing) timing->blocks_seconds = dit_now() - timing_phase;
+    timing_phase = dit_now();
 
     final_mod = final_modulation(gpu, weights, time_embedding, time_rows,
                                  error, error_size);
@@ -947,8 +1040,10 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
     if (ok)
         ok = dit_op(gpu, h3_gpu_submit(gpu), "submit VDN output heads",
                     error, error_size);
+    if (timing) timing->output_head_seconds = dit_now() - timing_phase;
 
 cleanup:
+    timing_phase = dit_now();
     h3_vdn_block_weights_free(&block);
     h3_gpu_tensor_free(audio_f32); h3_gpu_tensor_free(video_f32);
     h3_gpu_tensor_free(audio_bf16); h3_gpu_tensor_free(video_bf16);
@@ -958,6 +1053,11 @@ cleanup:
     h3_gpu_tensor_free(rope_cos); h3_gpu_tensor_free(adaln_map);
     h3_gpu_tensor_free(time_map);
     if (!ok) h3_vdn_velocity_free(velocity);
+    if (timing) {
+        double timing_stop = dit_now();
+        timing->cleanup_seconds = timing_stop - timing_phase;
+        timing->total_seconds = timing_stop - timing_start;
+    }
     return ok;
 }
 
@@ -969,8 +1069,10 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                    unsigned evaluations, uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress layer_progress,
                    h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
+                   h3_vdn_denoise_timing *timing,
                    char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
+    if (timing) memset(timing, 0, sizeof(*timing));
     if (!gpu || !store || !weights || !refined_prompt || !layout ||
         !video_rows || (layout->audio_rows && !audio_rows) ||
         evaluations < 1 || evaluations > H3_MAX_STEPS) {
@@ -995,15 +1097,28 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
     uint32_t video_elements = (uint32_t)video_elements_wide;
     uint32_t audio_elements = (uint32_t)audio_elements_wide;
     for (unsigned step = 0; step < evaluations; step++) {
+        double nfe_start = dit_now();
+        h3_gpu_stats gpu_start, gpu_stop;
+        h3_gpu_profile_stats profile_start, profile_stop;
+        memset(&gpu_start, 0, sizeof(gpu_start));
+        memset(&gpu_stop, 0, sizeof(gpu_stop));
+        memset(&profile_start, 0, sizeof(profile_start));
+        memset(&profile_stop, 0, sizeof(profile_stop));
+        (void)h3_gpu_get_stats(gpu, &gpu_start);
+        (void)h3_gpu_get_profile_stats(gpu, &profile_start);
         float video_timestep = 1.0f - schedule.video[step];
         float audio_timestep = 1.0f - schedule.audio[step];
         h3_vdn_velocity velocity;
+        h3_vdn_forward_timing forward_timing;
         memset(&velocity, 0, sizeof(velocity));
+        memset(&forward_timing, 0, sizeof(forward_timing));
         if (!h3_vdn_forward(
                 gpu, store, weights, refined_prompt, layout, video_rows,
                 audio_rows, video_timestep, audio_timestep, radius, chunk,
                 layer_progress, progress_opaque, &velocity,
+                timing ? &forward_timing : NULL,
                 error, error_size)) return 0;
+        double scheduler_start = dit_now();
         /* Match MiniMaxH3Scheduler exactly: sigma_from_t is recovered from
          * the rounded model timestep, while the ratio uses the sigma grid. */
         float video_sigma_from_t = 1.0f - video_timestep;
@@ -1012,6 +1127,8 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
         float audio_ratio = schedule.audio[step + 1] / schedule.audio[step];
         float video_scale = (1.0f - video_ratio) * video_sigma_from_t;
         float audio_scale = (1.0f - audio_ratio) * audio_sigma_from_t;
+        double scheduler_stop = dit_now();
+        double euler_start = scheduler_stop;
         int ok = dit_op(gpu, h3_gpu_begin(gpu), "begin VDN Euler step",
                         error, error_size) &&
                  dit_op(gpu, h3_gpu_euler_f32(
@@ -1028,6 +1145,23 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                         error, error_size);
         h3_vdn_velocity_free(&velocity);
         if (!ok) return 0;
+        double nfe_stop = dit_now();
+        (void)h3_gpu_get_stats(gpu, &gpu_stop);
+        (void)h3_gpu_get_profile_stats(gpu, &profile_stop);
+        if (timing) {
+            h3_vdn_nfe_timing *entry = &timing->entries[step];
+            entry->index = step;
+            entry->video_timestep = video_timestep;
+            entry->audio_timestep = audio_timestep;
+            entry->wall_seconds = nfe_stop - nfe_start;
+            entry->scheduler_seconds = scheduler_stop - scheduler_start;
+            entry->euler_seconds = nfe_stop - euler_start;
+            entry->forward = forward_timing;
+            dit_gpu_stats_delta(&gpu_start, &gpu_stop, &entry->gpu);
+            dit_profile_stats_delta(
+                &profile_start, &profile_stop, &entry->profile);
+            timing->count = step + 1;
+        }
         h3_gpu_profile_mark(gpu, "NFE");
         if (nfe_progress) nfe_progress(step + 1, evaluations, progress_opaque);
     }

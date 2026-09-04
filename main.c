@@ -134,6 +134,8 @@ static void print_info(const h3_ctx *ctx) {
     printf("h3 %s\n", H3_VERSION);
     printf("Device %d: %s (%s/%s)\n", device->device_index, device->name,
            device->backend, device->architecture);
+    if (device->pci_bus_id[0])
+        printf("  PCI bus ID            %s\n", device->pci_bus_id);
     printf("  physical memory       %.1f GiB\n", gib(device->physical_memory));
     printf("  recommended GPU set   %.1f GiB\n", gib(device->recommended_working_set));
     printf("  max allocation        %.1f GiB\n", gib(device->max_buffer_length));
@@ -193,8 +195,9 @@ static int list_devices(void) {
             fprintf(stderr, "h3: %s\n", error);
             return 1;
         }
-        printf("%d\t%s\t%s\t%s\t%.1f GiB\n", index, info.backend,
-               info.architecture, info.name, gib(info.physical_memory));
+        printf("%d\t%s\t%s\t%s\t%.1f GiB\t%s\n", index, info.backend,
+               info.architecture, info.name, gib(info.physical_memory),
+               info.pci_bus_id[0] ? info.pci_bus_id : "-");
     }
     return 0;
 }

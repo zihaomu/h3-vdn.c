@@ -19,6 +19,7 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline, with diagnostic legacy fallbacks |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | 26-run attention/staging stress matrix and two byte-identical production E2E renders |
+| Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
 The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
@@ -159,9 +160,21 @@ omitted, the CLI reads `8` from this checkpoint; an explicitly mismatched value
 fails before loading the large weights.
 
 Generation writes both the requested MP4 and
-`<output>.inference.json`. The record contains the fixed model revision,
-checkpoint and prompt paths, backend/device, seed, NFE, 12/3 video/audio shifts,
-tensor geometry, peak GPU allocation, and phase timings.
+`<output>.inference.json`. Schema v2 contains the fixed model revision,
+checkpoint and prompt paths, backend/device/PCI BDF, seed, NFE, 12/3
+video/audio shifts, tensor geometry, five FNV-1a output hashes, peak GPU/RSS,
+process counters, and mutually exclusive pipeline phase timings. When profiling
+is enabled, every NFE also records forward subphases, GPU command statistics,
+inclusive linear/SDPA/solve/scan event totals, and streamed-weight read/H2D
+bytes and time. Inclusive event/I/O totals may overlap and must not be added to
+critical-path wall time; the JSON reports explicit accounted, residual, and
+coverage fields for that reason.
+
+Validate a profiled record with:
+
+```sh
+scripts/validate_vdn_profile.sh outputs/vdn-cli-smoke.mp4.inference.json
+```
 
 The validated seed-0 smoke result is:
 
@@ -200,9 +213,26 @@ The denoised latent, decoded F32 video, PCM, RGB24, and final MP4 hashes all
 matched across runs; all 56 decoded frames were distinct and the audio measured
 -23.5 dB mean / -9.8 dB peak.
 
+The schema-v2 profiling baseline reproduced that total at 486.53 and 487.19
+seconds. A representative exact run attributed 243.05 seconds to all eight NFE
+and 240.32 seconds to the video VAE; the remaining setup, readback, audio VAE,
+RGB conversion, and mux accounted for about 3.82 seconds. Dividing total E2E by
+eight therefore does not report NFE latency: individual NFE were approximately
+30 seconds, while the one-time video VAE consumed almost the same wall time as
+the complete denoiser. A no-continuous-sampling control was 488.35 seconds, so
+the diagnostic sampler showed no measurable overhead above the 1% threshold.
+
 With `--profile`, the HIP backend also reports weight-read/H2D throughput,
 command wait time, allocation/dispatch counters, and GPU event time for linear,
-SDPA, VDN solve, and VDN scan operations. On `gfx1201`, VDN window attention
+SDPA, VDN solve, and VDN scan operations. For this repository's fixed physical
+GPU-4 experiments, `scripts/profile_vdn_gpu4.sh OUTPUT_DIR -- COMMAND...` exposes
+only `HIP_VISIBLE_DEVICES=4`, resolves the HIP device to its PCI BDF, refuses a
+busy card, and samples the matching `amd-smi`, `iostat`, and process counters.
+Set `H3_TELEMETRY_DISABLE=1` to retain its identity/idle preflight while running
+a no-continuous-sampling control.
+Do not assume HIP ordinals, `amd-smi` IDs, and DRM/card IDs are interchangeable.
+
+On `gfx1201`, VDN window attention
 uses a wave32 kernel with precomputed window bounds and a D=128 specialization;
 set `H3_VDN_SCALAR_SDPA=1` to restore the bitwise oracle. At the real
 512x512/56-frame token geometry, caching the invariant query values and jumping
