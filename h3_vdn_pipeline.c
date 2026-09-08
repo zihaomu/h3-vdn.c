@@ -278,7 +278,7 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         "\"solve\": %.6f, \"scan\": %.6f},\n"
         "  \"gpu_profile_calls\": {\"linear\": %" PRIu64 ", \"lora\": %" PRIu64 ", "
         "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
-        "\"scan\": %" PRIu64 "},\n"
+        "\"solve_retries\": %" PRIu64 ", \"scan\": %" PRIu64 "},\n"
         "  \"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
         "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
         "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
@@ -317,7 +317,8 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         gpu_profile->solve_seconds, gpu_profile->scan_seconds,
         gpu_profile->linear_calls, gpu_profile->lora_calls,
         gpu_profile->sdpa_calls,
-        gpu_profile->solve_calls, gpu_profile->scan_calls,
+        gpu_profile->solve_calls, gpu_profile->solve_retries,
+        gpu_profile->scan_calls,
         gpu_profile->weight_read_bytes, gpu_profile->weight_read_seconds,
         read_gibps, gpu_profile->weight_upload_bytes,
         gpu_profile->weight_upload_seconds, upload_gibps,
@@ -364,7 +365,7 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             "\"sdpa\": %.6f, \"solve\": %.6f, \"scan\": %.6f}, "
             "\"gpu_profile_calls\": {\"linear\": %" PRIu64 ", \"lora\": %" PRIu64 ", "
             "\"sdpa\": %" PRIu64 ", \"solve\": %" PRIu64 ", "
-            "\"scan\": %" PRIu64 "}, "
+            "\"solve_retries\": %" PRIu64 ", \"scan\": %" PRIu64 "}, "
             "\"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
             "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
             "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
@@ -387,7 +388,8 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             entry->profile.solve_seconds, entry->profile.scan_seconds,
             entry->profile.linear_calls, entry->profile.lora_calls,
             entry->profile.sdpa_calls,
-            entry->profile.solve_calls, entry->profile.scan_calls,
+            entry->profile.solve_calls, entry->profile.solve_retries,
+            entry->profile.scan_calls,
             entry->profile.weight_read_bytes,
             entry->profile.weight_read_seconds, nfe_read_gibps,
             entry->profile.weight_upload_bytes,

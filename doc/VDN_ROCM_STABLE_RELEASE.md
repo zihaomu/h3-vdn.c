@@ -1,6 +1,6 @@
 # OpenVDN ROCm v0.1.0 Stable Release
 
-Validation date: 2026-09-04  
+Validation date: 2026-09-04; gfx1201 POTRF guard revalidated 2026-09-08
 Release branch: `vdn-h3-rocm`  
 Upstream OpenVDN code: `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`  
 Model revision: `18be6bcc4ee72585eee322ba28b5ccac2cf85ef0`
@@ -41,11 +41,11 @@ logical device 0 inside the process.
 |---|---|
 | Clean `gfx1201` build | Pass, no compiler warning/error |
 | Host/API | 1774 checks plus JSON, metadata, reference, prompt, and fail-fast input-contract suites pass |
-| GPU operators | backend/storage/general DiT and VDN ops/features/solve/scan pass; scalar fallback also passes |
+| GPU operators | backend/storage/general DiT and VDN ops/features/solve/scan pass; scalar fallback and deterministic POTRF silent-corruption injection/retry pass |
 | Real loader | base + default + turbo parity passes with staging cache enabled and disabled; no live allocation leak |
 | Production single NFE | sequence 5338; video `b3d3500676d3fb12`; audio `5fbd7afb3d78a277`; peak 4.969 GiB |
 | Prompt lengths | 800/821/1299 convert and load; 821/1299 refine; 821 completes all 50 blocks |
-| Production E2E | two consecutive 512×512, 56-frame, 8-NFE runs pass and are byte-identical |
+| Production E2E | two consecutive release runs and one post-POTRF-guard 512×512, 56-frame, 8-NFE run reproduce all frozen hashes and the same MP4 |
 | Release-rehearsal E2E | clean-build 64×32 fixture passes 8 NFE, both VAEs, and mux; exact historical SHA retained |
 
 The two production runs took 486.49 and 487.20 seconds. Their internal hashes
@@ -58,10 +58,22 @@ The clean-build smoke artifact is 73,528 bytes with SHA-256
 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`.
 FFprobe reports 56 H.264 frames at 64×32 and 24 fps plus stereo AAC at 32 kHz.
 
-The historical one-off old lane-0 hash anomaly did not reproduce in a 26-run
-matrix: distributed/lane-0 attention each passed 10/10 with pipelined staging
-and 3/3 with serial staging. Kernel logs showed no reset/fault/ECC report and
-GPU 4 UMC RAS counters were 0/0.
+Post-release stress isolated the earlier intermittent hash anomaly outside the
+attention/staging implementation. ROCm 7.2.x rocSOLVER 3.32 can silently
+corrupt a strided-batched POTRF factor on `gfx1201` while returning `info=0`;
+stream synchronization did not eliminate it. The backend now preserves each
+`A+I`, verifies `L*L^T` on the GPU, and retries only failed matrices before
+POTRI. A deterministic injected bad factor was detected and recovered on all
+66 calls in its test process. Ten real-weight 50-layer runs, a 64-iteration
+production-batch solve stress, both small E2E entry points, and a final
+production E2E all remained exact. The final production artifact again had
+the five hashes above and the same MP4 SHA-256.
+
+A final clean-build release rehearsal repeated the backend, storage, DiT and
+VDN operator gates, fault injection, loader parity, input contracts, refiner,
+block, production-shape 50-layer forward, both VAEs, and 8-NFE small E2E. Every
+GPU run used physical GPU 4/BDF `e3:00.0`, returned status 0, and had an empty
+concurrency guard; the small MP4 remained byte-identical.
 
 ## Platform matrix
 

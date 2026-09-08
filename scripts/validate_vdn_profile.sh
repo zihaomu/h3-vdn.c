@@ -30,6 +30,7 @@ jq -e '
         .critical_path_seconds.forward > 0 and
         .critical_path_seconds.blocks > 0 and
         .gpu_profile_calls.sdpa == 50 and
+        (.gpu_profile_calls.solve_retries | type == "number" and . >= 0) and
         .weight_stream.read_bytes > 0 and
         .weight_stream.read_bytes == .weight_stream.h2d_bytes
     ] | all) and
@@ -44,6 +45,7 @@ jq -e '
     .timing_seconds.coverage >= 0.95 and
     .timing_seconds.coverage <= 1.001 and
     .timing_seconds.residual >= 0 and
+    (.gpu_profile_calls.solve_retries | type == "number" and . >= 0) and
     .weight_stream.read_bytes > 0 and
     .weight_stream.read_bytes == .weight_stream.h2d_bytes
 ' "$record" >/dev/null

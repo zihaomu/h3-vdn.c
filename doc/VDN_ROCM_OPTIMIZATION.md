@@ -686,6 +686,52 @@ both stable event and end-to-end wall improvement. Its runtime switch and A/B
 hooks were removed. More complex dual-stream or custom scan GEMM work is not
 justified by the roughly 0.1-second/NFE ceiling.
 
+### KEEP: gfx1201 rocSOLVER POTRF verification and retry
+
+Post-release cross-prompt stress exposed two failure modes in ROCm 7.2.3's
+rocSOLVER 3.32 `spotrf_strided_batched` path on the R9700: successful 50-layer
+runs could silently return changed video/audio hashes, and other runs stopped
+at a random Cholesky leading minor. A stream synchronization before POTRF was
+rejected: it initially produced six correct real-weight runs, then failed at
+layer 37, video batch 71, leading minor 80.
+
+This matches the independently reported
+[ROCm issue #6623](https://github.com/ROCm/legacy-rocm-build/issues/6623): on
+the same `gfx1201` GPU family and rocSOLVER 3.32, strided-batched POTRF can
+return a corrupted factor with `info=0`, and launch/device serialization does
+not resolve it. The kept backend workaround is limited to `gfx1201`:
+
+- copy the original `A+I` into the otherwise-unused transition output;
+- verify the complete lower triangle of `L*L^T` on the GPU using a relative
+  residual threshold of `1e-4 * max(max_diag(A+I), 1)`;
+- restore and refactorize only failed matrices, for at most two retries;
+- report retry counts in human-readable profiles and schema-v2 inference JSON.
+
+A deterministic `H3_TEST_VDN_CORRUPT_POTRF=1` test hook corrupts one factor
+after a successful POTRF while leaving `info=0`. The verifier detected and
+retried all 66 injected calls in the final small-plus-production test process;
+two production-batch iterations retained hash `6367b2dcf68759d5`. Without
+fault injection, 64 synthetic production-batch iterations were identical.
+Ten consecutive real-weight, production-token 50-layer runs all reproduced
+video/audio hashes `b3d3500676d3fb12` and `5fbd7afb3d78a277`; the old detached
+binary silently changed both hashes in two of three comparison runs.
+
+The real-weight verifier/retry build measured a median solve event near
+0.504 seconds/NFE versus 0.381 seconds for the one valid old-binary sample,
+about 0.12 seconds or 0.4% of a 30-second forward. That cost is accepted for
+detecting a library failure that otherwise reports success. The guard remains
+independent of exact wave32 versus experimental Sage attention.
+
+The post-workaround production E2E ran on physical GPU 4/BDF `e3:00.0` with
+an empty concurrency guard. Eight-NFE DiT took 268.504 seconds and the exact
+video VAE took 110.749 seconds; the wrapper wall was about 382 seconds. The
+run reproduced all five frozen internal hashes and the 2,315,918-byte MP4
+SHA-256 `ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+Its 68.329-second weight-read total was materially slower than the earlier
+39.463-second profile, so this run is a correctness/reliability gate rather
+than a replacement crossed performance baseline. It nevertheless remains
+below the 438.16-second phase target.
+
 ## Test gates
 
 Build and run the local gates with:
@@ -759,6 +805,14 @@ Its schema-v2 record reported `attention.requested_mode=auto`,
 `approximate=false`, eight NFE entries, LoRA timing, and a zeroed default
 resident-cache record. Every formal GPU gate used BDF `0000:e3:00.0` and had
 an empty concurrency guard.
+
+The 2026-09-08 POTRF-guard clean-build regression repeated the complete
+backend/storage/DiT/VDN operator group, including deterministic silent
+corruption/retry injection. Input contracts, both loader modes, refiner, block,
+the production-shape 50-layer forward, both VAEs, and the 64x32 8-NFE E2E all
+returned status 0 on physical GPU 4 with empty concurrency guards. The final
+small E2E retained the five frozen hashes and the same 73,528-byte MP4 SHA-256;
+the 50-layer run reported zero natural POTRF retries.
 
 ## Next priorities
 

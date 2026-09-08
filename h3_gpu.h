@@ -46,6 +46,7 @@ typedef struct {
     uint64_t lora_calls;
     uint64_t sdpa_calls;
     uint64_t solve_calls;
+    uint64_t solve_retries;
     uint64_t scan_calls;
     double linear_seconds;
     double lora_seconds;

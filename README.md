@@ -18,9 +18,9 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks |
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline; optional bounded resident effective-weight sources for repeated NFE |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
-| Determinism | 26-run attention/staging stress matrix and two byte-identical production E2E renders |
-| Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
-| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention is explicit opt-in; it is much faster but failed the frozen 8-NFE audio latent gate and is not part of the stable/default path |
+| Determinism | gfx1201 POTRF factors are independently verified and retried around the ROCm 7.2 rocSOLVER defect; 10-run real-weight and 64-run production-batch stresses are exact |
+| Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache/POTRF-retry counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
+| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention is explicit opt-in; E27 is much faster but passed none of the three prompt audio gates and is not part of the stable/default path |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
 The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
@@ -28,6 +28,17 @@ The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
 2,315,918-byte MP4 files with SHA-256
 `ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
 Their denoised latent, decoded F32 video, PCM, and RGB24 hashes also matched.
+
+ROCm 7.2's rocSOLVER 3.32 can intermittently return a corrupted batched
+Cholesky factor on `gfx1201` while reporting success. The HIP backend therefore
+preserves each `A+I`, checks `L*L^T` on the GPU before inversion, and restores
+and refactorizes only failed matrices. A deterministic fault-injection gate
+exercises the silent-corruption path, and profile/JSON output reports
+`solve_retries`. This guard added about 0.12 seconds to a roughly 30-second
+50-layer NFE in the acceptance workload while preventing both observed silent
+hash drift and leading-minor failures. A post-guard 512x512/56-frame/8-NFE
+render reproduced all five frozen internal hashes and the production MP4
+SHA-256 above.
 
 The current branch additionally enables an exact wave32 F32/D64 video-VAE
 attention specialization by default on supported devices. In crossed
@@ -50,12 +61,13 @@ preserves the default streaming path.
 
 The branch also carries an explicitly experimental native gfx12 Sage-style
 attention path selected with `H3_VDN_SDPA=sage-i8-bf16`. Its current E27
-task-split kernel reduced a same-process production 8-NFE DiT comparison from
-241.002963 to 118.216247 seconds (-50.95%). Video latent quality passed the
-frozen gate (0.233513% relative RMSE, 0.999997274 cosine), but audio latent
-relative RMSE was 11.499490%, above the 5% limit. The run therefore stopped
-before the three-prompt decoded-media gate. This mode remains research-only;
-unset/`auto` continues to use the bitwise-exact BF16 wave32 path.
+task-split kernel reached a clean-GPU4 profile total of 14.892 ms and GPU
+median of 15.121 ms. Same-process production 8-NFE DiT runs are roughly
+2.0x faster than wave32, and decoded video quality passes. The completed
+three-prompt staged gate nevertheless passed audio for 0/3 prompts: examples
+0 and 1 failed decoded-audio correlation/RMSE, while example 2 failed the
+audio-latent fast gate. This mode remains research-only; unset/`auto` continues
+to use the bitwise-exact BF16 wave32 path.
 
 An isolated ROCm model-weight probe also found 1.29x--1.77x all-in INT8 GEMM
 speedups for production AdalN/MLP shapes while approximately halving their
@@ -201,10 +213,10 @@ video/audio shifts, tensor geometry, five FNV-1a output hashes, peak GPU/RSS,
 process counters, and mutually exclusive pipeline phase timings. When profiling
 is enabled, every NFE also records forward subphases, GPU command statistics,
 inclusive linear/SDPA/solve/scan/LoRA event totals, streamed-weight read/H2D
-bytes and time, and resident-cache budget/bytes/blocks/hits/misses/admission
-state. Inclusive event/I/O totals may overlap and must not be added to
-critical-path wall time; the JSON reports explicit accounted, residual, and
-coverage fields for that reason.
+bytes and time, POTRF retry counts, and resident-cache
+budget/bytes/blocks/hits/misses/admission state. Inclusive event/I/O totals
+may overlap and must not be added to critical-path wall time; the JSON reports
+explicit accounted, residual, and coverage fields for that reason.
 
 Validate a profiled record with:
 

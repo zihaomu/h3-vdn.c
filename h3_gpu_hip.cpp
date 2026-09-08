@@ -401,12 +401,14 @@ static void h3_gpu_profile_emit_ops(h3_gpu *gpu) {
     if (total <= 0.0) return;
     std::fprintf(stderr,
         "h3 profile: %-20s %-14s measured=%8.3fs linear=%8.3fs "
-        "lora=%8.3fs sdpa=%8.3fs solve=%8.3fs scan=%8.3fs\n",
+        "lora=%8.3fs sdpa=%8.3fs solve=%8.3fs scan=%8.3fs "
+        "potrf-retry=%llu\n",
         gpu->profile_label[0] ? gpu->profile_label : "HIP context",
         "gpu-op-classes", total / 1000.0, gpu->profile_linear_ms / 1000.0,
         gpu->profile_lora_ms / 1000.0, gpu->profile_sdpa_ms / 1000.0,
         gpu->profile_solve_ms / 1000.0,
-        gpu->profile_scan_ms / 1000.0);
+        gpu->profile_scan_ms / 1000.0,
+        static_cast<unsigned long long>(gpu->profile_totals.solve_retries));
 }
 
 static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
@@ -2440,6 +2442,70 @@ __global__ static void h3_hip_vdn_add_identity_f32_kernel(
     float *matrix = matrices + static_cast<size_t>(batch) * stride;
     for (uint32_t index = 0; index < dimension; index++)
         matrix[static_cast<size_t>(index) * dimension + index] += 1.0f;
+}
+
+/* gfx1201 versions of rocSOLVER 3.32 can intermittently return a corrupted
+ * POTRF factor while reporting info=0 (ROCm/legacy-rocm-build#6623). Check
+ * L*L^T against the preserved input before POTRI so a bad matrix can be
+ * restored and refactorized. The matrices are column-major to rocSOLVER;
+ * VDN inputs are symmetric. */
+__global__ static void h3_hip_vdn_verify_cholesky_f32_kernel(
+        const float *factors, const float *original, rocblas_int *info,
+        uint32_t batches, uint32_t dimension, float relative_tolerance) {
+    uint32_t batch = blockIdx.x;
+    uint32_t lane = threadIdx.x;
+    if (batch >= batches || info[batch] != 0) return;
+    size_t matrix_elements = static_cast<size_t>(dimension) * dimension;
+    size_t base = static_cast<size_t>(batch) * matrix_elements;
+    float maximum_residual = 0.0f;
+    float maximum_diagonal = 0.0f;
+    for (size_t index = lane; index < matrix_elements;
+         index += blockDim.x) {
+        uint32_t row = static_cast<uint32_t>(index % dimension);
+        uint32_t column = static_cast<uint32_t>(index / dimension);
+        if (row < column) continue;
+        float reconstructed = 0.0f;
+        for (uint32_t inner = 0; inner <= column; ++inner)
+            reconstructed = fmaf(
+                factors[base + row + static_cast<size_t>(inner) * dimension],
+                factors[base + column +
+                        static_cast<size_t>(inner) * dimension],
+                reconstructed);
+        float expected = original[base + row +
+                                  static_cast<size_t>(column) * dimension];
+        float residual = fabsf(reconstructed - expected);
+        if (!isfinite(reconstructed) || !isfinite(expected) ||
+            !isfinite(residual))
+            maximum_residual = INFINITY;
+        else
+            maximum_residual = fmaxf(maximum_residual, residual);
+        if (row == column) {
+            float diagonal = fabsf(expected);
+            maximum_diagonal = isfinite(diagonal) ?
+                fmaxf(maximum_diagonal, diagonal) : INFINITY;
+        }
+    }
+    extern __shared__ float reductions[];
+    float *residuals = reductions;
+    float *diagonals = reductions + blockDim.x;
+    residuals[lane] = maximum_residual;
+    diagonals[lane] = maximum_diagonal;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) {
+            residuals[lane] = fmaxf(residuals[lane],
+                                    residuals[lane + stride]);
+            diagonals[lane] = fmaxf(diagonals[lane],
+                                    diagonals[lane + stride]);
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        float scale = fmaxf(diagonals[0], 1.0f);
+        if (!isfinite(residuals[0]) || !isfinite(scale) ||
+            residuals[0] > relative_tolerance * scale)
+            info[batch] = -1;
+    }
 }
 
 __global__ static void h3_hip_vdn_symmetrize_inverse_f32_kernel(
@@ -5027,6 +5093,77 @@ extern "C" int h3_gpu_vdn_frame_stats_bf16(
     return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
+static void h3_hip_report_cholesky_matrix(
+        const float *matrix, uint32_t dimension, uint32_t batch) {
+    const size_t entries = static_cast<size_t>(dimension) * dimension;
+    size_t nonfinite = 0;
+    double minimum_diagonal = std::numeric_limits<double>::infinity();
+    double maximum_diagonal = -std::numeric_limits<double>::infinity();
+    double maximum_absolute = 0.0;
+    double maximum_asymmetry = 0.0;
+    for (uint32_t row = 0; row < dimension; ++row) {
+        const double diagonal = matrix[static_cast<size_t>(row) * dimension +
+                                       row];
+        if (std::isfinite(diagonal)) {
+            minimum_diagonal = std::min(minimum_diagonal, diagonal);
+            maximum_diagonal = std::max(maximum_diagonal, diagonal);
+        }
+        for (uint32_t column = 0; column < dimension; ++column) {
+            const double value =
+                matrix[static_cast<size_t>(row) * dimension + column];
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+                continue;
+            }
+            maximum_absolute = std::max(maximum_absolute, std::fabs(value));
+            if (column < row) {
+                const double transposed =
+                    matrix[static_cast<size_t>(column) * dimension + row];
+                if (std::isfinite(transposed))
+                    maximum_asymmetry = std::max(
+                        maximum_asymmetry, std::fabs(value - transposed));
+            }
+        }
+    }
+
+    double *lower = static_cast<double *>(std::calloc(entries, sizeof(*lower)));
+    uint32_t cpu_minor = 0;
+    double minimum_pivot = std::numeric_limits<double>::infinity();
+    if (lower) {
+        for (uint32_t row = 0; row < dimension && !cpu_minor; ++row) {
+            for (uint32_t column = 0; column <= row; ++column) {
+                double value =
+                    matrix[static_cast<size_t>(row) * dimension + column];
+                for (uint32_t inner = 0; inner < column; ++inner)
+                    value -= lower[static_cast<size_t>(row) * dimension +
+                                   inner] *
+                             lower[static_cast<size_t>(column) * dimension +
+                                   inner];
+                if (row == column) {
+                    minimum_pivot = std::min(minimum_pivot, value);
+                    if (!std::isfinite(value) || value <= 0.0) {
+                        cpu_minor = row + 1;
+                        break;
+                    }
+                    lower[static_cast<size_t>(row) * dimension + column] =
+                        std::sqrt(value);
+                } else {
+                    lower[static_cast<size_t>(row) * dimension + column] =
+                        value /
+                        lower[static_cast<size_t>(column) * dimension +
+                              column];
+                }
+            }
+        }
+        std::free(lower);
+    }
+    std::fprintf(stderr,
+        "VDN Cholesky diagnostic batch=%u nonfinite=%zu diag=[%.9g,%.9g] "
+        "max_abs=%.9g max_asymmetry=%.9g cpu_minor=%u min_pivot=%.9g\n",
+        batch, nonfinite, minimum_diagonal, maximum_diagonal,
+        maximum_absolute, maximum_asymmetry, cpu_minor, minimum_pivot);
+}
+
 extern "C" int h3_gpu_vdn_solve_f32(
                      h3_gpu *gpu, h3_gpu_tensor *transition,
                      h3_gpu_tensor *injection, h3_gpu_tensor *a,
@@ -5065,6 +5202,16 @@ extern "C" int h3_gpu_vdn_solve_f32(
                        head_dim);
     if (!h3_gpu_kernel_enqueued(gpu, "VDN add identity")) return 0;
 
+    const int verify_potrf = !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
+    if (verify_potrf) {
+        if (!h3_gpu_check(gpu, hipMemcpyAsync(
+                transition->data, a->data,
+                static_cast<size_t>(elements_wide) * sizeof(float),
+                hipMemcpyDeviceToDevice, gpu->stream),
+                "preserve VDN Cholesky input")) return 0;
+        gpu->stats.blit_copies++;
+    }
+
     rocblas_int *device_info = nullptr;
     rocblas_int *host_info = static_cast<rocblas_int *>(
         std::calloc(batches, sizeof(*host_info)));
@@ -5076,27 +5223,111 @@ extern "C" int h3_gpu_vdn_solve_f32(
         return 0;
     }
     rocblas_stride stride = static_cast<rocblas_stride>(matrix_elements);
-    int ok = h3_gpu_check_blas(
-        gpu, rocsolver_spotrf_strided_batched(
+    int ok = h3_gpu_check(gpu, hipMemsetAsync(
+            device_info, 0, batches * sizeof(*device_info), gpu->stream),
+            "reset VDN Cholesky info") &&
+        h3_gpu_check_blas(gpu, rocsolver_spotrf_strided_batched(
             gpu->blas, rocblas_fill_lower, static_cast<rocblas_int>(head_dim),
             static_cast<float *>(a->data), static_cast<rocblas_int>(head_dim),
             stride, device_info, static_cast<rocblas_int>(batches)),
-        "VDN batched Cholesky") &&
-        h3_gpu_check(gpu, hipMemcpyAsync(
-            host_info, device_info, batches * sizeof(*host_info),
-            hipMemcpyDeviceToHost, gpu->stream),
-            "read VDN Cholesky info") &&
-        h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
-                     "wait for VDN Cholesky");
-    if (ok) {
-        for (uint32_t index = 0; index < batches; index++)
-            if (host_info[index] != 0) {
-                h3_gpu_set_error(gpu,
-                    "VDN Cholesky batch %u failed at leading minor %d",
-                    index, host_info[index]);
-                ok = 0;
-                break;
+        "VDN batched Cholesky");
+    const char *fault_value =
+        std::getenv("H3_TEST_VDN_CORRUPT_POTRF");
+    if (ok && verify_potrf && fault_value && !std::strcmp(fault_value, "1"))
+        ok = h3_gpu_check(gpu, hipMemsetAsync(
+                a->data, 0, sizeof(float), gpu->stream),
+                "inject VDN Cholesky test fault");
+    uint32_t failed_batch = 0;
+    rocblas_int failed_info = 0;
+    constexpr unsigned max_attempts = 3;
+    unsigned attempts_used = 0;
+    for (unsigned attempt = 0; ok && attempt < max_attempts; ++attempt) {
+        attempts_used = attempt + 1;
+        if (verify_potrf) {
+            hipLaunchKernelGGL(h3_hip_vdn_verify_cholesky_f32_kernel,
+                dim3(batches), dim3(H3_HIP_THREADS),
+                2 * H3_HIP_THREADS * sizeof(float), gpu->stream,
+                static_cast<const float *>(a->data),
+                static_cast<const float *>(transition->data), device_info,
+                batches, head_dim, 1e-4f);
+            ok = h3_gpu_kernel_enqueued(gpu, "verify VDN Cholesky factor");
+        }
+        if (ok)
+            ok = h3_gpu_check(gpu, hipMemcpyAsync(
+                host_info, device_info, batches * sizeof(*host_info),
+                hipMemcpyDeviceToHost, gpu->stream),
+                "read VDN Cholesky info") &&
+                h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
+                             "wait for VDN Cholesky");
+        if (!ok) break;
+
+        uint32_t failures = 0;
+        for (uint32_t index = 0; index < batches; ++index) {
+            if (host_info[index] == 0) continue;
+            if (!failures) {
+                failed_batch = index;
+                failed_info = host_info[index];
             }
+            failures++;
+        }
+        if (!failures) break;
+        if (!verify_potrf || attempt + 1 == max_attempts) {
+            ok = 0;
+            break;
+        }
+
+        gpu->profile_totals.solve_retries += failures;
+        const size_t matrix_bytes =
+            static_cast<size_t>(matrix_elements) * sizeof(float);
+        for (uint32_t index = 0; ok && index < batches; ++index) {
+            if (host_info[index] == 0) continue;
+            size_t offset = static_cast<size_t>(index) * matrix_elements;
+            ok = h3_gpu_check(gpu, hipMemcpyAsync(
+                    static_cast<float *>(a->data) + offset,
+                    static_cast<const float *>(transition->data) + offset,
+                    matrix_bytes, hipMemcpyDeviceToDevice, gpu->stream),
+                    "restore VDN Cholesky retry input") &&
+                h3_gpu_check(gpu, hipMemsetAsync(
+                    device_info + index, 0, sizeof(*device_info), gpu->stream),
+                    "reset VDN Cholesky retry info") &&
+                h3_gpu_check_blas(gpu,
+                    rocsolver_spotrf_strided_batched(
+                        gpu->blas, rocblas_fill_lower,
+                        static_cast<rocblas_int>(head_dim),
+                        static_cast<float *>(a->data) + offset,
+                        static_cast<rocblas_int>(head_dim), stride,
+                        device_info + index, 1),
+                    "retry VDN Cholesky");
+            if (ok) gpu->stats.blit_copies++;
+        }
+    }
+    if (!ok && failed_info != 0) {
+        const char *diagnostic_value =
+            std::getenv("H3_VDN_SOLVE_DIAGNOSTICS");
+        const int diagnostics = diagnostic_value && *diagnostic_value &&
+            std::strcmp(diagnostic_value, "0");
+        if (diagnostics && verify_potrf) {
+            float *host_matrix = static_cast<float *>(std::malloc(
+                static_cast<size_t>(matrix_elements) * sizeof(float)));
+            size_t offset = static_cast<size_t>(failed_batch) *
+                            matrix_elements;
+            if (host_matrix && hipMemcpy(
+                    host_matrix,
+                    static_cast<const float *>(transition->data) + offset,
+                    static_cast<size_t>(matrix_elements) * sizeof(float),
+                    hipMemcpyDeviceToHost) == hipSuccess)
+                h3_hip_report_cholesky_matrix(
+                    host_matrix, head_dim, failed_batch);
+            std::free(host_matrix);
+        }
+        if (failed_info < 0)
+            h3_gpu_set_error(gpu,
+                "VDN Cholesky batch %u failed factor verification after %u attempts",
+                failed_batch, attempts_used);
+        else
+            h3_gpu_set_error(gpu,
+                "VDN Cholesky batch %u failed at leading minor %d after %u attempts",
+                failed_batch, failed_info, attempts_used);
     }
     if (ok) {
         std::memset(host_info, 0, batches * sizeof(*host_info));

@@ -24,6 +24,9 @@ enum {
 
 typedef struct {
     size_t elements;
+    uint32_t audio_start;
+    uint32_t video_start;
+    uint32_t sequence;
     int capture;
     h3_gpu_tensor *snapshots[BLOCKS];
     uint16_t *reference;
@@ -35,6 +38,34 @@ static float bf16_to_f32(uint16_t value) {
     float result;
     memcpy(&result, &bits, sizeof(result));
     return result;
+}
+
+static void print_layer_region_error(unsigned completed, const char *name,
+                                     const uint16_t *reference,
+                                     const uint16_t *candidate,
+                                     size_t begin, size_t end) {
+    float maximum = 0.0f;
+    double squared_error = 0.0, squared_reference = 0.0;
+    double squared_candidate = 0.0, dot_product = 0.0;
+    size_t invalid = 0;
+    for (size_t element = begin; element < end; element++) {
+        float reference_value = bf16_to_f32(reference[element]);
+        float candidate_value = bf16_to_f32(candidate[element]);
+        float difference = candidate_value - reference_value;
+        if (fabsf(difference) > maximum) maximum = fabsf(difference);
+        squared_error += (double)difference * difference;
+        squared_reference += (double)reference_value * reference_value;
+        squared_candidate += (double)candidate_value * candidate_value;
+        dot_product += (double)reference_value * candidate_value;
+        invalid += !isfinite(candidate_value);
+    }
+    double relative_rmse = squared_reference > 0.0 ?
+        sqrt(squared_error / squared_reference) : INFINITY;
+    double cosine = squared_reference > 0.0 && squared_candidate > 0.0 ?
+        dot_product / sqrt(squared_reference * squared_candidate) : 0.0;
+    printf("VDN Sage layer modality[%u][%s]: max_abs=%.9g "
+           "relative_rmse=%.9g cosine=%.12g invalid=%zu\n",
+           completed, name, maximum, relative_rmse, cosine, invalid);
 }
 
 static int observe_layer(h3_gpu *gpu, unsigned completed, unsigned total,
@@ -92,6 +123,15 @@ static int observe_layer(h3_gpu *gpu, unsigned completed, unsigned total,
     printf("VDN Sage layer error[%u]: max_abs=%.9g relative_rmse=%.9g "
            "cosine=%.12g invalid=%zu\n", completed, maximum,
            relative_rmse, cosine, invalid);
+    const size_t audio_begin = (size_t)comparison->audio_start * HIDDEN;
+    const size_t video_begin = (size_t)comparison->video_start * HIDDEN;
+    const size_t sequence_end = (size_t)comparison->sequence * HIDDEN;
+    print_layer_region_error(completed, "text", comparison->reference,
+                             comparison->candidate, 0, audio_begin);
+    print_layer_region_error(completed, "audio", comparison->reference,
+                             comparison->candidate, audio_begin, video_begin);
+    print_layer_region_error(completed, "video", comparison->reference,
+                             comparison->candidate, video_begin, sequence_end);
     if (invalid) {
         snprintf(error, error_size,
                  "Sage hidden layer %u contains non-finite values",
@@ -229,6 +269,9 @@ int main(int argc, char **argv) {
     if (!refined || !h3_vdn_layout_build(
             &prompt, frames, latent_h, latent_w, audio_latents,
             &layout, error, sizeof(error))) goto failed;
+    layers.audio_start = layout.audio_start;
+    layers.video_start = layout.video_start;
+    layers.sequence = layout.sequence;
     size_t video_elements = (size_t)layout.video_rows * VIDEO_PATCH;
     size_t audio_elements = (size_t)layout.audio_rows * AUDIO_WIDTH;
     video_host = malloc(video_elements * sizeof(*video_host));
