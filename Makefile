@@ -264,6 +264,12 @@ h3_vdn_e2e_tests: tests/test_vdn_e2e.o $(LIB_OBJ)
 h3_vdn_int8_gemm_bench: tests/bench_vdn_int8_gemm.o
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_vdn_fp8_gemm_bench: tests/bench_vdn_fp8_gemm.o
+	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
+
+h3_vdn_fp8_tests: tests/test_vdn_fp8.o
+	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
+
 h3_vdn_int8_tests: tests/test_vdn_int8.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
@@ -480,7 +486,8 @@ clean:
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
 		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
-		h3_vdn_int8_gemm_bench h3_vdn_int8_tests \
+		h3_vdn_int8_gemm_bench h3_vdn_fp8_gemm_bench h3_vdn_fp8_tests \
+		h3_vdn_int8_tests \
 		h3_vdn_int8_cache_tests h3_vdn_int8_cache_builder \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \

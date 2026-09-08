@@ -79,9 +79,15 @@ gates: full INT8 activation execution reached a 13.34% 50-layer speedup but
 large video/audio errors; BF16 execution of dequantized weights reduced error
 but reached at most 9.50%, and the only 50-layer quality-passing component
 candidate was just 5.49% faster before VAE and cache verification costs. No
-INT8 cache runtime switch or loader is exposed. The builder is retained only
-to reproduce this result and support future groupwise/FP8 research; BF16
-remains the supported model format.
+INT8 cache runtime switch or loader is exposed. A separate gfx1201 OCP
+E4M3/hipBLASLt probe reached 1.31x--1.98x on the three production GEMM shapes,
+but real effective-weight roundtrips failed the 50-layer gate: all AdaLN/MLP
+weights had 4.80% combined relative RMSE, MLP-only had 4.94%, and AdaLN-only
+had 2.57% plus 10.14% audio error. Its optimistic transfer-plus-GEMM upper
+bound also remains below the 10% production E2E requirement. The reproducible
+benchmarks are retained for future groupwise/block-scaled research; no FP8
+cache or runtime switch is exposed, and BF16 remains the supported model
+format.
 
 ### ROCm compatibility
 
@@ -853,6 +859,19 @@ scripts/profile_vdn_gpu4.sh outputs/int8-cache-build-gpu4 -- \
   models/vdn-minimax-h3/h3-base \
   models/vdn-minimax-h3/stage-dmd-step-250 \
   models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
+
+# Isolated gfx1201 OCP E4M3 capability/performance probes. Only this target
+# adds an explicit hipBLASLt link; the h3 link line and DT_NEEDED stay intact.
+make BACKEND=hip HIP_ARCHS=gfx1201 \
+  h3_vdn_fp8_tests h3_vdn_fp8_gemm_bench
+scripts/profile_vdn_gpu4.sh outputs/fp8-operator-gpu4 -- \
+  ./h3_vdn_fp8_tests
+scripts/profile_vdn_gpu4.sh outputs/fp8-adaln-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 3 96768 2688 10
+scripts/profile_vdn_gpu4.sh outputs/fp8-fc1-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 5338 28672 5376 5
+scripts/profile_vdn_gpu4.sh outputs/fp8-fc2-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 5338 5376 14336 5
 ```
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output

@@ -853,6 +853,76 @@ scripts/profile_vdn_gpu4.sh outputs/int8-cache-build-gpu4 -- \
   models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
 ```
 
+### FP8 model-weight feasibility on gfx1201
+
+The remaining FP8 half of the reduced-precision plan was evaluated separately
+after the INT8 cache decision. ROCm 7.2.3 rocBLAS 5.2 exposes no FP8 datatype,
+but the installed hipBLASLt 1.2.2 and gfx1201 wave32 ISA do support OCP E4M3.
+`h3_vdn_fp8_gemm_bench` therefore adds an explicit hipBLASLt link only to an
+isolated research executable. The main `h3` link line and direct `DT_NEEDED`
+set remain unchanged; this ROCm package's rocBLAS already loads hipBLASLt
+transitively.
+
+The operator oracle uses non-uniform inputs and explicit zero rows; CPU and
+GPU E4M3 bytes, F32 row scales, and final BF16 output all had zero mismatches.
+The benchmark uses the runtime's row-major tensors through an equivalent
+column-major view, quantizes input and weight per output row with E4M3
+`amax/448`, runs FP8xFP8-to-F32, applies both row scales, and converts the
+result to BF16. A 16x16x128 capability check returned 32 algorithms and
+reproduced the analytical and BF16 value exactly. Production-shape results on
+physical GPU 4/BDF `e3:00.0` were:
+
+| Matrix | BF16 rocBLAS | FP8 quant + hipBLASLt + dequant | Speedup |
+|---|---:|---:|---:|
+| AdaLN, `3x2688` by `96768x2688` | 0.867067 ms | 0.437810 ms | 1.980462x |
+| FC1, `5338x5376` by `28672x5376` | 10.321590 ms | 7.833940 ms | 1.317548x |
+| FC2, `5338x14336` by `5376x14336` | 5.557861 ms | 4.232268 ms | 1.313211x |
+
+All four runs, including the capability check, exited zero on gfx1201 and had
+empty concurrency guards. Each result is the median of five crossed groups;
+all raw group times are emitted by the benchmark. The three GEMM deltas total
+only about 0.212 seconds per 50-layer NFE. Even an optimistic additive estimate
+that also halves the historical read and H2D time for the 45.76 GiB/NFE
+AdaLN/MLP payload saves only about 3.3 seconds/NFE, or roughly 7.5% of the
+354.4-second production E2E baseline over eight NFEs. Real overlap and cache
+verification can only reduce that bound, so this format cannot independently
+meet the 10% E2E gate.
+
+Quality was checked against the actual turbo-merged effective weights without
+creating another 23 GiB cache: a temporary loader hook performed the exact
+per-row E4M3 quantize/dequantize operation that such a cache would introduce,
+then ran a same-process wave32 50-layer comparison. These timings include the
+temporary BF16 load/roundtrip and are not used as performance evidence.
+
+| Quantized component | Combined RMSE / cosine | Video RMSE / cosine | Audio RMSE / cosine | Decision |
+|---|---:|---:|---:|---|
+| AdaLN + FC1 + FC2 | 4.79686% / 0.998927651 | 4.51494% / 0.999062897 | 8.10835% / 0.996736490 | reject |
+| FC1 + FC2 only | 4.93898% / 0.998862535 | 4.55417% / 0.999058255 | 9.15756% / 0.995801518 | reject |
+| AdaLN only | 2.57055% / 0.999670840 | 0.833963% / 0.999967403 | 10.1416% / 0.994864878 | reject |
+
+Every output was finite and all natural POTRF retry counts were zero. The full
+and MLP-only candidates clearly exceed the 2.5% combined 50-layer gate;
+AdaLN-only also exceeds it narrowly and has severe modality-specific audio
+error. The hierarchy therefore stopped before eight-NFE and decoded-media
+tests. All temporary loader, environment, GPU API, and forward-test hooks were
+removed after attribution. No FP8 cache v2 was generated, no FP8 runtime mode
+is exposed, and the supported BF16 path is unchanged.
+
+Reproduce the retained performance probe with:
+
+```sh
+make BACKEND=hip HIP_ARCHS=gfx1201 \
+  h3_vdn_fp8_tests h3_vdn_fp8_gemm_bench
+scripts/profile_vdn_gpu4.sh outputs/fp8-operator-gpu4 -- \
+  ./h3_vdn_fp8_tests
+scripts/profile_vdn_gpu4.sh outputs/fp8-adaln-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 3 96768 2688 10
+scripts/profile_vdn_gpu4.sh outputs/fp8-fc1-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 5338 28672 5376 5
+scripts/profile_vdn_gpu4.sh outputs/fp8-fc2-gpu4 -- \
+  ./h3_vdn_fp8_gemm_bench 5338 5376 14336 5
+```
+
 ## Test gates
 
 Build and run the local gates with:
