@@ -732,6 +732,39 @@ Its 68.329-second weight-read total was materially slower than the earlier
 than a replacement crossed performance baseline. It nevertheless remains
 below the 438.16-second phase target.
 
+### P7 REJECT: Sage E27 plus exact text/audio-query prefix
+
+The first post-P6 audio-quality candidate kept the existing E27 Sage result for
+video queries and overwrote `[0, video_start)` with the exact wave32 result on
+every attention call. This made text and audio query outputs bitwise equal to
+wave32 for the current hidden state while preserving E27 output bitwise for the
+video suffix. A GPU operator composition test reported zero prefix and suffix
+mismatches. Two production-shape samples, including quantization and the exact
+prefix recomputation, took 0.084386 and 0.082121 seconds; the stable crossed
+wave32 sample took 0.411999 seconds.
+
+Prompt 2's real 50-layer comparison initially passed the output-level gates:
+wall fell from 35.187573 to 28.542355 seconds, video relative RMSE/cosine were
+0.00617807/0.999980939, and audio relative RMSE/cosine were
+0.0378569/0.999283377. The complete same-process eight-NFE latent gate then
+rejected the candidate:
+
+| Metric | exact wave32 | exact-prefix candidate | Decision |
+|---|---:|---:|---|
+| DiT wall | 280.602851 s | 184.934060 s | -34.09%, performance passes |
+| steady SDPA/NFE | about 20.0 s | about 6.8 s | passes |
+| video relative RMSE / cosine | - | 0.222981% / 0.999997515 | passes |
+| audio relative RMSE / cosine | - | 8.671439% / 0.996251677 | **fails both gates** |
+
+Both outputs were finite, all natural POTRF retry counts were zero, and the
+physical GPU 4 concurrency guard was empty. Exact-prefix improved audio error
+over pure E27's prompt-2 12.108549% relative RMSE, but did not meet the frozen
+5%/0.999 audio limits. The mode, kernel range support, and composition test were
+therefore removed; no dead runtime switch remains, no three-prompt decoded-media
+run was started, and exact BF16 remains the stable default. The next accepted
+research direction is the already-qualified, versioned offline INT8 model-weight
+cache rather than another unversioned runtime format.
+
 ## Test gates
 
 Build and run the local gates with:
