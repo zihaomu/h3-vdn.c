@@ -15,7 +15,7 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Native ROCm execution | HIP kernels plus rocBLAS/rocSOLVER; no CUDA runtime in the VDN inference path |
 | Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
 | VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
-| Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks |
+| Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks; experimental I8-QK/BF16-PV dispatch is supplied by the pinned SageAttention-AMD submodule |
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline; optional bounded resident effective-weight sources for repeated NFE |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | gfx1201 POTRF factors are independently verified and retried around the ROCm 7.2 rocSOLVER defect; 10-run real-weight and 64-run production-batch stresses are exact |
@@ -60,10 +60,17 @@ and falls back to ordinary streaming when admission is unsafe. Unset or `0`
 preserves the default streaming path.
 
 The branch also carries an explicitly experimental native gfx12 Sage-style
-attention path selected with `H3_VDN_SDPA=sage-i8-bf16`. Its current E27
-task-split kernel reached a clean-GPU4 profile total of 14.892 ms and GPU
-median of 15.121 ms. Same-process production 8-NFE DiT runs are roughly
-2.0x faster than wave32, and decoded video quality passes. The completed
+attention path selected with `H3_VDN_SDPA=sage-i8-bf16`. The implementation is
+owned by the Apache-2.0
+[SageAttention-AMD](https://github.com/zihaomu/SageAttention-AMD) submodule,
+fixed at commit `18d949018cec1467ac6d30c12b3494f2f51bb552`; H3 retains only its
+mode policy, tensor/context bridge, exact oracle, and model/media gates. Its E27
+task-split kernel at the pinned revision reached a clean-GPU4 profile total of
+14.665 ms and GPU median of 14.792 ms. The H3 public-dispatch crossed A/B
+measured 14.953/15.217 ms including quantization and bridge overhead while
+reproducing both pre-migration hashes exactly. A production 50-layer run was
+2.109x faster than wave32, and prompt-0 8-NFE DiT was 46.34% faster. The
+completed
 three-prompt staged gate nevertheless passed audio for 0/3 prompts: examples
 0 and 1 failed decoded-audio correlation/RMSE, while example 2 failed the
 audio-latent fast gate. This mode remains research-only; unset/`auto` continues
@@ -185,7 +192,16 @@ error instead of silently using a different encoder.
 
 ### Build, inspect, and generate
 
-Linux selects HIP by default; it can also be requested explicitly:
+Initialize the fixed SageAttention-AMD source before the first HIP build. A
+normal build never downloads dependencies and fails with an actionable message
+if the submodule is absent:
+
+```sh
+git submodule update --init --recursive
+```
+
+For a fresh checkout, `git clone --recurse-submodules` is equivalent. Linux
+selects HIP by default; it can also be requested explicitly:
 
 ```sh
 make BACKEND=hip -j16
@@ -807,6 +823,22 @@ make BACKEND=hip \
   backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
   vdn-metadata-test vdn-reference-test vdn-block-loader-test \
   vdn-prompt-test vdn-input-contract-test vdn-gpu-ops-test
+make BACKEND=hip vdn-sage-test sage-upstream-contract-test \
+  sage-upstream-isa-test
+```
+
+`vdn-sage-test` covers H3's dispatch-mode policy. The upstream targets cover
+SageAttention-AMD registry/tool/CPU contracts and the gfx12 WMMA ISA; GPU
+correctness and benchmarks must be run under the repository's physical-GPU-4
+guard:
+
+```sh
+scripts/profile_vdn_gpu4.sh outputs/sage-upstream-gpu-test-gpu4 -- \
+  make BACKEND=hip HIP_ARCHS=gfx1201 H3_PHYSICAL_GPU=4 \
+  sage-upstream-gpu-test
+scripts/profile_vdn_gpu4.sh outputs/sage-upstream-bench-gpu4 -- \
+  make BACKEND=hip HIP_ARCHS=gfx1201 H3_PHYSICAL_GPU=4 \
+  sage-upstream-bench
 ```
 
 The real-weight tests are intentionally split so loader, refiner, block stack,
@@ -835,6 +867,11 @@ benchmark. Its default arguments model the 512x512/56-frame VDN geometry;
 same-binary comparisons, `H3_VDN_RELOAD_QUERY=1` reloads query values inside
 the key loop and `H3_VDN_SCAN_MASK=1` scans masked rows instead of jumping over
 the two disallowed gaps.
+
+`make BACKEND=hip h3_vdn_sage_sdpa_bench` builds the H3 integration A/B. Both
+arms call the same public H3 SDPA entry; the exact arm requests `wave32` and the
+candidate arm requests `sage-i8-bf16`, including Q/K quantization and bridge
+overhead in the reported time.
 
 The rejected INT8-weight study remains reproducible without affecting normal
 inference. Generation writes about 23 GiB and refuses to overwrite an existing

@@ -1,5 +1,23 @@
 # Third-party notices
 
+## SageAttention-AMD
+
+The optional experimental `H3_VDN_SDPA=sage-i8-bf16` implementation is built
+from the `third_party/sageattention-amd` Git submodule, fixed for this revision
+at commit `18d949018cec1467ac6d30c12b3494f2f51bb552`. SageAttention-AMD is
+licensed under the Apache License, Version 2.0; its license text and detailed
+notices are retained in the submodule as `LICENSE` and
+`THIRD_PARTY_NOTICES.md`.
+
+Its gfx12 WMMA fragment-packing approach was informed by thu-ml/SageAttention
+pull request #368 at commit
+`66f5e64c9e36084c863a4480e570069245e58f90`. Copyright notices include the
+SageAttention team (2024) and Advanced Micro Devices, Inc. (2026). The
+integrated implementation removes Torch/ATen, uses raw HIP pointers with a
+caller-owned stream/workspace, implements H3's interval mask, and uses BF16 PV.
+
+## ccv Metal kernels
+
 The rectangular Morton decoder and the dynamic symmetric int8 quantization /
 Metal 4 TensorOps scheduling design in `h3_shaders.metal` are adapted from
 ccv's Metal FlashAttention `NAMatMulKernel` and `NAInt8MatMulKernel`,

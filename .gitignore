@@ -13,6 +13,7 @@ __pycache__/
 doc/baseline/*.txt
 
 # Compiler and test outputs.
+build/
 *.o
 *.d
 *.air

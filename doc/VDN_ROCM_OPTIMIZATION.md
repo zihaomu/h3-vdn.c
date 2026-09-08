@@ -489,6 +489,12 @@ non-bitwise SageAttention/low-precision research gate instead.
 The native gfx12 design was informed by SageAttention PR #368 fixed at commit
 `66f5e64c9e36084c863a4480e570069245e58f90` (Apache-2.0), without importing its
 PyTorch extension runtime. The implementation remains C/C++17 and HIP-only.
+The maintained implementation now comes from the fixed
+`third_party/sageattention-amd` submodule at
+`18d949018cec1467ac6d30c12b3494f2f51bb552`; H3 owns only the thin dispatch and
+context bridge. Planner, quantization, kernel, ISA and operator contracts must
+be changed and validated in that upstream repository before its gitlink is
+advanced here.
 `H3_VDN_SDPA=sage-i8-bf16` is an explicit experimental mode; `auto` continues
 to select the bitwise-exact wave32 implementation. The incomplete F16 and FP8
 modes fail explicitly instead of silently falling back.
@@ -552,6 +558,35 @@ at layer 22, and ended at 0.00896422 at layer 50; all layers were finite.
 This is a research keep, not a stable default. It must next pass the three-
 prompt video, audio, and complete E2E quality gate. BF16 exact fallback remains
 mandatory regardless of that result.
+
+#### SageAttention-AMD submodule ownership cutover
+
+The 2026-09-08 cutover removed H3's duplicate planner, Q/K quantization,
+rocWMMA experiments, E27 kernel, and low-level test API. The fixed submodule now
+owns those components; `h3_vdn_sage_bridge.cpp` is the only H3-to-upstream
+adapter, while `h3_vdn_sdpa_mode.c` retains H3's dispatch policy. A clean HIP
+build places the three upstream runtime objects directly in `libh3.a`; symbol
+inspection found a single E27 archive member. Missing submodules fail with an
+explicit `git submodule update --init --recursive` instruction and never cause
+a build-time download.
+
+The physical-GPU-4 migration gate produced:
+
+| Gate | Result |
+|---|---|
+| Upstream GPU contract | generic/H3 oracle, targeted interval shapes, guard canaries, determinism and finite checks passed on `gfx1201` |
+| Upstream production operator | 14.665 ms profiled total; 14.792 ms GPU median; Q/K quant 0.474/0.397 ms; hash `d8fccefb0ea98938` |
+| H3 crossed public dispatch | 14.953/15.217 ms Sage including bridge and quant; exact pre-cutover hashes `2a54af9f76d9adbe` / `b9a74fa3e1008c63` |
+| Production 50 layers | wave32 30.447261 s; Sage 14.438533 s; exact wave32 output hashes retained |
+| Prompt-0 8-NFE | wave32 246.579859 s; Sage 132.308016 s; migrated Sage latent hashes exactly matched pre-cutover E27 |
+| Prompt-0/1 full media | migrated MP4 SHA-256 values exactly matched pre-cutover E27: `5a4cc484205211255c2c6b9a1e71e7256e338ebca830f033284507408b4b2f77` and `798f8a8c7f6f437522340205a7157dca58a418d4d8f842b348df9a88bc365bd1` |
+
+This validates the ownership migration, not a quality promotion. Prompt 0 and
+1 retain their decoded-audio failures. Prompt 2 stopped at the staged 8-NFE
+gate with video relative RMSE/cosine `0.00221533361/0.999997546` but audio
+`0.105619612/0.994429938`, outside the frozen 5%/0.999 limits. Therefore
+`sage-i8-bf16` remains explicit and experimental, and `auto` remains exact
+wave32.
 
 ### REJECT: offline default/turbo LoRA premerge
 
@@ -932,15 +967,20 @@ make BACKEND=hip -j16 \
   h3_vdn_gpu_ops_tests h3_vdn_feature_tests \
   h3_vdn_solve_tests h3_vdn_scan_tests h3_vdn_forward_smoke_tests \
   h3_f32_sdpa_bench h3_vdn_video_vae_smoke_tests \
-  h3_vdn_sage_tests h3_vdn_sage_quant_tests h3_vdn_sage_sdpa_bench
+  h3_vdn_sage_tests h3_vdn_sage_sdpa_bench
+make BACKEND=hip HIP_ARCHS=gfx1201 \
+  sage-upstream-contract-test sage-upstream-isa-test
 
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_gpu_ops_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_feature_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_solve_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_scan_tests
 ./h3_vdn_sage_tests
-HIP_VISIBLE_DEVICES=4 ./h3_vdn_sage_quant_tests
 HIP_VISIBLE_DEVICES=4 ./h3_vdn_sage_sdpa_bench
+
+scripts/profile_vdn_gpu4.sh outputs/sage-upstream-gpu-test-gpu4 -- \
+  make BACKEND=hip HIP_ARCHS=gfx1201 H3_PHYSICAL_GPU=4 \
+  sage-upstream-gpu-test
 
 # Generic F32/D64 oracle versus the default exact wave32 specialization.
 HIP_VISIBLE_DEVICES=4 ./h3_f32_sdpa_bench

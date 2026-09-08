@@ -6,6 +6,11 @@ COMMON_WARNINGS := -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
 	-Wno-sign-conversion
 CFLAGS := -std=c11 -O3 -MMD -MP $(COMMON_WARNINGS)
 CXXFLAGS := -std=c++17 -O3 -MMD -MP $(COMMON_WARNINGS)
+SAGEATTENTION_DIR ?= third_party/sageattention-amd
+SAGEATTENTION_BUILD_DIR ?= build/sageattention-amd
+SAGEATTENTION_TEST_BUILD_DIR ?= build/sageattention-amd-upstream
+SAGEATTENTION_CPPFLAGS := -I$(SAGEATTENTION_DIR)/include \
+	-I$(SAGEATTENTION_DIR)/src
 
 LIB_C := h3.c h3_host.c h3_json.c h3_safetensors.c h3_sha256.c h3_vdn.c h3_vdn_pipeline.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
@@ -28,6 +33,11 @@ BACKEND_PROBE_OBJ := h3_metal.o
 else ifeq ($(BACKEND),hip)
 ROCM_PATH ?= /opt/rocm
 HIP_ARCHS ?= gfx1201
+ifneq ($(strip $(MAKECMDGOALS)),clean)
+ifeq ($(wildcard $(SAGEATTENTION_DIR)/include/sage_attention.hpp),)
+$(error SageAttention-AMD submodule is missing; run: git submodule update --init --recursive)
+endif
+endif
 HIP_OFFLOAD_FLAGS := $(addprefix --offload-arch=,$(HIP_ARCHS))
 CC := $(ROCM_PATH)/llvm/bin/clang
 CXX := $(ROCM_PATH)/bin/hipcc
@@ -38,16 +48,19 @@ LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lrocsolver -lrocblas -lamdhip64 -licuuc -licui18n \
 	-lm -lpthread -ldl
 LIB_C += h3_tokenizer_stub.c
-LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c h3_vdn_sage.c
-LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp
-LIB_HIP := h3_vdn_sage_gfx12.hip
-BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sage.o h3_vdn_sage_gfx12.o
+LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c h3_vdn_sdpa_mode.c
+LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp h3_vdn_sage_bridge.cpp
+SAGEATTENTION_OBJ := $(SAGEATTENTION_BUILD_DIR)/sage_attention.o \
+	$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage.o \
+	$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage_gfx12.o
+BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sdpa_mode.o \
+	h3_vdn_sage_bridge.o $(SAGEATTENTION_OBJ)
 else
 $(error unsupported BACKEND=$(BACKEND); use metal or hip)
 endif
 
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o) $(LIB_CPP:.cpp=.o) \
-	$(LIB_HIP:.hip=.o)
+	$(SAGEATTENTION_OBJ)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 VDN_WEIGHT_SUPPORT_OBJ := h3_vdn_weights.o h3_weights.o h3_safetensors.o \
 	h3_sha256.o
@@ -58,6 +71,8 @@ VDN_WEIGHT_SUPPORT_OBJ := h3_vdn_weights.o h3_weights.o h3_safetensors.o \
 	vdn-stack-smoke-test vdn-forward-smoke-test vdn-denoise-smoke-test \
 	vdn-video-vae-smoke-test vdn-audio-vae-smoke-test \
 	vdn-e2e-test vdn-input-contract-test \
+	sageattention-check sage-upstream-contract-test sage-upstream-gpu-test \
+	sage-upstream-isa-test sage-upstream-bench \
 	parity real-parity clean
 
 all: h3 libh3.a
@@ -169,23 +184,49 @@ h3_vdn_sdpa_bench: tests/bench_vdn_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
-h3_vdn_sage_tests: tests/test_vdn_sage.o h3_vdn_sage.o
+h3_vdn_sage_tests: tests/test_vdn_sdpa_mode.o h3_vdn_sdpa_mode.o
 	$(CC) -o $@ $^ -lm
 
 vdn-sage-test: h3_vdn_sage_tests
 	./h3_vdn_sage_tests
 
-h3_vdn_sage_quant_tests: tests/test_vdn_sage_quant.o $(BACKEND_PROBE_OBJ) \
-		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
-	$(LINK) -o $@ $^ $(LDLIBS)
-
-h3_vdn_sage_quant_bench: tests/bench_vdn_sage_quant.o $(BACKEND_PROBE_OBJ) \
-		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
-	$(LINK) -o $@ $^ $(LDLIBS)
-
 h3_vdn_sage_sdpa_bench: tests/bench_vdn_sage_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
+
+sageattention-check:
+	@if [ ! -f "$(SAGEATTENTION_DIR)/include/sage_attention.hpp" ]; then \
+		echo "SageAttention-AMD submodule is missing; run: git submodule update --init --recursive" >&2; \
+		exit 2; \
+	fi
+
+sage-upstream-contract-test: sageattention-check
+	$(MAKE) -C $(SAGEATTENTION_DIR) \
+		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
+		HIP_ARCHS=$(HIP_ARCHS) metadata-check tool-test contract-test
+
+sage-upstream-gpu-test: sageattention-check
+	@if [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
+		echo "sage-upstream-gpu-test requires H3_PHYSICAL_GPU=4" >&2; \
+		exit 2; \
+	fi
+	$(MAKE) -C $(SAGEATTENTION_DIR) \
+		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
+		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=4 gpu-test
+
+sage-upstream-isa-test: sageattention-check
+	$(MAKE) -C $(SAGEATTENTION_DIR) \
+		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
+		HIP_ARCHS=$(HIP_ARCHS) isa
+
+sage-upstream-bench: sageattention-check
+	@if [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
+		echo "sage-upstream-bench requires H3_PHYSICAL_GPU=4" >&2; \
+		exit 2; \
+	fi
+	$(MAKE) -C $(SAGEATTENTION_DIR) \
+		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
+		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=4 bench
 
 h3_f32_sdpa_bench: tests/bench_f32_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
@@ -454,6 +495,33 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
 	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
 
+$(SAGEATTENTION_BUILD_DIR):
+	mkdir -p $@
+
+$(SAGEATTENTION_BUILD_DIR)/sage_attention.o: \
+		$(SAGEATTENTION_DIR)/src/sage_attention.cpp \
+		$(SAGEATTENTION_DIR)/include/sage_attention.hpp \
+		$(SAGEATTENTION_DIR)/src/sage_attention_internal.hpp \
+		| sageattention-check $(SAGEATTENTION_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(SAGEATTENTION_CPPFLAGS) -c $< -o $@
+
+$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage.o: \
+		$(SAGEATTENTION_DIR)/src/h3_vdn_sage.cpp \
+		$(SAGEATTENTION_DIR)/include/h3_vdn_sage.hpp \
+		$(SAGEATTENTION_DIR)/include/sage_attention.hpp \
+		| sageattention-check $(SAGEATTENTION_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(SAGEATTENTION_CPPFLAGS) -c $< -o $@
+
+$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage_gfx12.o: \
+		$(SAGEATTENTION_DIR)/src/h3_vdn_sage_gfx12.hip \
+		$(SAGEATTENTION_DIR)/include/sage_attention.hpp \
+		$(SAGEATTENTION_DIR)/src/sage_attention_internal.hpp \
+		| sageattention-check $(SAGEATTENTION_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(SAGEATTENTION_CPPFLAGS) $(SAGE_AMDGPU_FLAGS) \
+		-x hip -c $< -o $@
+
+h3_vdn_sage_bridge.o: CXXFLAGS += -I$(SAGEATTENTION_DIR)/include
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -473,7 +541,8 @@ tests/%.o: tests/%.c
 # terminal editor for conversion diagnostics unrelated to H3.
 linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 
--include $(wildcard *.d tests/*.d)
+-include $(wildcard *.d tests/*.d $(SAGEATTENTION_BUILD_DIR)/*.d \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/*.d)
 
 clean:
 	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_gpu_ops_tests \
@@ -482,7 +551,7 @@ clean:
 		h3_vdn_reference_tests h3_vdn_block_loader_tests h3_vdn_prompt_tests \
 		h3_vdn_input_contract_tests h3_vdn_gpu_ops_tests \
 		h3_vdn_feature_tests h3_vdn_solve_tests h3_vdn_scan_tests \
-		h3_vdn_sage_tests h3_vdn_sage_quant_tests \
+		h3_vdn_sage_tests \
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
 		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
@@ -497,5 +566,18 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 h3_vdn_sdpa_bench h3_f32_sdpa_bench \
-	h3_vdn_sage_quant_bench h3_vdn_sage_sdpa_bench \
-	libh3.a *.o *.d tests/*.o tests/*.d
+	h3_vdn_sage_sdpa_bench libh3.a *.o *.d tests/*.o tests/*.d \
+	$(SAGEATTENTION_BUILD_DIR)/*.o $(SAGEATTENTION_BUILD_DIR)/*.d \
+	$(SAGEATTENTION_BUILD_DIR)/*.a $(SAGEATTENTION_BUILD_DIR)/*.s \
+	$(SAGEATTENTION_BUILD_DIR)/test_contract \
+	$(SAGEATTENTION_BUILD_DIR)/test_gpu \
+	$(SAGEATTENTION_BUILD_DIR)/bench_h3_vdn \
+	$(SAGEATTENTION_BUILD_DIR)/bench_interval \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/*.o \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/*.d \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/*.a \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/*.s \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/test_contract \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/test_gpu \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/bench_h3_vdn \
+	$(SAGEATTENTION_TEST_BUILD_DIR)/bench_interval

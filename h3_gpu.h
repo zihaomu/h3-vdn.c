@@ -513,42 +513,6 @@ int h3_gpu_vdn_window_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t frames, uint32_t tokens_per_frame,
                             uint32_t radius, uint32_t chunk,
                             int anchor_both, float scale);
-/* SageAttention research primitive: groupwise signed INT8 Q/K quantization.
- * Scales use [heads][ceil(sequence/group_rows)] with 32 Q rows and 64 K rows. */
-int h3_gpu_vdn_sage_quant_qk_bf16(
-                            h3_gpu *gpu, h3_gpu_tensor *query_i8,
-                            h3_gpu_tensor *key_i8,
-                            h3_gpu_tensor *query_scales,
-                            h3_gpu_tensor *key_scales,
-                            const h3_gpu_tensor *query_bf16,
-                            const h3_gpu_tensor *key_bf16,
-                            uint32_t sequence, uint32_t heads,
-                            uint32_t head_dim);
-/* Research-only gfx12 I8 WMMA QK tile. Computes one 16x16 score tile after
- * applying group scales and the caller's attention scale. */
-int h3_gpu_vdn_sage_wmma_qk_tile_i8(
-                            h3_gpu *gpu, h3_gpu_tensor *scores_f32,
-                            const h3_gpu_tensor *query_i8,
-                            const h3_gpu_tensor *key_i8,
-                            const h3_gpu_tensor *query_scales,
-                            const h3_gpu_tensor *key_scales,
-                            uint32_t sequence, uint32_t heads,
-                            uint32_t head_dim, uint32_t query_start,
-                            uint32_t key_start, uint32_t head, float scale);
-/* Research-only gfx12 fused attention over prequantized I8 Q/K and BF16 V.
- * Scores are never materialized outside the kernel. */
-int h3_gpu_vdn_sage_attention_i8_bf16(
-                            h3_gpu *gpu, h3_gpu_tensor *output_bf16,
-                            const h3_gpu_tensor *query_i8,
-                            const h3_gpu_tensor *key_i8,
-                            const h3_gpu_tensor *query_scales,
-                            const h3_gpu_tensor *key_scales,
-                            const h3_gpu_tensor *value_bf16,
-                            uint32_t sequence, uint32_t heads,
-                            uint32_t head_dim, uint32_t video_start,
-                            uint32_t frames, uint32_t tokens_per_frame,
-                            uint32_t radius, uint32_t chunk,
-                            int anchor_both, float scale);
 int h3_gpu_vdn_softmax_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *attended,
                             const h3_gpu_tensor *gate_logits,

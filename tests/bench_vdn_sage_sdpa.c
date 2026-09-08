@@ -57,10 +57,6 @@ typedef struct {
     h3_gpu_tensor *query;
     h3_gpu_tensor *key;
     h3_gpu_tensor *value;
-    h3_gpu_tensor *query_i8;
-    h3_gpu_tensor *key_i8;
-    h3_gpu_tensor *query_scales;
-    h3_gpu_tensor *key_scales;
     uint32_t sequence;
     uint32_t heads;
     uint32_t video_start;
@@ -70,27 +66,19 @@ typedef struct {
 
 static int enqueue(benchmark *bench, int sage) {
     if (!h3_gpu_begin(bench->gpu)) return 0;
-    if (sage) {
-        if (!h3_gpu_vdn_sage_quant_qk_bf16(
-                bench->gpu, bench->query_i8, bench->key_i8,
-                bench->query_scales, bench->key_scales, bench->query,
-                bench->key, bench->sequence, bench->heads, HEAD_DIM) ||
-            !h3_gpu_vdn_sage_attention_i8_bf16(
-                bench->gpu, bench->output, bench->query_i8, bench->key_i8,
-                bench->query_scales, bench->key_scales, bench->value,
-                bench->sequence, bench->heads, HEAD_DIM, bench->video_start,
-                FRAMES, bench->tokens_per_frame, 1, 5, 1, bench->scale))
-            return 0;
-    } else if (!h3_gpu_vdn_window_sdpa_bf16(
-                   bench->gpu, bench->output, bench->query, bench->key,
-                   bench->value, bench->sequence, bench->heads, HEAD_DIM,
-                   bench->video_start, FRAMES, bench->tokens_per_frame,
-                   1, 5, 1, bench->scale)) return 0;
+    (void)sage;
+    if (!h3_gpu_vdn_window_sdpa_bf16(
+            bench->gpu, bench->output, bench->query, bench->key,
+            bench->value, bench->sequence, bench->heads, HEAD_DIM,
+            bench->video_start, FRAMES, bench->tokens_per_frame,
+            1, 5, 1, bench->scale)) return 0;
     return h3_gpu_submit(bench->gpu);
 }
 
 static int run_path(benchmark *bench, int sage, uint32_t iterations,
                     double *seconds, uint16_t *result, size_t elements) {
+    if (setenv("H3_VDN_SDPA", sage ? "sage-i8-bf16" : "wave32", 1) != 0)
+        return 0;
     if (!enqueue(bench, sage)) return 0;
     double start = monotonic_seconds();
     for (uint32_t iteration = 0; iteration < iterations; iteration++)
@@ -144,23 +132,29 @@ int main(int argc, char **argv) {
     bench.video_start = video_start;
     bench.tokens_per_frame = tokens_per_frame;
     bench.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    uint32_t q_groups = (sequence + 31) / 32;
-    uint32_t k_groups = (sequence + 63) / 64;
     int ok = bench.gpu != NULL;
     if (ok) {
         bench.query = h3_gpu_tensor_from_bf16(bench.gpu, input, elements);
         bench.key = h3_gpu_tensor_from_bf16(bench.gpu, input, elements);
         bench.value = h3_gpu_tensor_from_bf16(bench.gpu, input, elements);
         bench.output = h3_gpu_tensor_new_bf16(bench.gpu, elements);
-        bench.query_i8 = h3_gpu_tensor_new_i8(bench.gpu, elements);
-        bench.key_i8 = h3_gpu_tensor_new_i8(bench.gpu, elements);
-        bench.query_scales = h3_gpu_tensor_new_f32(
-            bench.gpu, (size_t)heads * q_groups);
-        bench.key_scales = h3_gpu_tensor_new_f32(
-            bench.gpu, (size_t)heads * k_groups);
-        ok = bench.query && bench.key && bench.value && bench.output &&
-             bench.query_i8 && bench.key_i8 && bench.query_scales &&
-             bench.key_scales;
+        ok = bench.query && bench.key && bench.value && bench.output;
+    }
+    /* Exercise the H3-owned workspace growth and prepared-geometry
+     * invalidation before the production-shape comparison. The later Sage
+     * hash comparison detects stale metadata as well as launch errors. */
+    if (ok) {
+        const uint32_t saved_sequence = bench.sequence;
+        const uint32_t saved_video_start = bench.video_start;
+        const uint32_t saved_tokens_per_frame = bench.tokens_per_frame;
+        bench.sequence = 64;
+        bench.video_start = 1;
+        bench.tokens_per_frame = 1;
+        ok = setenv("H3_VDN_SDPA", "sage-i8-bf16", 1) == 0 &&
+             enqueue(&bench, 1);
+        bench.sequence = saved_sequence;
+        bench.video_start = saved_video_start;
+        bench.tokens_per_frame = saved_tokens_per_frame;
     }
     double baseline_seconds = 0.0, candidate_seconds = 0.0;
     const char *sage_first_value = getenv("H3_SAGE_BENCH_SAGE_FIRST");
@@ -218,10 +212,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Sage attention benchmark failed: %s\n",
                 error[0] ? error : h3_gpu_error(bench.gpu));
     }
-    h3_gpu_tensor_free(bench.key_scales);
-    h3_gpu_tensor_free(bench.query_scales);
-    h3_gpu_tensor_free(bench.key_i8);
-    h3_gpu_tensor_free(bench.query_i8);
     h3_gpu_tensor_free(bench.output);
     h3_gpu_tensor_free(bench.value);
     h3_gpu_tensor_free(bench.key);
