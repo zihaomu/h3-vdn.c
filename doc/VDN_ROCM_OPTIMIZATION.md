@@ -765,6 +765,94 @@ run was started, and exact BF16 remains the stable default. The next accepted
 research direction is the already-qualified, versioned offline INT8 model-weight
 cache rather than another unversioned runtime format.
 
+### P7 RESEARCH KEEP / RUNTIME REJECT: versioned INT8 weight cache
+
+The follow-up investigated the largest remaining streaming target without
+changing the supported checkpoint. A research-only builder now merges the
+turbo LoRA into each block's AdaLN, FC1, and FC2 matrices, applies symmetric
+per-output INT8 quantization (`amax/127`, RNE, `[-127,127]`, zero scale 1), and
+writes a separate cache. It does not overwrite the source model or expose an
+inference switch.
+
+Cache v1 has a strict, fixed layout:
+
+- `manifest.json` plus `block-00.safetensors` through
+  `block-49.safetensors`;
+- six tensors per block: I8 weight and F32 output-row scale for
+  `96768x2688` AdaLN, `28672x5376` FC1, and `5376x14336` FC2;
+- a canonical source digest over the names, dtypes, shapes, and payloads of
+  every participating base and turbo-LoRA tensor;
+- exact file sizes and SHA-256 digests for all 50 payload files;
+- schema verification for all 300 tensors and non-overwriting, atomic
+  directory publication only after full validation.
+
+The physical-GPU-4 build produced 491,847,424 bytes per block, about 23 GiB in
+total. Its source digest was
+`2c3da2ccd63ef7cc27493c8ee8d2800a0f28c0570f22fa0965b9eb4172439060`.
+All files and tensors passed the post-build verifier, and the complete build
+took 401.713 seconds. The first portable SHA implementation spent 184.322
+seconds hashing source tensors and 90.267 seconds rechecking cache files. The
+final implementation optionally resolves libcrypto EVP at runtime, uses the
+host's SHA-NI path when available, and retains the self-contained C fallback.
+The final read-only verification took 30.695 seconds for the source, 14.324
+seconds for the cache, and 45.06 seconds wall in total. Both accelerated and
+forced-portable known-vector/range tests pass.
+
+The HIP operator foundation remains useful research infrastructure:
+per-row BF16-to-I8 quantization, rocBLAS I8xI8-to-I32 GEMM, BF16 dequantization,
+and a bounded reusable I32 workspace. Its CPU oracle is bitwise for input and
+weight I8 values, F32 scales, and final BF16 output on GPU 4. It remains
+unreachable from the normal VDN and generic H3 runtime paths.
+
+Four same-process production-shape 50-layer comparisons determined the runtime
+decision. Percentages below are relative RMSE; the frozen combined 50-layer
+gate is at most 2.5% with cosine at least 0.9995, and final production E2E must
+be at least 10% faster.
+
+| Candidate | BF16 -> candidate wall | Combined RMSE / cosine | Video RMSE / cosine | Audio RMSE / cosine | Decision |
+|---|---:|---:|---:|---:|---|
+| INT8 weights + dynamic INT8 activations | 33.073876 -> 28.660565 s (-13.34%) | 16.4616% / 0.988139 | 12.4701% / 0.993238 | 46.3774% / 0.922521 | reject quality |
+| all cached weights dequantized to BF16 | 31.373132 -> 28.391895 s (-9.50%) | 3.20946% / 0.999512 | 2.58371% / 0.999699 | 8.32546% / 0.996534 | reject RMSE/performance |
+| MLP-only I8-to-BF16 | 29.767053 -> 29.120509 s (-2.17%) | 3.04473% / 0.999562 | 2.55066% / 0.999705 | 7.36706% / 0.997294 | reject RMSE/performance |
+| AdaLN-only I8-to-BF16 | 30.514340 -> 28.838376 s (-5.49%) | 1.68684% / 0.999858 | 0.611624% / 0.999982 | 6.56324% / 0.997846 | early quality pass, reject E2E potential |
+
+The full-INT8 and MLP candidates failed the 50-layer gate, so the hierarchy
+stopped before eight-NFE and decoded-media runs. AdaLN-only passed the combined
+early quality threshold, but its 5.49% forward gain cannot produce a 10%
+production E2E gain once the roughly 110-second video VAE and 45-second strict
+cache/source verification are included. Running another roughly nine-minute
+latent A/B could not change that performance conclusion, so it was also
+stopped at the prescribed gate.
+
+All temporary runtime cache parsing, component selection, block fields,
+AdaLN/MLP branches, and comparison hooks were removed. The cache implementation
+is linked only by its builder and tests, not by `h3`. A clean-build default
+production forward subsequently took 30.664280 seconds and reproduced the
+frozen video/audio hashes `b3d3500676d3fb12` and `5fbd7afb3d78a277`, with zero
+natural POTRF retries. The GPU was physical card 4/BDF `e3:00.0`, and the
+concurrency guard was empty.
+
+Reproduce the retained research artifacts with:
+
+```sh
+make BACKEND=hip HIP_ARCHS=gfx1201 \
+  h3_vdn_int8_tests h3_vdn_int8_cache_tests h3_vdn_int8_cache_builder
+
+scripts/profile_vdn_gpu4.sh outputs/int8-operator-gpu4 -- \
+  ./h3_vdn_int8_tests
+
+scripts/profile_vdn_gpu4.sh outputs/int8-cache-build-gpu4 -- \
+  ./h3_vdn_int8_cache_builder \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
+
+./h3_vdn_int8_cache_builder --verify \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
+```
+
 ## Test gates
 
 Build and run the local gates with:
@@ -847,13 +935,22 @@ returned status 0 on physical GPU 4 with empty concurrency guards. The final
 small E2E retained the five frozen hashes and the same 73,528-byte MP4 SHA-256;
 the 50-layer run reported zero natural POTRF retries.
 
+The subsequent P7 INT8-cache study also ended with the runtime candidate fully
+removed. Its final clean build passed the 1,774 host checks, JSON, accelerated
+and forced-portable SHA-256, VDN metadata/reference/prompt/cache contracts, the
+GPU-4 INT8 CPU oracle, and default real block loading. The restored production
+BF16 forward took 30.664280 seconds, reproduced hashes
+`b3d3500676d3fb12`/`5fbd7afb3d78a277`, and reported zero natural retries on
+BDF `e3:00.0` with an empty guard.
+
 ## Next priorities
 
 1. Keep exact BF16 as the stable default; any new Sage candidate must first
    reduce 8-NFE audio latent RMSE below 5% before decoded-media work resumes.
-2. If model-weight quantization continues, define a versioned offline cache and
-   measure real loader/H2D savings plus full quality gates; the microbenchmark
-   alone is not runtime support.
+2. Do not expose the v1 per-output INT8 weight cache at runtime. Any future
+   groupwise INT8 or FP8 design must define a new version, pass the 50-layer
+   audio-sensitive gate first, and retain credible 10% production-E2E potential
+   after verification and VAE costs.
 3. Do not revisit scan fusion without a new profile showing a materially larger
    hotspot than the current roughly 0.1 seconds/NFE.
 4. Keep all formal acceptance on physical GPU 4. Multi-GPU sharding remains

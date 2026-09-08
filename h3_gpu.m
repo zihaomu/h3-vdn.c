@@ -719,6 +719,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                    sizeof(float), H3_GPU_F32, "F32");
 }
 
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   sizeof(int8_t), H3_GPU_I8, "I8");
+}
+
 static int h3_gpu_tensor_read_file_bf16_mode(
                                  h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,

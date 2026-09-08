@@ -93,6 +93,9 @@ h3_vdn_weight_store *h3_vdn_weight_store_open(
 void h3_vdn_weight_store_free(h3_vdn_weight_store *store);
 int h3_vdn_weight_store_cache_stats(
     const h3_vdn_weight_store *store, h3_vdn_weight_cache_stats *stats);
+int h3_vdn_weight_store_int8_source_sha256(
+    const h3_vdn_weight_store *store, uint8_t digest[32],
+    char *error, size_t error_size);
 
 int h3_vdn_block_weights_load(h3_vdn_weight_store *store, h3_gpu *gpu,
                               unsigned block, h3_vdn_block_weights *weights,

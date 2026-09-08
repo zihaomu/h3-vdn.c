@@ -1,5 +1,6 @@
 #include "h3_vdn_weights.h"
 
+#include "h3_sha256.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -159,6 +160,109 @@ int h3_vdn_weight_store_cache_stats(
     stats->misses = store->resident_misses;
     stats->resident_blocks = store->resident_blocks;
     stats->admission_limited = store->resident_admission_limited;
+    return 1;
+}
+
+static void digest_u32(h3_sha256 *digest, uint32_t value) {
+    uint8_t bytes[4];
+    for (unsigned index = 0; index < 4; index++)
+        bytes[index] = (uint8_t)(value >> (index * 8));
+    h3_sha256_update(digest, bytes, sizeof(bytes));
+}
+
+static void digest_u64(h3_sha256 *digest, uint64_t value) {
+    uint8_t bytes[8];
+    for (unsigned index = 0; index < 8; index++)
+        bytes[index] = (uint8_t)(value >> (index * 8));
+    h3_sha256_update(digest, bytes, sizeof(bytes));
+}
+
+static int digest_tensor(h3_sha256 *digest, const h3_weight_store *store,
+                         const char *name, int ndim, const uint64_t *shape,
+                         char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header || tensor->dtype != H3_DTYPE_BF16 ||
+        tensor->ndim != ndim)
+        return vdn_fail(error, error_size,
+                        "INT8 source tensor is absent or incompatible: %s",
+                        name);
+    for (int dimension = 0; dimension < ndim; dimension++)
+        if (tensor->shape[dimension] != shape[dimension])
+            return vdn_fail(error, error_size,
+                            "INT8 source tensor shape mismatch: %s", name);
+    size_t name_length = strlen(name);
+    if (name_length > UINT32_MAX)
+        return vdn_fail(error, error_size,
+                        "INT8 source tensor name is too long");
+    digest_u32(digest, (uint32_t)name_length);
+    h3_sha256_update(digest, name, name_length);
+    digest_u32(digest, (uint32_t)H3_DTYPE_BF16);
+    digest_u32(digest, (uint32_t)ndim);
+    for (int dimension = 0; dimension < ndim; dimension++)
+        digest_u64(digest, shape[dimension]);
+    uint64_t bytes = tensor->data_end - tensor->data_begin;
+    digest_u64(digest, bytes);
+    return h3_sha256_update_file_range(
+        digest, header->path, tensor->file_offset, bytes, error, error_size);
+}
+
+static int digest_matrix(h3_sha256 *digest, const h3_weight_store *store,
+                         const char *name, uint64_t rows, uint64_t columns,
+                         char *error, size_t error_size) {
+    uint64_t shape[2] = {rows, columns};
+    return digest_tensor(digest, store, name, 2, shape, error, error_size);
+}
+
+int h3_vdn_weight_store_int8_source_sha256(
+        const h3_vdn_weight_store *store, uint8_t output[32],
+        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!store || !store->base || !output ||
+        (store->use_turbo && !store->turbo_adapter))
+        return vdn_fail(error, error_size,
+                        "invalid VDN INT8 source digest arguments");
+    h3_sha256 digest;
+    h3_sha256_init(&digest);
+    static const char domain[] = "h3-vdn-int8-effective-source-v1";
+    h3_sha256_update(&digest, domain, sizeof(domain));
+    digest_u32(&digest, (uint32_t)store->use_turbo);
+    for (unsigned block = 0; block < VDN_BLOCKS; block++) {
+        char name[288];
+#define DIGEST_BASE(suffix, rows, columns) do {                               \
+    int length = snprintf(name, sizeof(name),                                 \
+        "transformer_blocks.%u.%s", block, suffix);                          \
+    if (length < 0 || (size_t)length >= sizeof(name) ||                       \
+        !digest_matrix(&digest, store->base, name, rows, columns,             \
+                       error, error_size)) return 0;                           \
+} while (0)
+        DIGEST_BASE("adaln_proj.linear.weight", VDN_ADALN_WIDTH,
+                    VDN_TIME_WIDTH);
+        DIGEST_BASE("ff.net.0.proj.weight", VDN_FFN * 2, VDN_HIDDEN);
+        DIGEST_BASE("ff.net.2.weight", VDN_HIDDEN, VDN_FFN);
+#undef DIGEST_BASE
+        if (!store->use_turbo) continue;
+#define DIGEST_LORA(target, rank, rows, columns) do {                         \
+    int length = snprintf(name, sizeof(name),                                 \
+        "transformer_blocks.%u.%s.lora_A.turbo.weight", block, target);      \
+    if (length < 0 || (size_t)length >= sizeof(name) ||                       \
+        !digest_matrix(&digest, store->turbo_adapter, name, rank, columns,    \
+                       error, error_size)) return 0;                           \
+    length = snprintf(name, sizeof(name),                                     \
+        "transformer_blocks.%u.%s.lora_B.turbo.weight", block, target);      \
+    if (length < 0 || (size_t)length >= sizeof(name) ||                       \
+        !digest_matrix(&digest, store->turbo_adapter, name, rows, rank,       \
+                       error, error_size)) return 0;                           \
+} while (0)
+        DIGEST_LORA("adaln_proj.linear", 16, VDN_ADALN_WIDTH,
+                    VDN_TIME_WIDTH);
+        DIGEST_LORA("ff.net.0.proj", 64, VDN_FFN * 2, VDN_HIDDEN);
+        DIGEST_LORA("ff.net.2", 64, VDN_HIDDEN, VDN_FFN);
+#undef DIGEST_LORA
+    }
+    if (!h3_sha256_final(&digest, output))
+        return vdn_fail(error, error_size,
+                        "cannot finalize VDN INT8 source SHA-256");
     return 1;
 }
 

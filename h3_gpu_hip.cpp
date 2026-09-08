@@ -73,6 +73,8 @@ struct h3_gpu {
     size_t sage_tasks_offset;
     uint32_t sage_task_count;
     int sage_tasks_valid;
+    void *int8_accumulator_workspace;
+    size_t int8_accumulator_workspace_bytes;
 };
 
 struct h3_gpu_tensor {
@@ -492,6 +494,34 @@ static int h3_gpu_ensure_sage_workspace(h3_gpu *gpu, size_t bytes) {
     gpu->sage_workspace = replacement;
     gpu->sage_workspace_bytes = bytes;
     gpu->sage_tasks_valid = 0;
+    gpu->stats.allocated_bytes += bytes;
+    gpu->stats.live_bytes += bytes;
+    if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+        gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
+}
+
+static int h3_gpu_ensure_int8_accumulator_workspace(h3_gpu *gpu,
+                                                     size_t elements) {
+    if (elements > SIZE_MAX / sizeof(int32_t)) {
+        h3_gpu_set_error(gpu, "INT8 accumulator workspace size overflow");
+        return 0;
+    }
+    const size_t bytes = elements * sizeof(int32_t);
+    if (gpu->int8_accumulator_workspace_bytes >= bytes) return 1;
+    void *replacement = nullptr;
+    if (!h3_gpu_check(gpu, hipMalloc(&replacement, bytes ? bytes : 1),
+                      "hipMalloc INT8 accumulator workspace")) return 0;
+    if (gpu->int8_accumulator_workspace) {
+        if (!h3_gpu_check(gpu, hipFree(gpu->int8_accumulator_workspace),
+                          "hipFree old INT8 accumulator workspace")) {
+            (void)hipFree(replacement);
+            return 0;
+        }
+        gpu->stats.live_bytes -= gpu->int8_accumulator_workspace_bytes;
+    }
+    gpu->int8_accumulator_workspace = replacement;
+    gpu->int8_accumulator_workspace_bytes = bytes;
     gpu->stats.allocated_bytes += bytes;
     gpu->stats.live_bytes += bytes;
     if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
@@ -1665,6 +1695,52 @@ __global__ static void h3_hip_vdn_sage_quant_bf16_i8_kernel(
             output[index] = static_cast<int8_t>(rounded);
         }
     }
+}
+
+__global__ static void h3_hip_quantize_bf16_i8_rows_kernel(
+        const hip_bfloat16 *input, int8_t *output, float *scales,
+        uint32_t rows, uint32_t columns) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (row >= rows) return;
+    const size_t offset = static_cast<size_t>(row) * columns;
+    float local_amax = 0.0f;
+    for (uint32_t column = lane; column < columns; column += blockDim.x)
+        local_amax = fmaxf(
+            local_amax, fabsf(static_cast<float>(input[offset + column])));
+    extern __shared__ float reduction[];
+    reduction[lane] = local_amax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride)
+            reduction[lane] = fmaxf(reduction[lane],
+                                    reduction[lane + stride]);
+        __syncthreads();
+    }
+    const float amax = reduction[0];
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (lane == 0) scales[row] = scale;
+    for (uint32_t column = lane; column < columns; column += blockDim.x) {
+        int32_t quantized = __float2int_rn(
+            static_cast<float>(input[offset + column]) * inverse);
+        if (quantized > 127) quantized = 127;
+        if (quantized < -127) quantized = -127;
+        output[offset + column] = static_cast<int8_t>(quantized);
+    }
+}
+
+__global__ static void h3_hip_dequantize_i32_bf16_kernel(
+        const int32_t *input, hip_bfloat16 *output,
+        const float *input_scales, const float *weight_scales,
+        uint32_t elements, uint32_t output_dim) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    const uint32_t row = index / output_dim;
+    const uint32_t column = index % output_dim;
+    output[index] = hip_bfloat16(
+        static_cast<float>(input[index]) * input_scales[row] *
+        weight_scales[column]);
 }
 
 __global__ static void h3_hip_vdn_sage_wmma_qk_tile_i8_kernel(
@@ -3111,6 +3187,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_destroy_events(gpu);
     h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
+    (void)hipFree(gpu->int8_accumulator_workspace);
     (void)hipFree(gpu->sage_workspace);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);
@@ -3179,6 +3256,13 @@ extern "C" h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu,
                                                   uint64_t file_offset,
                                                   size_t elements) {
     return h3_gpu_tensor_load(gpu, path, file_offset, elements, H3_GPU_F32);
+}
+
+extern "C" h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu,
+                                                  const char *path,
+                                                  uint64_t file_offset,
+                                                  size_t elements) {
+    return h3_gpu_tensor_load(gpu, path, file_offset, elements, H3_GPU_I8);
 }
 
 extern "C" int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor,
@@ -4073,7 +4157,26 @@ extern "C" int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || !rows || !columns ||
+        !h3_gpu_count_2d(gpu, rows, columns, &elements,
+                         "INT8 weight elements") ||
+        !h3_gpu_require_tensor(gpu, input, elements, H3_GPU_BF16,
+                               "INT8 weight source") ||
+        !h3_gpu_require_tensor(gpu, output, elements, H3_GPU_I8,
+                               "INT8 weight destination") ||
+        !h3_gpu_require_tensor(gpu, scales, rows, H3_GPU_F32,
+                               "INT8 weight scales"))
+        return 0;
+    hipLaunchKernelGGL(
+        h3_hip_quantize_bf16_i8_rows_kernel, dim3(rows),
+        dim3(H3_HIP_THREADS), H3_HIP_THREADS * sizeof(float), gpu->stream,
+        static_cast<const hip_bfloat16 *>(input->data),
+        static_cast<int8_t *>(output->data),
+        static_cast<float *>(scales->data), rows, columns);
+    if (!h3_gpu_kernel_enqueued(gpu, __func__)) return 0;
+    gpu->stats.direct_dispatches++;
+    return 1;
 }
 
 extern "C" int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -4085,7 +4188,78 @@ extern "C" int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales) {
-    return h3_gpu_unsupported(gpu, __func__);
+    (void)use_slower_uncached_int8_scales;
+    size_t input_elements, weight_elements, output_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || !rows || !input_dim ||
+        !output_dim ||
+        rows > static_cast<uint32_t>(std::numeric_limits<rocblas_int>::max()) ||
+        input_dim >
+            static_cast<uint32_t>(std::numeric_limits<rocblas_int>::max()) ||
+        output_dim >
+            static_cast<uint32_t>(std::numeric_limits<rocblas_int>::max()) ||
+        !h3_gpu_count_2d(gpu, rows, input_dim, &input_elements,
+                         "INT8 linear input") ||
+        !h3_gpu_count_2d(gpu, output_dim, input_dim, &weight_elements,
+                         "INT8 linear weight") ||
+        !h3_gpu_count_2d(gpu, rows, output_dim, &output_elements,
+                         "INT8 linear output") ||
+        output_elements > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, input, input_elements, H3_GPU_BF16,
+                               "INT8 linear input") ||
+        !h3_gpu_require_tensor(gpu, quantized_input, input_elements,
+                               H3_GPU_I8, "INT8 linear quantized input") ||
+        !h3_gpu_require_tensor(gpu, input_scales, rows, H3_GPU_F32,
+                               "INT8 linear input scales") ||
+        !h3_gpu_require_tensor(gpu, weight, weight_elements, H3_GPU_I8,
+                               "INT8 linear weight") ||
+        !h3_gpu_require_tensor(gpu, weight_scales, output_dim, H3_GPU_F32,
+                               "INT8 linear weight scales") ||
+        !h3_gpu_require_tensor(gpu, output, output_elements, H3_GPU_BF16,
+                               "INT8 linear output") ||
+        !h3_gpu_ensure_int8_accumulator_workspace(gpu, output_elements))
+        return 0;
+
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_LINEAR);
+    hipLaunchKernelGGL(
+        h3_hip_quantize_bf16_i8_rows_kernel, dim3(rows),
+        dim3(H3_HIP_THREADS), H3_HIP_THREADS * sizeof(float), gpu->stream,
+        static_cast<const hip_bfloat16 *>(input->data),
+        static_cast<int8_t *>(quantized_input->data),
+        static_cast<float *>(input_scales->data), rows, input_dim);
+    if (!h3_gpu_kernel_enqueued(gpu, "INT8 activation quantization"))
+        return 0;
+
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    rocblas_status status = rocblas_gemm_ex(
+        gpu->blas, rocblas_operation_transpose, rocblas_operation_none,
+        static_cast<rocblas_int>(output_dim),
+        static_cast<rocblas_int>(rows),
+        static_cast<rocblas_int>(input_dim), &alpha,
+        weight->data, rocblas_datatype_i8_r,
+        static_cast<rocblas_int>(input_dim),
+        quantized_input->data, rocblas_datatype_i8_r,
+        static_cast<rocblas_int>(input_dim), &beta,
+        gpu->int8_accumulator_workspace, rocblas_datatype_i32_r,
+        static_cast<rocblas_int>(output_dim),
+        gpu->int8_accumulator_workspace, rocblas_datatype_i32_r,
+        static_cast<rocblas_int>(output_dim), rocblas_datatype_i32_r,
+        rocblas_gemm_algo_standard, 0, 0);
+    if (!h3_gpu_check_blas(gpu, status, "rocblas_gemm_ex INT8 linear"))
+        return 0;
+    hipLaunchKernelGGL(
+        h3_hip_dequantize_i32_bf16_kernel,
+        h3_gpu_grid_1d(static_cast<uint32_t>(output_elements)),
+        dim3(H3_HIP_THREADS), 0, gpu->stream,
+        static_cast<const int32_t *>(gpu->int8_accumulator_workspace),
+        static_cast<hip_bfloat16 *>(output->data),
+        static_cast<const float *>(input_scales->data),
+        static_cast<const float *>(weight_scales->data),
+        static_cast<uint32_t>(output_elements), output_dim);
+    if (!h3_gpu_kernel_enqueued(gpu, "INT8 linear dequantization")) return 0;
+    gpu->stats.direct_dispatches += 2;
+    gpu->stats.mps_linear_dispatches++;
+    return 1;
 }
 
 extern "C" int h3_gpu_linear_int8_head_major_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

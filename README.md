@@ -20,7 +20,7 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | gfx1201 POTRF factors are independently verified and retried around the ROCm 7.2 rocSOLVER defect; 10-run real-weight and 64-run production-batch stresses are exact |
 | Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache/POTRF-retry counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
-| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention is explicit opt-in; E27 is much faster but passed none of the three prompt audio gates and is not part of the stable/default path |
+| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention and a versioned 23 GiB AdaLN/MLP INT8 cache were measured; both failed frozen quality/performance gates and neither is part of the stable/default path |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
 The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
@@ -69,11 +69,19 @@ three-prompt staged gate nevertheless passed audio for 0/3 prompts: examples
 audio-latent fast gate. This mode remains research-only; unset/`auto` continues
 to use the bitwise-exact BF16 wave32 path.
 
-An isolated ROCm model-weight probe also found 1.29x--1.77x all-in INT8 GEMM
-speedups for production AdalN/MLP shapes while approximately halving their
-weight bytes. No INT8 checkpoint format or loader is exposed yet: this is only
-evidence for a future versioned offline-cache experiment, and BF16 remains the
-supported model format.
+The branch also contains reproducible tooling for the completed INT8
+model-weight investigation. It can build and strictly verify a versioned
+approximately 23 GiB cache containing turbo-merged AdaLN/FC1/FC2 weights, with
+canonical source-content and per-file SHA-256 identities. The native ROCm
+operator oracle is bitwise against its CPU reference, and production GEMM
+probes were 1.29x--1.77x faster. Runtime candidates did not pass the frozen
+gates: full INT8 activation execution reached a 13.34% 50-layer speedup but
+large video/audio errors; BF16 execution of dequantized weights reduced error
+but reached at most 9.50%, and the only 50-layer quality-passing component
+candidate was just 5.49% faster before VAE and cache verification costs. No
+INT8 cache runtime switch or loader is exposed. The builder is retained only
+to reproduce this result and support future groupwise/FP8 research; BF16
+remains the supported model format.
 
 ### ROCm compatibility
 
@@ -821,6 +829,31 @@ benchmark. Its default arguments model the 512x512/56-frame VDN geometry;
 same-binary comparisons, `H3_VDN_RELOAD_QUERY=1` reloads query values inside
 the key loop and `H3_VDN_SCAN_MASK=1` scans masked rows instead of jumping over
 the two disallowed gaps.
+
+The rejected INT8-weight study remains reproducible without affecting normal
+inference. Generation writes about 23 GiB and refuses to overwrite an existing
+directory; only the generation command uses a GPU. The `--verify` command is
+read-only and recomputes both the canonical source identity and every cache
+file digest:
+
+```sh
+make BACKEND=hip HIP_ARCHS=gfx1201 \
+  h3_vdn_int8_tests h3_vdn_int8_cache_tests h3_vdn_int8_cache_builder
+
+scripts/profile_vdn_gpu4.sh outputs/int8-operator-gpu4 -- \
+  ./h3_vdn_int8_tests
+
+scripts/profile_vdn_gpu4.sh outputs/int8-cache-build-gpu4 -- \
+  ./h3_vdn_int8_cache_builder \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
+
+./h3_vdn_int8_cache_builder --verify \
+  models/vdn-minimax-h3/h3-base \
+  models/vdn-minimax-h3/stage-dmd-step-250 \
+  models/vdn-minimax-h3/int8-cache-stage-dmd-turbo-v1 1
+```
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
