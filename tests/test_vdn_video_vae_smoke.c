@@ -103,6 +103,20 @@ int main(int argc, char **argv) {
         h3_video_frames_free(&frames);
         return 1;
     }
+    const char *dump_path = getenv("VDN_VAE_DUMP_F32");
+    if (dump_path && *dump_path) {
+        FILE *dump = fopen(dump_path, "wb");
+        int dump_ok = dump &&
+            fwrite(frames.rgb, sizeof(*frames.rgb), elements, dump) ==
+                elements;
+        if (dump && fclose(dump) != 0) dump_ok = 0;
+        if (!dump_ok) {
+            fprintf(stderr, "cannot write VDN VAE F32 dump: %s\n",
+                    strerror(errno));
+            h3_video_frames_free(&frames);
+            return 1;
+        }
+    }
     printf("VDN released video VAE passed: RGB F32[%d,%d,%d,3], "
            "wall=%.6fs, hash=%016llx, peak=%.3f GiB\n",
            frames.frames, frames.height, frames.width,

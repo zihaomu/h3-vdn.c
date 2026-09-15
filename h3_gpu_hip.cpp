@@ -30,10 +30,25 @@ struct h3_gpu_staging {
     h3_gpu_staging *next;
 };
 
+enum { H3_HIP_LINEAR_PROFILE_SHAPES = 32 };
+
+struct h3_gpu_linear_profile_shape {
+    uint32_t rows;
+    uint32_t input_dim;
+    uint32_t output_dim;
+    h3_gpu_dtype dtype;
+    int has_bias;
+    int32_t solution_index;
+    uint64_t calls;
+    double event_ms;
+    double enqueue_seconds;
+};
+
 struct h3_gpu {
     int device;
     int warp_size;
     char gcn_arch_name[64];
+    char rocblas_version[64];
     hipStream_t stream;
     rocblas_handle blas;
     char error[512];
@@ -47,6 +62,7 @@ struct h3_gpu {
     h3_gpu_stats profile_mark_stats;
     hipEvent_t *profile_events;
     uint8_t *profile_categories;
+    uint8_t *profile_linear_shape_indices;
     size_t profile_capacity;
     size_t profile_count;
     int profile_event_open;
@@ -56,6 +72,9 @@ struct h3_gpu {
     double profile_solve_ms;
     double profile_scan_ms;
     h3_gpu_profile_stats profile_totals;
+    h3_gpu_linear_profile_shape
+        profile_linear_shapes[H3_HIP_LINEAR_PROFILE_SHAPES];
+    size_t profile_linear_shape_count;
     pthread_mutex_t staging_lock;
     int staging_lock_initialized;
     int staging_cache_enabled;
@@ -254,11 +273,16 @@ static int h3_gpu_profile_init_events(h3_gpu *gpu) {
         std::calloc(capacity * 2, sizeof(*events)));
     uint8_t *categories = static_cast<uint8_t *>(
         std::calloc(capacity, sizeof(*categories)));
-    if (!events || !categories) {
+    uint8_t *linear_shape_indices = static_cast<uint8_t *>(
+        std::malloc(capacity * sizeof(*linear_shape_indices)));
+    if (!events || !categories || !linear_shape_indices) {
         std::free(events);
         std::free(categories);
+        std::free(linear_shape_indices);
         return 0;
     }
+    std::memset(linear_shape_indices, UINT8_MAX,
+                capacity * sizeof(*linear_shape_indices));
     size_t created = 0;
     for (; created < capacity * 2; created++) {
         if (hipEventCreateWithFlags(&events[created], hipEventDefault) !=
@@ -269,34 +293,41 @@ static int h3_gpu_profile_init_events(h3_gpu *gpu) {
             (void)hipEventDestroy(events[index]);
         std::free(events);
         std::free(categories);
+        std::free(linear_shape_indices);
         return 0;
     }
     gpu->profile_events = events;
     gpu->profile_categories = categories;
+    gpu->profile_linear_shape_indices = linear_shape_indices;
     gpu->profile_capacity = capacity;
     return 1;
 }
 
-static void h3_gpu_profile_begin_op(h3_gpu *gpu) {
+static int h3_gpu_profile_begin_op(h3_gpu *gpu) {
     if (!gpu || !h3_gpu_profile_enabled() || gpu->profile_event_open ||
         (gpu->profile_events &&
          gpu->profile_count >= gpu->profile_capacity))
-        return;
+        return 0;
     if (!h3_gpu_profile_init_events(gpu) ||
-        gpu->profile_count >= gpu->profile_capacity) return;
+        gpu->profile_count >= gpu->profile_capacity) return 0;
     if (hipEventRecord(gpu->profile_events[gpu->profile_count * 2],
-                       gpu->stream) == hipSuccess)
+                       gpu->stream) == hipSuccess) {
         gpu->profile_event_open = 1;
+        return 1;
+    }
+    return 0;
 }
 
 static void h3_gpu_profile_end_op(h3_gpu *gpu,
-                                  h3_gpu_profile_category category) {
+                                  h3_gpu_profile_category category,
+                                  uint8_t linear_shape_index) {
     if (!gpu || !gpu->profile_event_open ||
         gpu->profile_count >= gpu->profile_capacity) return;
     size_t index = gpu->profile_count;
     if (hipEventRecord(gpu->profile_events[index * 2 + 1], gpu->stream) ==
         hipSuccess) {
         gpu->profile_categories[index] = static_cast<uint8_t>(category);
+        gpu->profile_linear_shape_indices[index] = linear_shape_index;
         gpu->profile_count++;
     }
     gpu->profile_event_open = 0;
@@ -305,10 +336,54 @@ static void h3_gpu_profile_end_op(h3_gpu *gpu,
 struct h3_gpu_profile_scope {
     h3_gpu *gpu;
     h3_gpu_profile_category category;
-    h3_gpu_profile_scope(h3_gpu *value, h3_gpu_profile_category kind)
-        : gpu(value), category(kind) { h3_gpu_profile_begin_op(gpu); }
-    ~h3_gpu_profile_scope() { h3_gpu_profile_end_op(gpu, category); }
+    uint8_t linear_shape_index;
+    double enqueue_start;
+    int opened;
+    h3_gpu_profile_scope(h3_gpu *value, h3_gpu_profile_category kind,
+                         uint8_t shape_index = UINT8_MAX)
+        : gpu(value), category(kind), linear_shape_index(shape_index),
+          enqueue_start(0.0), opened(h3_gpu_profile_begin_op(gpu)) {
+        if (opened && category == H3_HIP_PROFILE_LINEAR)
+            enqueue_start = h3_gpu_now();
+    }
+    ~h3_gpu_profile_scope() {
+        if (!opened) return;
+        h3_gpu_profile_end_op(gpu, category, linear_shape_index);
+        if (category == H3_HIP_PROFILE_LINEAR &&
+            linear_shape_index < gpu->profile_linear_shape_count)
+            gpu->profile_linear_shapes[linear_shape_index].enqueue_seconds +=
+                h3_gpu_now() - enqueue_start;
+    }
 };
+
+static uint8_t h3_gpu_profile_linear_shape(h3_gpu *gpu, uint32_t rows,
+                                            uint32_t input_dim,
+                                            uint32_t output_dim,
+                                            h3_gpu_dtype dtype,
+                                            int has_bias,
+                                            int32_t solution_index) {
+    if (!gpu) return UINT8_MAX;
+    for (size_t index = 0; index < gpu->profile_linear_shape_count; index++) {
+        const h3_gpu_linear_profile_shape &shape =
+            gpu->profile_linear_shapes[index];
+        if (shape.rows == rows && shape.input_dim == input_dim &&
+            shape.output_dim == output_dim && shape.dtype == dtype &&
+            shape.has_bias == has_bias &&
+            shape.solution_index == solution_index)
+            return static_cast<uint8_t>(index);
+    }
+    if (gpu->profile_linear_shape_count >= H3_HIP_LINEAR_PROFILE_SHAPES)
+        return UINT8_MAX;
+    size_t index = gpu->profile_linear_shape_count++;
+    h3_gpu_linear_profile_shape &shape = gpu->profile_linear_shapes[index];
+    shape.rows = rows;
+    shape.input_dim = input_dim;
+    shape.output_dim = output_dim;
+    shape.dtype = dtype;
+    shape.has_bias = has_bias;
+    shape.solution_index = solution_index;
+    return static_cast<uint8_t>(index);
+}
 
 static void h3_gpu_profile_flush_ops(h3_gpu *gpu) {
     if (!gpu || !gpu->profile_count) return;
@@ -322,6 +397,14 @@ static void h3_gpu_profile_flush_ops(h3_gpu *gpu) {
             gpu->profile_linear_ms += milliseconds;
             gpu->profile_totals.linear_seconds += milliseconds / 1000.0;
             gpu->profile_totals.linear_calls++;
+            if (gpu->profile_linear_shape_indices[index] <
+                gpu->profile_linear_shape_count) {
+                h3_gpu_linear_profile_shape &shape =
+                    gpu->profile_linear_shapes[
+                        gpu->profile_linear_shape_indices[index]];
+                shape.calls++;
+                shape.event_ms += milliseconds;
+            }
             break;
         case H3_HIP_PROFILE_LORA:
             gpu->profile_lora_ms += milliseconds;
@@ -354,8 +437,10 @@ static void h3_gpu_profile_destroy_events(h3_gpu *gpu) {
         (void)hipEventDestroy(gpu->profile_events[index]);
     std::free(gpu->profile_events);
     std::free(gpu->profile_categories);
+    std::free(gpu->profile_linear_shape_indices);
     gpu->profile_events = nullptr;
     gpu->profile_categories = nullptr;
+    gpu->profile_linear_shape_indices = nullptr;
     gpu->profile_capacity = 0;
     gpu->profile_count = 0;
 }
@@ -431,6 +516,42 @@ static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
         static_cast<unsigned long long>(gpu->staging_hits),
         static_cast<unsigned long long>(gpu->staging_hits +
                                         gpu->staging_misses));
+}
+
+static void h3_gpu_profile_emit_linear_shapes(h3_gpu *gpu) {
+    if (!gpu || !h3_gpu_profile_enabled()) return;
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    for (size_t index = 0; index < gpu->profile_linear_shape_count; index++) {
+        const h3_gpu_linear_profile_shape &shape =
+            gpu->profile_linear_shapes[index];
+        if (!shape.calls) continue;
+        double bytes = static_cast<double>(h3_gpu_dtype_size(shape.dtype));
+        double input_bytes = static_cast<double>(shape.calls) * shape.rows *
+                             shape.input_dim * bytes;
+        double weight_bytes = static_cast<double>(shape.calls) *
+                              shape.output_dim * shape.input_dim * bytes;
+        double output_bytes = static_cast<double>(shape.calls) * shape.rows *
+                              shape.output_dim * bytes;
+        double bias_bytes = shape.has_bias ?
+            static_cast<double>(shape.calls) * shape.output_dim * bytes : 0.0;
+        std::fprintf(stderr,
+            "h3 profile: %-20s linear-shape   M=%u N=%u K=%u dtype=%s "
+            "bias=%d algo=%s solution=%d calls=%llu "
+            "event=%8.3fs enqueue=%8.6fs input=%7.3fGiB weight=%7.3fGiB "
+            "output=%7.3fGiB bias-bytes=%7.6fGiB\n",
+            gpu->profile_label[0] ? gpu->profile_label : "HIP context",
+            shape.rows, shape.output_dim, shape.input_dim,
+            shape.dtype == H3_GPU_F32 ? "f32" :
+            shape.dtype == H3_GPU_BF16 ? "bf16" : "other",
+            shape.has_bias,
+            shape.solution_index ? "rocblas_gemm_algo_solution_index" :
+                                   "rocblas_gemm_algo_standard",
+            shape.solution_index,
+            static_cast<unsigned long long>(shape.calls),
+            shape.event_ms / 1000.0, shape.enqueue_seconds,
+            input_bytes / gib, weight_bytes / gib, output_bytes / gib,
+            bias_bytes / gib);
+    }
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *gpu, const void *values,
@@ -2466,7 +2587,53 @@ static int h3_gpu_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                                         "linear bias")))
         return 0;
 
+    int32_t solution_index = 0;
+    if (dtype == H3_GPU_F32) {
+        const char *mode = std::getenv("H3_VAE_F32_GEMM");
+        if (mode && *mode && std::strcmp(mode, "standard") &&
+            std::strcmp(mode, "exact")) {
+            int fast_fc1 = !std::strcmp(mode, "fast-fc1");
+            int fast_fc2 = !std::strcmp(mode, "fast-fc2");
+            int fast_qkv = !std::strcmp(mode, "fast-qkv");
+            int fast_out = !std::strcmp(mode, "fast-out");
+            int fast_primary = !std::strcmp(mode, "fast-primary");
+            int fast_all = !std::strcmp(mode, "fast-all");
+            if (!fast_fc1 && !fast_fc2 && !fast_qkv && !fast_out &&
+                !fast_primary && !fast_all) {
+                h3_gpu_set_error(gpu,
+                    "unknown H3_VAE_F32_GEMM mode '%s'", mode);
+                return 0;
+            }
+            if (std::strcmp(gpu->gcn_arch_name, "gfx1201")) {
+                h3_gpu_set_error(gpu,
+                    "H3_VAE_F32_GEMM mode '%s' requires gfx1201", mode);
+                return 0;
+            }
+            if (std::strcmp(gpu->rocblas_version,
+                            "5.2.0.dabb6df2b9")) {
+                h3_gpu_set_error(gpu,
+                    "H3_VAE_F32_GEMM mode '%s' is not registered for "
+                    "rocBLAS %s", mode, gpu->rocblas_version);
+                return 0;
+            }
+            if (rows == 2273) {
+                int fc1 = input_dim == 2048 && output_dim == 16384;
+                int fc2 = input_dim == 8192 && output_dim == 2048;
+                int qkv = input_dim == 2048 && output_dim == 6144;
+                int out = input_dim == 2048 && output_dim == 2048;
+                if ((fast_fc1 && fc1) || (fast_fc2 && fc2) ||
+                    (fast_qkv && qkv) || (fast_out && out) ||
+                    (fast_primary && (fc1 || qkv || out)) ||
+                    (fast_all && (fc1 || fc2 || qkv || out)))
+                    solution_index = 91217;
+            }
+        }
+    }
     h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_LINEAR);
+    if (profile.opened)
+        profile.linear_shape_index = h3_gpu_profile_linear_shape(
+            gpu, rows, input_dim, output_dim, dtype, bias != nullptr,
+            solution_index);
     rocblas_datatype type = dtype == H3_GPU_F32 ? rocblas_datatype_f32_r :
                                                    rocblas_datatype_bf16_r;
     float alpha = 1.0f;
@@ -2479,7 +2646,9 @@ static int h3_gpu_linear(h3_gpu *gpu, h3_gpu_tensor *output,
         static_cast<rocblas_int>(input_dim), &beta, output->data, type,
         static_cast<rocblas_int>(output_dim), output->data, type,
         static_cast<rocblas_int>(output_dim), rocblas_datatype_f32_r,
-        rocblas_gemm_algo_standard, 0, 0);
+        solution_index ? rocblas_gemm_algo_solution_index :
+                         rocblas_gemm_algo_standard,
+        solution_index, 0);
     if (!h3_gpu_check_blas(gpu, status, "rocblas_gemm_ex")) return 0;
     gpu->stats.mps_linear_dispatches++;
 
@@ -2724,6 +2893,9 @@ extern "C" h3_gpu *h3_gpu_create(const char *shader_source_path,
     rocblas_status blas_status = rocblas_create_handle(&gpu->blas);
     if (blas_status == rocblas_status_success)
         blas_status = rocblas_set_stream(gpu->blas, gpu->stream);
+    if (blas_status == rocblas_status_success)
+        blas_status = rocblas_get_version_string(
+            gpu->rocblas_version, sizeof(gpu->rocblas_version));
     if (blas_status != rocblas_status_success) {
         if (error && error_size)
             std::snprintf(error, error_size,
@@ -2753,6 +2925,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
                         gpu->profile_start_wall);
     h3_gpu_profile_emit_ops(gpu);
     h3_gpu_profile_emit_load(gpu);
+    h3_gpu_profile_emit_linear_shapes(gpu);
     h3_gpu_profile_destroy_events(gpu);
     h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);

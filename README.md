@@ -20,7 +20,8 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | gfx1201 POTRF factors are independently verified and retried around the ROCm 7.2 rocSOLVER defect; 10-run real-weight and 64-run production-batch stresses are exact |
 | Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache/POTRF-retry counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
-| Reduced-precision research | Native gfx12 I8-QK/BF16-PV Sage attention and a versioned 23 GiB AdaLN/MLP INT8 cache were measured; both failed frozen quality/performance gates and neither is part of the stable/default path |
+| Video-VAE optimization | Per-shape F32 GEMM profiling plus explicit `fast-all` research mode; VAE wall median -20.85% and three-prompt media 3/3 PASS, while exact remains the default |
+| Reduced-precision research | E27/E33 Sage attention and per-row/block-scaled INT8/FP8 weights have reproducible evidence; failed candidates are excluded from `auto` and release defaults |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
 The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
@@ -47,6 +48,17 @@ production A/B, total generation fell from 486.705699 to 354.399810 seconds
 remained byte-identical. Set `H3_F32_SDPA_SCALAR=1` to force the generic scalar
 oracle for diagnosis.
 
+For gfx1201 experiments, `H3_VAE_F32_GEMM=fast-all` selects the registered
+rocBLAS fast solution for the production FC1/FC2/QKV/output shapes. Three
+crossed VAE runs reduced wall median from 108.871191 to 86.176618 seconds
+(-20.85%) and linear event from 53.713 to 31.244 seconds (-41.83%). Raw decoded
+video error was 0.000122535% relative RMSE with cosine
+0.999999999999232, and three full prompt renders passed video, temporal,
+exact-audio, container, and A/V-sync gates. The solution changes F32 reduction
+order and saves only about 6.4% of the frozen complete E2E, so it remains an
+explicit approximate research mode. Unset, `standard`, and `exact` retain the
+bitwise-stable rocBLAS algorithm.
+
 Systems with sufficient free VRAM may additionally set
 `H3_VDN_RESIDENT_GIB=12`. This keeps the first nine effective blocks as
 immutable GPU-side sources and clones them into the normal per-NFE working
@@ -63,7 +75,7 @@ The branch also carries an explicitly experimental native gfx12 Sage-style
 attention path selected with `H3_VDN_SDPA=sage-i8-bf16`. The implementation is
 owned by the Apache-2.0
 [SageAttention-AMD](https://github.com/zihaomu/SageAttention-AMD) submodule,
-fixed at commit `18d949018cec1467ac6d30c12b3494f2f51bb552`; H3 retains only its
+fixed at commit `37e838b1347cfae4ac73ac524ae0a476dfdc38c3`; H3 retains only its
 mode policy, tensor/context bridge, exact oracle, and model/media gates. Its E27
 task-split kernel at the pinned revision reached a clean-GPU4 profile total of
 14.665 ms and GPU median of 14.792 ms. The H3 public-dispatch crossed A/B
@@ -75,6 +87,15 @@ three-prompt staged gate nevertheless passed audio for 0/3 prompts: examples
 0 and 1 failed decoded-audio correlation/RMSE, while example 2 failed the
 audio-latent fast gate. This mode remains research-only; unset/`auto` continues
 to use the bitwise-exact BF16 wave32 path.
+
+The pinned submodule also contains the E33 BF16-QK/compensated-BF16-PV study.
+It reached 19.247 ms in a clean upstream campaign and 19.191 ms through the H3
+bridge versus 411.463 ms exact (21.440x), then passed prompt-2's 50-layer gate.
+The required eight-NFE test rejected it: video remained within limits, but
+audio reached 10.68372% relative RMSE and 0.994280444 cosine. A third residual
+made both speed and operator error worse. The temporary H3 E33 mode was
+therefore removed; the submodule retains the clean operator result and the
+downstream failure record without changing `auto`.
 
 The branch also contains reproducible tooling for the completed INT8
 model-weight investigation. It can build and strictly verify a versioned
@@ -95,6 +116,16 @@ bound also remains below the 10% production E2E requirement. The reproducible
 benchmarks are retained for future groupwise/block-scaled research; no FP8
 cache or runtime switch is exposed, and BF16 remains the supported model
 format.
+
+That groupwise follow-up has now also been executed. hipBLASLt 1.2.2 returned
+zero gfx1201 heuristics for BF16-activation/block-FP8-weight and dual-block-FP8
+descriptors. A fused fallback kept activation BF16 and dequantized only a
+`16x256` I8 weight tile into LDS immediately before BF16 WMMA; its byte/scale,
+canary, finite, and determinism contracts passed. Production performance did
+not: AdaLN ran at only 0.282--0.286x of rocBLAS BF16, FC1 at 0.051x, and FC2 at
+0.052--0.053x. The experiment stopped at the operator gate, created no derived
+cache or runtime switch, and is retained only as
+`h3_vdn_block_weight_gemm_bench` for future ROCm capability retesting.
 
 ### ROCm compatibility
 

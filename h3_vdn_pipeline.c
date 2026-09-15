@@ -11,6 +11,7 @@
 #include "h3_host.h"
 #include "h3_vdn_dit.h"
 #include "h3_vdn_prompt.h"
+#include "h3_vdn_sdpa_mode.h"
 #include "h3_vdn_weights.h"
 #include "h3_video_vae.h"
 
@@ -151,6 +152,14 @@ static char *joined_path(const char *root, const char *suffix) {
     return result;
 }
 
+static int valid_vae_gemm_mode(const char *mode) {
+    return !mode || !*mode || !strcmp(mode, "standard") ||
+        !strcmp(mode, "exact") || !strcmp(mode, "fast-fc1") ||
+        !strcmp(mode, "fast-fc2") || !strcmp(mode, "fast-qkv") ||
+        !strcmp(mode, "fast-out") || !strcmp(mode, "fast-primary") ||
+        !strcmp(mode, "fast-all");
+}
+
 static int json_string(FILE *file, const char *value) {
     if (fputc('"', file) == EOF) return 0;
     for (const unsigned char *cursor = (const unsigned char *)value;
@@ -225,6 +234,10 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
     if (!attention_mode || !*attention_mode) attention_mode = "auto";
     int approximate_attention =
         strncmp(attention_mode, "sage-", 5) == 0;
+    const char *vae_gemm_mode = getenv("H3_VAE_F32_GEMM");
+    if (!vae_gemm_mode || !*vae_gemm_mode) vae_gemm_mode = "exact";
+    int approximate_vae_gemm =
+        strncmp(vae_gemm_mode, "fast-", 5) == 0;
     int ok = fprintf(file,
         "{\n  \"schema_version\": 2,\n"
         "  \"engine_version\": \"%s\",\n  \"model_revision\": ",
@@ -245,6 +258,10 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         json_string(file, attention_mode) &&
         fprintf(file, ", \"approximate\": %s},\n",
                 approximate_attention ? "true" : "false") >= 0 &&
+        fputs("  \"video_vae_gemm\": {\"requested_mode\": ", file) != EOF &&
+        json_string(file, vae_gemm_mode) &&
+        fprintf(file, ", \"approximate\": %s},\n",
+                approximate_vae_gemm ? "true" : "false") >= 0 &&
         fprintf(file,
         "  \"device_index\": %d,\n"
         "  \"dtype\": \"BF16\",\n"
@@ -450,6 +467,18 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
 
     if (!params->prompt_embeddings || !*params->prompt_embeddings) {
         h3_set_error(ctx, "VDN generation requires prompt_embeddings");
+        return NULL;
+    }
+    const char *attention_mode = getenv("H3_VDN_SDPA");
+    h3_vdn_sdpa_mode parsed_attention_mode = H3_VDN_SDPA_AUTO;
+    if (attention_mode && *attention_mode &&
+        !h3_vdn_sdpa_mode_parse(attention_mode, &parsed_attention_mode)) {
+        h3_set_error(ctx, "invalid H3_VDN_SDPA mode");
+        return NULL;
+    }
+    const char *vae_gemm_mode = getenv("H3_VAE_F32_GEMM");
+    if (!valid_vae_gemm_mode(vae_gemm_mode)) {
+        h3_set_error(ctx, "unknown H3_VAE_F32_GEMM mode");
         return NULL;
     }
     if (params->reference_count || params->first_frame || params->last_frame) {

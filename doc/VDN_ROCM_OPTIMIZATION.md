@@ -958,6 +958,93 @@ scripts/profile_vdn_gpu4.sh outputs/fp8-fc2-gpu4 -- \
   ./h3_vdn_fp8_gemm_bench 5338 5376 14336 5
 ```
 
+### KEEP research-only: video-VAE F32 GEMM fast solution
+
+Production-shape profiling showed that FC1, FC2, QKV, and attention-output
+projections account for 99.2% of video-VAE linear event time. Exact rocBLAS and
+hipBLASLt solution searches found at most a 4.8% bitwise-exact FC1 gain, below
+the operator gate. The gfx1201/rocBLAS-5.2.0 solution-index 91217 path is not
+bitwise exact, so it is available only through explicit research modes; unset,
+`standard`, and `exact` preserve `rocblas_gemm_algo_standard`.
+
+`H3_VAE_F32_GEMM=fast-all` applies only to the four registered production
+`M=2273` shapes. Three crossed VAE runs reduced wall median from 108.871191 to
+86.176618 seconds (-20.85%) and linear event median from 53.713 to 31.244
+seconds (-41.83%). The candidate RGB-F32 hash was deterministic in all three
+runs. Its paired raw decoded-video relative RMSE/cosine were
+0.000122535%/0.999999999999232. Three full prompt renders passed video
+PSNR/SSIM/temporal, exact audio, container, and A/V-sync gates. This saves about
+22.7 seconds, or roughly 6.4% of the frozen 354.4-second production E2E, so it
+does not independently satisfy the 10% release-promotion target. It remains
+explicit and approximate.
+
+A production-shape `rocprofv3` trace also bounded all proposed neighboring
+fusion work. Bias, QKV prep, SwiGLU, scale/residual-add, and RMSNorm together
+were only 185.877 ms, 0.709% of GPU kernel event and 0.659% of wall. Those
+fusion candidates were rejected by upper bound instead of adding high-risk
+custom GEMM code.
+
+### REJECT runtime: E33 compensated BF16 SageAttention
+
+SageAttention-AMD commit `c74ea30` introduced the clean E33 operator, and
+commit `288fbca` recorded immutable GPU4 evidence. The final H3 gitlink points
+to `37e838b`, which also records the downstream failure. Clean E33 operator
+event median was 19.247 ms versus 462.824 ms for the paired exact wave32 sample;
+the H3 bridge measured 411.463 to 19.191 ms (21.440x), with relative RMSE
+0.000190124 and cosine 0.999999982.
+
+Prompt 2 passed the 50-layer gate, including audio RMSE/cosine
+4.02281%/0.999193881. The required eight-NFE comparison then reduced DiT wall
+from 305.908 to 154.313 seconds and passed video at
+0.21219%/0.999997758, but audio accumulated to
+10.68372%/0.994280444 and failed both limits. A third BF16 probability residual
+was tested as E33-R4; it passed operator correctness but slowed 19.247 to
+23.209 ms and worsened RMSE from 0.000215745 to 0.000266111. R4 was reverted,
+three-prompt media was not run, and H3's temporary E33 runtime mode/bridge
+branch was removed. `auto`, exact wave32, and the existing E27 research mode
+retain their previous semantics.
+
+### REJECT operator: block-scaled weight-only I8/FP8
+
+The follow-up deliberately changed both the v1 per-row error model and its
+full-BF16 materialization path. An isolated gfx12 probe keeps activations BF16,
+stores output-channel/K-group I8 weights and F32 scales, dequantizes only a
+`16x256` tile into LDS, and consumes it immediately with BF16 WMMA. Its small
+GPU4 contract passed quant byte/scale oracle, output/metadata canaries, finite,
+and bitwise determinism. Installed hipBLASLt 1.2.2 returned zero heuristics for
+both mixed BF16-activation/block-FP8-weight and dual-block-FP8 descriptors on
+gfx1201.
+
+The fused fallback failed the production operator gate by a large margin:
+AdaLN was 3.034--3.089 ms versus 0.866--0.873 ms BF16; FC1 was 242.500 versus
+12.332 ms; FC2 was 126.227--126.936 versus 6.579--6.704 ms. K-groups
+16/32/64/128/256 were screened on AdaLN, and 32/128 on FC2. Expanding LDS
+staging from K=16 to K=256 reduced barrier count sixteen-fold without improving
+FC1, showing that repeated I8-to-BF16 conversion per M tile dominates. No
+plausible tile adjustment can bridge the observed roughly 19--20x deficit in
+the absence of a mixed native instruction/library kernel.
+
+The candidate therefore stopped before single-block, 50-layer, 8-NFE, and
+media gates. No cache or runtime mode was created; the existing BF16 loader and
+default are unchanged. `h3_vdn_block_weight_gemm_bench` is retained so a future
+ROCm/hipBLASLt gfx1201 mixed block-scale implementation can be retested without
+rebuilding the experiment.
+
+```sh
+make BACKEND=hip HIP_ARCHS=gfx1201 h3_vdn_block_weight_gemm_bench
+
+# Small byte/scale/canary/finite/determinism contract and native capability.
+scripts/profile_vdn_gpu4.sh outputs/block-weight-contract-gpu4 -- \
+  env H3_BLOCK_WEIGHT_QUERY_NATIVE=1 \
+  ./h3_vdn_block_weight_gemm_bench 17 19 48 16 2
+
+# Representative production operator gates (M N K group iterations).
+scripts/profile_vdn_gpu4.sh outputs/block-weight-fc1-gpu4 -- \
+  ./h3_vdn_block_weight_gemm_bench 5338 28672 5376 128 3
+scripts/profile_vdn_gpu4.sh outputs/block-weight-fc2-gpu4 -- \
+  ./h3_vdn_block_weight_gemm_bench 5338 5376 14336 32 3
+```
+
 ## Test gates
 
 Build and run the local gates with:

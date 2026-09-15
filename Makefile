@@ -13,7 +13,7 @@ SAGEATTENTION_CPPFLAGS := -I$(SAGEATTENTION_DIR)/include \
 	-I$(SAGEATTENTION_DIR)/src
 
 LIB_C := h3.c h3_host.c h3_json.c h3_safetensors.c h3_sha256.c h3_vdn.c h3_vdn_pipeline.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_vdn_sdpa_mode.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -48,7 +48,7 @@ LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lrocsolver -lrocblas -lamdhip64 -licuuc -licui18n \
 	-lm -lpthread -ldl
 LIB_C += h3_tokenizer_stub.c
-LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c h3_vdn_sdpa_mode.c
+LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c
 LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp h3_vdn_sage_bridge.cpp
 SAGEATTENTION_OBJ := $(SAGEATTENTION_BUILD_DIR)/sage_attention.o \
 	$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage.o \
@@ -308,6 +308,15 @@ h3_vdn_int8_gemm_bench: tests/bench_vdn_int8_gemm.o
 h3_vdn_fp8_gemm_bench: tests/bench_vdn_fp8_gemm.o
 	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
 
+h3_vdn_block_weight_gemm_bench: tests/bench_vdn_block_weight_gemm.o
+	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
+
+h3_vae_f32_gemm_bench: tests/bench_vae_f32_gemm.o
+	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
+
+h3_vae_f32_compare: tests/compare_vae_f32.o
+	$(CC) -o $@ $^ -lm
+
 h3_vdn_fp8_tests: tests/test_vdn_fp8.o
 	$(LINK) -o $@ $^ -lhipblaslt $(LDLIBS)
 
@@ -555,7 +564,10 @@ clean:
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
 		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
-		h3_vdn_int8_gemm_bench h3_vdn_fp8_gemm_bench h3_vdn_fp8_tests \
+		h3_vdn_int8_gemm_bench h3_vdn_fp8_gemm_bench \
+		h3_vdn_block_weight_gemm_bench h3_vae_f32_gemm_bench \
+		h3_vae_f32_compare \
+		h3_vdn_fp8_tests \
 		h3_vdn_int8_tests \
 		h3_vdn_int8_cache_tests h3_vdn_int8_cache_builder \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \

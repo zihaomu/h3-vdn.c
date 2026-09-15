@@ -22,6 +22,7 @@ h3
 h3_*test
 h3_*tests
 h3_*bench
+h3_*compare
 h3_vdn_int8_cache_builder
 h3_dit_bench_864
 h3_tests

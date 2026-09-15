@@ -1,6 +1,7 @@
 #include "h3.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(condition) do {                                                \
@@ -73,6 +74,17 @@ int main(int argc, char **argv) {
     params.on_frame = ignore_frame;
     CHECK(fails_with(ctx, NULL, &params,
                      "VDN denoising preview is not implemented"));
+    params.preview_denoise = 0;
+    params.on_frame = NULL;
+
+    CHECK(setenv("H3_VAE_F32_GEMM", "unknown-mode", 1) == 0);
+    CHECK(fails_with(ctx, NULL, &params,
+                     "unknown H3_VAE_F32_GEMM mode"));
+    CHECK(unsetenv("H3_VAE_F32_GEMM") == 0);
+
+    CHECK(setenv("H3_VDN_SDPA", "unknown-mode", 1) == 0);
+    CHECK(fails_with(ctx, NULL, &params, "invalid H3_VDN_SDPA mode"));
+    CHECK(unsetenv("H3_VDN_SDPA") == 0);
 
     puts("VDN stable input contract fail-fast tests passed");
     h3_free(ctx);
