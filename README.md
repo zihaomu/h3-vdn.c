@@ -15,12 +15,12 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Native ROCm execution | HIP kernels plus rocBLAS/rocSOLVER; no CUDA runtime in the VDN inference path |
 | Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
 | VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
-| Hybrid attention | Exact `gfx1201` wave32 specializations for VDN BF16/D128 attention and video-VAE F32/D64 attention, with scalar correctness fallbacks; experimental I8-QK/BF16-PV dispatch is supplied by the pinned SageAttention-AMD submodule |
+| Hybrid attention | Exact `gfx1201` wave32 VDN BF16/D128 attention plus a production-shape two-kernel F32/D64 video-VAE path that removes the per-block score-LDS occupancy limit; scalar and one-kernel wave32 fallbacks remain available |
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline; optional bounded resident effective-weight sources for repeated NFE |
 | Prompt compatibility | Official variable-length BF16 `[L,5120]` embeddings and I64 `[L]` tags; upstream examples with 800, 821, and 1299 rows pass |
 | Determinism | gfx1201 POTRF factors are independently verified and retried around the ROCm 7.2 rocSOLVER defect; 10-run real-weight and 64-run production-batch stresses are exact |
 | Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache/POTRF-retry counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
-| Video-VAE optimization | Per-shape F32 GEMM profiling plus explicit `fast-all` research mode; VAE wall median -20.85% and three-prompt media 3/3 PASS, while exact remains the default |
+| Video-VAE optimization | Exact split-score SDPA is the `gfx1201` production-shape default (about -24% VAE wall, bitwise identical); explicit approximate `fast-all` composes with it to reach about 59 seconds and retains the prior three-prompt media 3/3 PASS |
 | Reduced-precision research | E27/E33 Sage attention and per-row/block-scaled INT8/FP8 weights have reproducible evidence; failed candidates are excluded from `auto` and release defaults |
 | Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
 
@@ -48,6 +48,23 @@ production A/B, total generation fell from 486.705699 to 354.399810 seconds
 remained byte-identical. Set `H3_F32_SDPA_SCALAR=1` to force the generic scalar
 oracle for diagnosis.
 
+The production `batch=1, sequence=2273, heads=32, D=64` video-VAE shape now
+goes one step further on `gfx1201`: exact QK+softmax and PV run as two kernels,
+with scores kept in a cached 0.616 GiB global workspace instead of about 9 KiB
+of LDS per wave. The QK reduction tree, scalar softmax traversal, probability
+multiplication, and PV FMA order are unchanged. Three standalone groups made
+the previous wave32 path 1.91--2.08x faster while every one of 23,275,520 F32
+outputs stayed bitwise identical. A same-binary production VAE pair reduced
+wall from 108.161230 to 81.972821 seconds and SDPA event time from 52.029 to
+25.189 seconds; decoded F32 hash remained `aafcf45d65a16b31`. Peak allocation
+rose from 9.454 to 10.070 GiB. Other shapes retain the one-kernel wave32 path;
+`H3_F32_SDPA_SPLIT_SCORES=0` forces it for diagnosis.
+
+The no-override exact production gate completed in 357 seconds: DiT 271.608
+seconds, video VAE 82.052 seconds, and audio VAE 1.579 seconds. It reproduced
+all five frozen internal hashes and the 2,315,918-byte MP4 SHA-256
+`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
+
 For gfx1201 experiments, `H3_VAE_F32_GEMM=fast-all` selects the registered
 rocBLAS fast solution for the production FC1/FC2/QKV/output shapes. Three
 crossed VAE runs reduced wall median from 108.871191 to 86.176618 seconds
@@ -58,6 +75,13 @@ exact-audio, container, and A/V-sync gates. The solution changes F32 reduction
 order and saves only about 6.4% of the frozen complete E2E, so it remains an
 explicit approximate research mode. Unset, `standard`, and `exact` retain the
 bitwise-stable rocBLAS algorithm.
+
+Composed with the exact split-score default, `fast-all` reduced the isolated
+production VAE to 59.040875 seconds (linear 31.416 seconds, SDPA 25.363
+seconds). A same-binary prompt-0 production pair completed in 378 versus 334
+seconds (-11.64%, 1.132x), reproduced the expected exact and approximate MP4
+hashes, and passed the 56-frame H.264/AAC container gate. This clears the 10%
+research target but does not make approximate GEMM the stable default.
 
 Systems with sufficient free VRAM may additionally set
 `H3_VDN_RESIDENT_GIB=12`. This keeps the first nine effective blocks as

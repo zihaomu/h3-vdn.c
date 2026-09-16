@@ -91,6 +91,8 @@ struct h3_gpu {
     int sage_workspace_prepared;
     void *int8_accumulator_workspace;
     size_t int8_accumulator_workspace_bytes;
+    void *f32_sdpa_split_workspace;
+    size_t f32_sdpa_split_workspace_bytes;
 };
 
 struct h3_gpu_tensor {
@@ -640,6 +642,29 @@ static int h3_gpu_ensure_int8_accumulator_workspace(h3_gpu *gpu,
     }
     gpu->int8_accumulator_workspace = replacement;
     gpu->int8_accumulator_workspace_bytes = bytes;
+    gpu->stats.allocated_bytes += bytes;
+    gpu->stats.live_bytes += bytes;
+    if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+        gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
+}
+
+static int h3_gpu_ensure_f32_sdpa_split_workspace(h3_gpu *gpu,
+                                                   size_t bytes) {
+    if (gpu->f32_sdpa_split_workspace_bytes >= bytes) return 1;
+    void *replacement = nullptr;
+    if (!h3_gpu_check(gpu, hipMalloc(&replacement, bytes ? bytes : 1),
+                      "hipMalloc F32 SDPA split workspace")) return 0;
+    if (gpu->f32_sdpa_split_workspace) {
+        if (!h3_gpu_check(gpu, hipFree(gpu->f32_sdpa_split_workspace),
+                          "hipFree old F32 SDPA split workspace")) {
+            (void)hipFree(replacement);
+            return 0;
+        }
+        gpu->stats.live_bytes -= gpu->f32_sdpa_split_workspace_bytes;
+    }
+    gpu->f32_sdpa_split_workspace = replacement;
+    gpu->f32_sdpa_split_workspace_bytes = bytes;
     gpu->stats.allocated_bytes += bytes;
     gpu->stats.live_bytes += bytes;
     if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
@@ -2563,6 +2588,84 @@ __global__ static void h3_hip_sdpa_f32_d64_wave32_kernel(
     output[query_base + lane + 32] = sum32;
 }
 
+/* Exact production specialization: moving the O(S) score array from per-block
+ * LDS to a cached global workspace removes the LDS occupancy limit. This first
+ * kernel preserves the QK tree and scalar max/exp/sum order and stores the
+ * unnormalized exp scores plus the inverse denominator. */
+__global__ static void h3_hip_sdpa_f32_d64_split_qk_kernel(
+        const float *query, const float *key, float *score_workspace,
+        float *inverses,
+        uint32_t batch, uint32_t sequence, uint32_t heads, float scale) {
+    constexpr uint32_t head_dim = 64;
+    uint32_t query_row = blockIdx.x;
+    uint32_t head_batch = blockIdx.y;
+    uint32_t lane = threadIdx.x;
+    uint32_t head = head_batch % heads;
+    uint32_t batch_index = head_batch / heads;
+    if (query_row >= sequence || batch_index >= batch || lane >= 32) return;
+    size_t batch_base = static_cast<size_t>(batch_index) * sequence * heads *
+                        head_dim;
+    size_t query_base = batch_base +
+        (static_cast<size_t>(query_row) * heads + head) * head_dim;
+    size_t pair = static_cast<size_t>(head_batch) * sequence + query_row;
+    float *pair_scores = score_workspace + pair * sequence;
+    float query0 = query[query_base + lane];
+    float query32 = query[query_base + lane + 32];
+    for (uint32_t key_row = 0; key_row < sequence; key_row++) {
+        size_t key_base = batch_base +
+            (static_cast<size_t>(key_row) * heads + head) * head_dim;
+        float product0 = fmaf(query0, key[key_base + lane], 0.0f);
+        float product32 = fmaf(query32, key[key_base + lane + 32], 0.0f);
+        float partial = product0 + product32;
+#pragma unroll
+        for (uint32_t offset = 16; offset; offset >>= 1)
+            partial += __shfl_down(partial, offset, 32);
+        if (lane == 0) pair_scores[key_row] = partial * scale;
+    }
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        for (uint32_t key_row = 0; key_row < sequence; key_row++)
+            maximum = fmaxf(maximum, pair_scores[key_row]);
+        float denominator = 0.0f;
+        for (uint32_t key_row = 0; key_row < sequence; key_row++) {
+            pair_scores[key_row] = expf(pair_scores[key_row] - maximum);
+            denominator += pair_scores[key_row];
+        }
+        inverses[pair] = 1.0f / denominator;
+    }
+}
+
+__global__ static void h3_hip_sdpa_f32_d64_split_pv_kernel(
+        const float *value, const float *score_workspace,
+        const float *inverses,
+        float *output, uint32_t batch, uint32_t sequence, uint32_t heads) {
+    constexpr uint32_t head_dim = 64;
+    uint32_t query_row = blockIdx.x;
+    uint32_t head_batch = blockIdx.y;
+    uint32_t lane = threadIdx.x;
+    uint32_t head = head_batch % heads;
+    uint32_t batch_index = head_batch / heads;
+    if (query_row >= sequence || batch_index >= batch || lane >= 32) return;
+    size_t batch_base = static_cast<size_t>(batch_index) * sequence * heads *
+                        head_dim;
+    size_t query_base = batch_base +
+        (static_cast<size_t>(query_row) * heads + head) * head_dim;
+    size_t pair = static_cast<size_t>(head_batch) * sequence + query_row;
+    const float *pair_scores = score_workspace + pair * sequence;
+    float inverse = inverses[pair];
+    float sum0 = 0.0f;
+    float sum32 = 0.0f;
+    for (uint32_t key_row = 0; key_row < sequence; key_row++) {
+        size_t value_base = batch_base +
+            (static_cast<size_t>(key_row) * heads + head) * head_dim;
+        float probability = pair_scores[key_row] * inverse;
+        sum0 = fmaf(probability, value[value_base + lane], sum0);
+        sum32 = fmaf(probability, value[value_base + lane + 32], sum32);
+    }
+    output[query_base + lane] = sum0;
+    output[query_base + lane + 32] = sum32;
+}
+
 static int h3_gpu_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight,
@@ -2754,21 +2857,58 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
     dim3 grid(sequence, batch * heads);
     const char *wave_value = std::getenv("H3_F32_SDPA_WAVE32");
     const char *scalar_value = std::getenv("H3_F32_SDPA_SCALAR");
+    const char *split_value = std::getenv("H3_F32_SDPA_SPLIT_SCORES");
     int force_scalar = scalar_value && *scalar_value &&
                        std::strcmp(scalar_value, "0");
     int disable_wave32 = wave_value && *wave_value &&
                          !std::strcmp(wave_value, "0");
     int use_f32_d64_wave32 = dtype == H3_GPU_F32 && head_dim == 64 && !causal &&
         gpu->warp_size == 32 && !force_scalar && !disable_wave32;
+    int split_disabled = split_value && *split_value &&
+                         !std::strcmp(split_value, "0");
+    int split_forced = split_value && *split_value &&
+                       std::strcmp(split_value, "0");
+    int registered_split_shape = batch == 1 && sequence == 2273 &&
+        heads == 32 && !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
+    int split_scores = use_f32_d64_wave32 && !split_disabled &&
+                       (registered_split_shape || split_forced);
     if (use_f32_d64_wave32) {
-        hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_wave32_kernel, grid,
-                           dim3(32), static_cast<size_t>(sequence) *
-                           sizeof(float), gpu->stream,
-                           static_cast<const float *>(query->data),
-                           static_cast<const float *>(key->data),
-                           static_cast<const float *>(value->data),
-                           static_cast<float *>(output->data), batch, sequence,
-                           heads, scale, causal);
+        if (split_scores) {
+            size_t pairs = static_cast<size_t>(batch) * heads * sequence;
+            if (pairs > SIZE_MAX / sequence ||
+                pairs * sequence > SIZE_MAX - pairs ||
+                (pairs * sequence + pairs) > SIZE_MAX / sizeof(float)) {
+                h3_gpu_set_error(gpu, "F32 SDPA split workspace overflow");
+                return 0;
+            }
+            size_t score_count = pairs * sequence;
+            size_t split_bytes = (score_count + pairs) * sizeof(float);
+            if (!h3_gpu_ensure_f32_sdpa_split_workspace(gpu, split_bytes))
+                return 0;
+            float *split_workspace = static_cast<float *>(
+                gpu->f32_sdpa_split_workspace);
+            float *split_inverses = split_workspace + score_count;
+            hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_split_qk_kernel, grid,
+                dim3(32), 0, gpu->stream,
+                static_cast<const float *>(query->data),
+                static_cast<const float *>(key->data), split_workspace,
+                split_inverses, batch, sequence, heads, scale);
+            if (!h3_gpu_kernel_enqueued(gpu, "F32 SDPA split QK kernel"))
+                return 0;
+            hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_split_pv_kernel, grid,
+                dim3(32), 0, gpu->stream,
+                static_cast<const float *>(value->data), split_workspace,
+                split_inverses, static_cast<float *>(output->data), batch,
+                sequence, heads);
+        } else {
+            hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_wave32_kernel, grid,
+                dim3(32), static_cast<size_t>(sequence) * sizeof(float),
+                gpu->stream, static_cast<const float *>(query->data),
+                static_cast<const float *>(key->data),
+                static_cast<const float *>(value->data),
+                static_cast<float *>(output->data), batch, sequence, heads,
+                scale, causal);
+        }
     } else if (dtype == H3_GPU_F32) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(h3_hip_sdpa_kernel<float>), grid,
                            dim3(H3_HIP_THREADS), shared_bytes, gpu->stream,
@@ -2929,6 +3069,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_destroy_events(gpu);
     h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
+    (void)hipFree(gpu->f32_sdpa_split_workspace);
     (void)hipFree(gpu->int8_accumulator_workspace);
     (void)hipFree(gpu->sage_workspace);
     (void)rocblas_destroy_handle(gpu->blas);

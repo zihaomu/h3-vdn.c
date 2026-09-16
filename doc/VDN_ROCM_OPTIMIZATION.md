@@ -452,6 +452,56 @@ MP4 SHA-256 `7a447fe6f63697ad1bbb2df8a74f385b432ce3a1d5855caee5f8c1531a955c5b`,
 and ffprobe all passed. A separate smoke run forced the scalar fallback and
 reproduced decoded-F32 hash `4e1406b60b207415`.
 
+### KEEP: exact split-score F32/D64 production video-VAE SDPA
+
+After F32 GEMM tuning left SDPA as the largest VAE item, three further exact
+designs were tested. Distributing `expf` across the wave regressed by 3.4%.
+Putting two queries in one block and sharing eight-key K/V tiles through LDS
+was also exact but regressed from 0.133252 to 0.238595 seconds because block
+barriers and staging outweighed reuse. Both failed runtime branches were
+removed.
+
+The kept design instead splits exact QK+softmax and PV into two kernels. Its
+score matrix and inverse denominators use a cached 0.616 GiB global workspace,
+removing the roughly 9 KiB LDS allocation from each one-wave block. QK retains
+the existing product/reduction tree; lane 0 retains the same max, exp and
+denominator order; PV retains the same probability multiply and FMA order.
+The result is therefore bitwise identical, not a reduced-precision attention
+path.
+
+Three `S=2273,H=32,D=64` groups measured old wave32→split at
+`0.124249→0.065095`, `0.128216→0.061916`, and `0.135407→0.065054` seconds
+(1.91--2.08x). All 23,275,520 F32 values matched scalar and wave32 bit for bit.
+Cleaned-source confirmation was `0.127802→0.062245` seconds (2.053x). Boundary
+shapes `S/H=1/3,7/5,65/7,509/3` also matched exactly, but split dispatch was
+slower there; automatic selection is consequently limited to gfx1201
+`batch=1,S=2273,H=32,D=64`. Other shapes retain one-kernel wave32, and
+`H3_F32_SDPA_SPLIT_SCORES=0` forces that fallback.
+
+| Production VAE result | one-kernel wave32 | split-score | Change |
+|---|---:|---:|---:|
+| wall | 108.161230 s | 81.972821 s | -24.21% / 1.319x |
+| SDPA event | 52.029 s | 25.189 s | -51.59% / 2.066x |
+| decoded F32 hash | `aafcf45d65a16b31` | `aafcf45d65a16b31` | bitwise exact |
+| peak live allocation | 9.454 GiB | 10.070 GiB | +0.616 GiB |
+
+With the already gated explicit `H3_VAE_F32_GEMM=fast-all` mode, isolated VAE
+wall was 59.040875 seconds (linear 31.416 seconds, SDPA 25.363 seconds). A
+same-binary prompt-0 production pair completed in 378 versus 334 seconds
+(-11.64%, 1.132x); all DiT/audio hashes remained exact, the candidate MP4
+SHA-256 was the previously gated
+`c46e805a39f839bb38f15513e349c436ead9d3fc462bc137fb473a177a43d97d`, and
+container/A-V checks passed. A later confirmation suffered unrelated weight
+read degradation (523.048 GiB at 5.33 rather than 8.27 GiB/s), but still
+reproduced the same VAE event times and output hashes; it is not used as an E2E
+performance sample.
+
+The final no-override exact production gate completed in 357 seconds. Its DiT,
+video VAE, and audio VAE walls were 271.608, 82.052, and 1.579 seconds; video
+VAE SDPA was 25.337 seconds. All five frozen hashes, the 2,315,918-byte MP4,
+SHA-256 `ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`,
+H.264/AAC stream contract, BDF `0000:e3:00.0`, and concurrency guard passed.
+
 ### REJECT: exact LDS-tiled BF16/D128 VDN SDPA
 
 An opt-in experiment grouped eight same-frame queries in one 256-thread block
