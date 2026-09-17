@@ -19,6 +19,8 @@ fi
 
 jq -e '
     . as $root |
+    (.block_profile // {"schema_version": 1, "enabled": false,
+                        "records": []}) as $block_profile |
     .schema_version == 2 and
     .backend == "hip" and
     (.pci_bus_id | test("^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\\.[[:xdigit:]]$")) and
@@ -47,7 +49,33 @@ jq -e '
     .timing_seconds.residual >= 0 and
     (.gpu_profile_calls.solve_retries | type == "number" and . >= 0) and
     .weight_stream.read_bytes > 0 and
-    .weight_stream.read_bytes == .weight_stream.h2d_bytes
+    .weight_stream.read_bytes == .weight_stream.h2d_bytes and
+    $block_profile.schema_version == 1 and
+    ($block_profile.enabled | type == "boolean") and
+    ($block_profile.records | type == "array") and
+    (if $block_profile.enabled then
+        ($block_profile.records | length == ($root.nfe * 50)) and
+        ([$block_profile.records[] |
+            (.nfe_index >= 0 and .nfe_index < $root.nfe) and
+            (.block_index >= 0 and .block_index < 50) and
+            .wall_seconds > 0 and
+            .phase_seconds.load > 0 and
+            .phase_seconds.execute > 0 and
+            .load.read_bytes > 0 and
+            .load.read_bytes == .load.h2d_bytes and
+            .load.read_seconds >= 0 and
+            .load.h2d_seconds >= 0 and
+            .load.staging_wait_seconds >= 0 and
+            .execute.sdpa_calls == 1
+        ] | all) and
+        ([range(0; $root.nfe) as $nfe |
+            ([ $block_profile.records[] |
+                select(.nfe_index == $nfe) | .load.read_bytes ] | add) ==
+            $root.nfe_timings[$nfe].weight_stream.read_bytes
+        ] | all)
+     else
+        ($block_profile.records | length == 0)
+     end)
 ' "$record" >/dev/null
 
 echo "VDN inference profile passed: $record"

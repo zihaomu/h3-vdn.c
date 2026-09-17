@@ -1,18 +1,27 @@
-# OpenVDN ROCm v0.1.0 Stable Release
+# OpenVDN ROCm v0.1.0 Stable Evidence — Withdrawn
+
+> **Status changed 2026-09-16:** this document records historical execution,
+> determinism, performance, and media-container evidence. Frame inspection of
+> both the 512×512/56-frame artifact documented here and later 640×384 renders
+> showed colored block noise. These gates did not establish model semantic
+> correctness, so the stable/release conclusion is withdrawn pending a real
+> OpenVDN PyTorch oracle, layer-by-layer parity, and an official-geometry visual
+> acceptance. Historical hashes below are negative deterministic fixtures.
 
 Validation date: 2026-09-04; gfx1201 POTRF guard revalidated 2026-09-08
 Release branch: `vdn-h3-rocm`  
 Upstream OpenVDN code: `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`  
 Model revision: `18be6bcc4ee72585eee322ba28b5ccac2cf85ef0`
 
-## Supported scope
+## Previously claimed scope
 
-This release runs OpenVDN `stage-dmd-step-250` end to end on one selected AMD
+The implementation runs OpenVDN `stage-dmd-step-250` mechanically end to end on one selected AMD
 Radeon AI PRO R9700 (`gfx1201`) with ROCm 7.2.3. It merges the default and turbo
 adapters, evaluates all 50 hybrid-attention blocks for each of 8 NFE, decodes
-video and stereo audio, and muxes an MP4.
+video and stereo audio, and muxes an MP4. The resulting video is not
+semantically valid, so this is not a supported release scope.
 
-The stable VDN prompt API is `--prompt-embeds` using one safetensors file with
+The current VDN prompt API is `--prompt-embeds` using one safetensors file with
 exactly two tensors: BF16 `prompt_embeds[L,5120]` and I64 `token_tags[L]`. The
 no-unpickle converter supports all three upstream examples (`L=800`, `821`, and
 `1299`) and output from the pinned upstream `encode_prompt.py`.
@@ -45,7 +54,7 @@ logical device 0 inside the process.
 | Real loader | base + default + turbo parity passes with staging cache enabled and disabled; no live allocation leak |
 | Production single NFE | sequence 5338; video `b3d3500676d3fb12`; audio `5fbd7afb3d78a277`; peak 4.969 GiB |
 | Prompt lengths | 800/821/1299 convert and load; 821/1299 refine; 821 completes all 50 blocks |
-| Production E2E | two consecutive release runs and one post-POTRF-guard 512×512, 56-frame, 8-NFE run reproduce all frozen hashes and the same MP4 |
+| Former production E2E | deterministic execution only; the reproduced 512×512, 56-frame MP4 is a colored-noise negative fixture |
 | Release-rehearsal E2E | clean-build 64×32 fixture passes 8 NFE, both VAEs, and mux; exact historical SHA retained |
 
 The two production runs took 486.49 and 487.20 seconds. Their internal hashes
@@ -79,7 +88,7 @@ concurrency guard; the small MP4 remained byte-identical.
 
 | Target | Release status |
 |---|---|
-| R9700 / `gfx1201`, ROCm 7.2.3 | Supported and runtime tested |
+| R9700 / `gfx1201`, ROCm 7.2.3 | Runtime exercised; semantic correctness failed, not release-ready |
 | `gfx90a`, `gfx942`, `gfx1030`, `gfx1100`, `gfx1151` | Compile-only; runtime experimental/unvalidated |
 | Other ROCm targets | Unsupported |
 
@@ -90,7 +99,8 @@ with a space-separated list. Compilation alone is not a support claim.
 ## Intentional limitations
 
 - One selected GPU only; no multi-GPU layer sharding.
-- `stage-dmd-step-250` with exactly 8 NFE is the end-to-end stable checkpoint.
+- `stage-dmd-step-250` with exactly 8 NFE mechanically completes, but its native
+  C/HIP output has not passed semantic correctness.
   `stage-b-step-2000` has metadata validation but no 50-NFE E2E acceptance.
 - Raw `-p` text is not encoded inside this binary. The VDN download omits its
   approximately 62 GB Qwen3-VL-32B processor/text encoder, so raw text is first

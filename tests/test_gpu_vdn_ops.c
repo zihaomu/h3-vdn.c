@@ -60,6 +60,10 @@ int main(void) {
     h3_gpu_tensor *qr = NULL, *kr = NULL, *v = NULL, *qw = NULL, *kw = NULL;
     h3_gpu_tensor *cosine = NULL, *sine = NULL, *q = NULL, *k = NULL;
     h3_gpu_tensor *attended = NULL, *logits = NULL, *gated = NULL;
+    h3_gpu_tensor *large_qr = NULL, *large_kr = NULL;
+    h3_gpu_tensor *large_qw = NULL, *large_kw = NULL;
+    h3_gpu_tensor *large_cos = NULL, *large_sin = NULL;
+    h3_gpu_tensor *large_q = NULL, *large_k = NULL;
     uint16_t qr_host[ROWS * INNER], kr_host[ROWS * INNER];
     uint16_t v_host[ROWS * INNER], norm_host[DIM];
     uint16_t cos_host[ROWS * 2], sin_host[ROWS * 2];
@@ -182,7 +186,34 @@ int main(void) {
             }
         }
 
+    /* Regression for the official VDN sequence length. The old
+     * dim3(heads, sequence) launch exceeded HIP's grid.y=65535 limit. */
+    enum { LARGE_ROWS = 65536, LARGE_HEADS = 1, LARGE_DIM = 2 };
+    large_qr = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)LARGE_ROWS * LARGE_HEADS * LARGE_DIM);
+    large_kr = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)LARGE_ROWS * LARGE_HEADS * LARGE_DIM);
+    large_qw = h3_gpu_tensor_new_bf16(gpu, LARGE_DIM);
+    large_kw = h3_gpu_tensor_new_bf16(gpu, LARGE_DIM);
+    large_cos = h3_gpu_tensor_new_bf16(gpu, LARGE_ROWS);
+    large_sin = h3_gpu_tensor_new_bf16(gpu, LARGE_ROWS);
+    large_q = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)LARGE_ROWS * LARGE_HEADS * LARGE_DIM);
+    large_k = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)LARGE_ROWS * LARGE_HEADS * LARGE_DIM);
+    CHECK(large_qr && large_kr && large_qw && large_kw && large_cos &&
+          large_sin && large_q && large_k);
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_vdn_qk_rope_bf16(
+        gpu, large_q, large_k, large_qr, large_kr, large_qw, large_kw,
+        large_cos, large_sin, LARGE_ROWS, LARGE_HEADS, LARGE_DIM, 1, 1e-5f));
+    CHECK(h3_gpu_submit(gpu));
+
 cleanup:
+    h3_gpu_tensor_free(large_k); h3_gpu_tensor_free(large_q);
+    h3_gpu_tensor_free(large_sin); h3_gpu_tensor_free(large_cos);
+    h3_gpu_tensor_free(large_kw); h3_gpu_tensor_free(large_qw);
+    h3_gpu_tensor_free(large_kr); h3_gpu_tensor_free(large_qr);
     h3_gpu_tensor_free(gated); h3_gpu_tensor_free(logits);
     h3_gpu_tensor_free(attended); h3_gpu_tensor_free(k); h3_gpu_tensor_free(q);
     h3_gpu_tensor_free(sine); h3_gpu_tensor_free(cosine);

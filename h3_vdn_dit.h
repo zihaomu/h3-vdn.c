@@ -49,6 +49,29 @@ typedef struct {
     double total_seconds;
 } h3_vdn_forward_timing;
 
+/* Optional, bounded block-level trace used to determine whether streamed
+ * weights are actually on the DiT critical path.  The snapshots are split at
+ * the load/execute boundary so read/H2D/LoRA work is not conflated with the
+ * transformer block itself. */
+typedef struct {
+    unsigned block_index;
+    double wall_seconds;
+    double load_wall_seconds;
+    double execute_wall_seconds;
+    double release_wall_seconds;
+    h3_gpu_stats load_gpu;
+    h3_gpu_stats execute_gpu;
+    h3_gpu_profile_stats load_profile;
+    h3_gpu_profile_stats execute_profile;
+} h3_vdn_block_timing;
+
+enum {
+    H3_VDN_PROFILE_BLOCKS_PER_NFE = 50,
+    H3_VDN_PROFILE_MAX_NFE = 8,
+    H3_VDN_PROFILE_BLOCK_CAPACITY =
+        H3_VDN_PROFILE_BLOCKS_PER_NFE * H3_VDN_PROFILE_MAX_NFE
+};
+
 typedef struct {
     unsigned index;
     float video_timestep;
@@ -59,11 +82,16 @@ typedef struct {
     h3_vdn_forward_timing forward;
     h3_gpu_stats gpu;
     h3_gpu_profile_stats profile;
+    unsigned block_timing_offset;
+    unsigned block_timing_count;
 } h3_vdn_nfe_timing;
 
 typedef struct {
     unsigned count;
+    int block_profile_enabled;
+    unsigned block_timing_count;
     h3_vdn_nfe_timing entries[H3_MAX_STEPS];
+    h3_vdn_block_timing block_timings[H3_VDN_PROFILE_BLOCK_CAPACITY];
 } h3_vdn_denoise_timing;
 
 typedef void (*h3_vdn_layer_progress)(unsigned completed, unsigned total,
@@ -109,6 +137,17 @@ void h3_vdn_velocity_free(h3_vdn_velocity *velocity);
 
 typedef void (*h3_vdn_nfe_progress)(unsigned completed, unsigned total,
                                     void *opaque);
+typedef int (*h3_vdn_nfe_observer)(
+    h3_gpu *gpu, unsigned completed, unsigned total,
+    const h3_gpu_tensor *video_rows, const h3_gpu_tensor *audio_rows,
+    void *opaque, char *error, size_t error_size);
+
+/* Diagnostic callback for locating the first prompt-refiner divergence.  The
+ * stage names are stable fixture keys without the leading `refiner.` prefix.
+ * The callback may synchronously read `tensor`; production callers pass NULL. */
+typedef int (*h3_vdn_refiner_observer)(
+    h3_gpu *gpu, const char *stage, const h3_gpu_tensor *tensor,
+    void *opaque, char *error, size_t error_size);
 
 /* Run the released paired 12/3 shifted schedule and update the mutable F32
  * video/audio latent rows in place. */
@@ -122,12 +161,31 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                    h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
                    h3_vdn_denoise_timing *timing,
                    char *error, size_t error_size);
+/* Diagnostic variant that exposes latent rows after every Euler update.
+ * Production callers should continue to use h3_vdn_denoise(). */
+int h3_vdn_denoise_observed(
+                   h3_gpu *gpu, h3_vdn_weight_store *store,
+                   const h3_vdn_model_weights *weights,
+                   const h3_gpu_tensor *refined_prompt,
+                   const h3_vdn_layout *layout,
+                   h3_gpu_tensor *video_rows, h3_gpu_tensor *audio_rows,
+                   unsigned evaluations, uint32_t radius, uint32_t chunk,
+                   h3_vdn_layer_progress layer_progress,
+                   h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
+                   h3_vdn_nfe_observer observer, void *observer_opaque,
+                   h3_vdn_denoise_timing *timing,
+                   char *error, size_t error_size);
 
 /* Project and refine an official variable-length prompt. The returned BF16
  * tensor is [prompt->tokens,5376] and owned by the caller. */
 h3_gpu_tensor *h3_vdn_refine_prompt(
     h3_gpu *gpu, const h3_vdn_model_weights *weights,
     const h3_text_embedding *prompt, char *error, size_t error_size);
+h3_gpu_tensor *h3_vdn_refine_prompt_observed(
+    h3_gpu *gpu, const h3_vdn_model_weights *weights,
+    const h3_text_embedding *prompt,
+    h3_vdn_refiner_observer observer, void *observer_opaque,
+    char *error, size_t error_size);
 
 h3_gpu_tensor *h3_vdn_time_embedding(
     h3_gpu *gpu, const h3_vdn_model_weights *weights,

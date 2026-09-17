@@ -1,19 +1,89 @@
 # h3.c
 
-## OpenVDN MiniMax-H3 on AMD ROCm — v0.1.0 stable
+## OpenVDN MiniMax-H3 on AMD ROCm — semantic correctness recovery
 
-The primary work on the `vdn-h3-rocm` branch is a native C/C++ HIP port of
+> **Release warning (2026-09-16):** the native ROCm path completes 8-NFE,
+> both VAEs, and MP4 mux, but visual inspection proved that both the former
+> 512×512/56-frame acceptance artifact and the newer 640×384 renders are
+> colored block noise. The old gates established execution, determinism, and
+> container validity—not correspondence with the OpenVDN model. The v0.1.0
+> stable claim is withdrawn while upstream PyTorch layer-by-layer parity is
+> being established. Do not treat the current output as a valid generated
+> sample or the historical timings as correct-model performance.
+
+## Original MiniMax-H3 on ROCm — correctness status
+
+The branch now also carries a correctness-first HIP bring-up of the original
+MiniMax-H3 path, independently of OpenVDN. The frozen model revision is
+`42ed227ee7df40d41602854ae760620d6eb651fe`; the default formal AMD regression
+device remains physical GPU 4 (`gfx1201`, PCI `0000:e3:00.0`), while the latest
+user-authorized isolated diagnosis ran on physical GPU 1 (PCI
+`0000:43:00.0`). The modern official Diffusers checkpoint is installed and now
+has upstream 320×192 diagnostic and 640×384 semantic E2E reference runs;
+the native C loader still cannot consume that 14-shard modern layout because it
+expects the older 13-shard `FL2VA/transformer` names.
+
+| Original H3 subsystem | Current HIP result |
+|---|---|
+| Tokenizer + Qwen text | Official token IDs exact; layer-50 relative-L2 `0.000554077` in the latest regression |
+| Qwen vision | Official 64×64 merged/deepstack oracle passes |
+| FL2VA multimodal conditioner | Official Diffusers all-ones attention-mask contract fixed; real GQA is bitwise exact and layer-50 relative-L2 is `0.001003644` |
+| Video/Audio VAE + mux | Official encoder/decoder tensor oracles and strict H.264/AAC A/V-sync contract pass |
+| HIP reference API coverage | `0` required gaps; 10 optional optimized DiT kernels remain unavailable |
+| Original DiT and E2E | Official BF16 Diffusers T2VA completed at 320×192 and 640×384, 124 frames and 50 NFE; 640×384 removes the low-resolution color/block artifacts and produces a coherent fox-in-snow video; native C remains blocked on old-to-modern Transformer layout adaptation |
+
+The first full upstream reference generated a playable 5.1667-second H.264/AAC
+file from the released H3-Base weights with seed 42. The deliberately tiny
+320×192 diagnostic was deterministic but retained chromatic and block-texture
+artifacts. A controlled follow-up kept 50 NFE and independently isolated VAE
+tiling, native versus `_native_math` SDPA, and resolution. Tiled and untiled
+VAE decodes and both SDPA modes retained the same artifact class, while native
+640×384 removed it: the result shows a clear fox moving coherently through a
+snowy forest. This identifies the earlier artifact as an out-of-distribution
+low-resolution failure rather than insufficient steps, VAE seams, or broken
+default SDPA.
+
+The 640×384 call took 345.610 seconds, used 16.197 GiB peak Torch allocation,
+and produced H.264/AAC streams with MP4 SHA-256
+`fa179519f8aeb4587254c914f8c1b7867f123eada2ddd29807ffd39f42faa50b`.
+It ran exclusively on physical GPU 1; both contention guards were empty. This
+is an upstream semantic pass, not yet the final release-quality gate at the
+model's intended 768-pixel short edge. Evidence is under
+`outputs/h3-artifact-diagnosis-20260917-r4/`; the reproducible runners are
+`scripts/run_h3_artifact_diagnosis.py` and
+`scripts/decode_h3_saved_video_latent.py`. The code-only frozen contract,
+official model revision link, local evidence hashes, and pinned Diffusers
+patches are documented in
+[`doc/H3_BF16_640X384_BASELINE.md`](doc/H3_BF16_640X384_BASELINE.md). No model
+or generated output is tracked by Git.
+
+The canonical multimodal gate is:
+
+```sh
+make BACKEND=hip H3_REFERENCE_PHYSICAL_GPU=4 h3-multimodal-oracle-test
+```
+
+It validates the fixture, runs a real-shape Q/K/V attention gate, then executes
+all 50 conditioner layers. The committed oracle contract and evidence are in
+[`doc/H3_UPSTREAM_ORACLE_SCHEMA.md`](doc/H3_UPSTREAM_ORACLE_SCHEMA.md); the
+workspace execution log additionally tracks the capacity guard and next DiT
+work in `doc/h3-original-model-correctness-and-performance-plan.md`.
+
+The primary work on the `vdn-h3-rocm` branch is an experimental native C/C++
+HIP port of
 [OpenVDN VDN-Minimax-H3](https://github.com/OpenVDN/vdn-minimax-h3). It runs the
 released `h3-base` and `stage-dmd-step-250` checkpoint end to end on one AMD
 GPU: default and turbo LoRA merge, all 50 hybrid-attention blocks for each of 8
-NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
+NFE, synchronized video/audio denoising, both VAEs, and MP4 mux. The execution
+chain is implemented, but model-level semantic correctness is not yet proven
+and current renders are invalid.
 
 ### What this port delivers
 
-| Area | Implemented and validated result |
+| Area | Current result |
 |---|---|
 | Native ROCm execution | HIP kernels plus rocBLAS/rocSOLVER; no CUDA runtime in the VDN inference path |
-| Complete generation | 8-NFE DiT, video VAE, audio VAE, H.264/AAC MP4 output |
+| Complete generation | Mechanically completes 8-NFE DiT, video VAE, audio VAE, and H.264/AAC mux; current decoded video is noise |
 | VDN checkpoint loading | Streams the 33B base weights and merges default + turbo LoRA adapters per block |
 | Hybrid attention | Exact `gfx1201` wave32 VDN BF16/D128 attention plus a production-shape two-kernel F32/D64 video-VAE path that removes the per-block score-LDS occupancy limit; scalar and one-kernel wave32 fallbacks remain available |
 | Weight streaming | Thread-safe pinned staging cache and double-buffered disk-to-GPU pipeline; optional bounded resident effective-weight sources for repeated NFE |
@@ -22,13 +92,13 @@ NFE, synchronized video/audio denoising, both VAEs, and MP4 mux.
 | Performance observability | Schema-v2 inference records with PCI BDF, five output hashes, per-NFE wall/GPU/weight-stream/LoRA/cache/POTRF-retry counters, VAE/mux phases, RSS/faults/context switches, and a single-card telemetry helper |
 | Video-VAE optimization | Exact split-score SDPA is the `gfx1201` production-shape default (about -24% VAE wall, bitwise identical); explicit approximate `fast-all` composes with it to reach about 59 seconds and retains the prior three-prompt media 3/3 PASS |
 | Reduced-precision research | E27/E33 Sage attention and per-row/block-scaled INT8/FP8 weights have reproducible evidence; failed candidates are excluded from `auto` and release defaults |
-| Release gates | Clean build, 1774 host checks, loader/LoRA parity, GPU ops, 50-layer forward, dual-VAE E2E, and fail-fast API tests |
+| Existing gates | Clean build, 1774 host checks, loader/LoRA checks, GPU ops, 50-layer execution, dual-VAE execution, and fail-fast API tests; no real OpenVDN model-level oracle yet |
 
-The production acceptance uses 56 frames at 512×512, 8 real NFE, stereo
-32 kHz audio, and one GPU. Two consecutive runs produced byte-identical
-2,315,918-byte MP4 files with SHA-256
-`ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
-Their denoised latent, decoded F32 video, PCM, and RGB24 hashes also matched.
+The former production acceptance used 56 frames at 512×512, 8 real NFE,
+stereo 32 kHz audio, and one GPU. Two consecutive runs produced byte-identical
+files and internal hashes, but subsequent frame inspection showed that the
+video is colored block noise. Those hashes are retained only as deterministic
+negative fixtures; they are not semantic acceptance values.
 
 ROCm 7.2's rocSOLVER 3.32 can intermittently return a corrupted batched
 Cholesky factor on `gfx1201` while reporting success. The HIP backend therefore
@@ -155,19 +225,21 @@ cache or runtime switch, and is retained only as
 
 | Target | Status | Evidence |
 |---|---|---|
-| Radeon AI PRO R9700 / `gfx1201`, ROCm 7.2.3 | **Stable, runtime tested** | Clean build, wave32/scalar parity, 50-layer stress, and production E2E |
+| Radeon AI PRO R9700 / `gfx1201`, ROCm 7.2.3 | **Experimental; semantic recovery in progress** | Runtime and deterministic execution tested; generated video currently invalid |
 | `gfx90a`, `gfx942`, `gfx1030`, `gfx1100`, `gfx1151` | Compile-only | Complete HIP translation unit builds; runtime remains unvalidated |
 | Other ROCm targets | Unsupported | No build or runtime evidence |
 
-The v0.1.0 stable guarantee is deliberately precise: Linux, one selected
-`gfx1201` GPU, ROCm 7.2.3, `stage-dmd-step-250`, and `--prompt-embeds` input.
+The previous v0.1.0 stable guarantee is withdrawn. The currently exercised
+environment is Linux, one selected `gfx1201` GPU, ROCm 7.2.3,
+`stage-dmd-step-250`, and `--prompt-embeds` input, but this is an engineering
+test matrix rather than a release support guarantee.
 The OpenVDN checkpoint omits its approximately 62 GB Qwen3-VL-32B prompt
 conditioner, so raw text is encoded with the pinned upstream preprocessing
 environment. OpenVDN also defines no first/last-frame or ordered-media input;
 those flags fail early and direct users to the separate MiniMax-H3
 FL2VA/Ref2VA path instead of silently applying incompatible model semantics.
 
-See the [stable release evidence](doc/VDN_ROCM_STABLE_RELEASE.md) and the
+See the [withdrawn stable release evidence](doc/VDN_ROCM_STABLE_RELEASE.md), the
 [implementation and optimization ledger](doc/VDN_ROCM_OPTIMIZATION.md) for
 commands, hashes, benchmarks, fallbacks, and known limitations.
 
@@ -215,7 +287,7 @@ baseline reports are ignored by Git.
 ### Prepare a prompt
 
 The OpenVDN checkpoint does not contain its Qwen3-VL-32B processor or prompt
-encoder. The stable native API therefore accepts an externally encoded prompt
+encoder. The current experimental native API therefore accepts an externally encoded prompt
 rather than raw `-p` text. Obtain the pinned upstream examples and convert any
 of its `prompts/*.pt` files to the small, auditable input format used here:
 
@@ -309,7 +381,7 @@ Validate a profiled record with:
 scripts/validate_vdn_profile.sh outputs/vdn-cli-smoke.mp4.inference.json
 ```
 
-The validated seed-0 smoke result is:
+The historical seed-0 mechanical smoke result is:
 
 ```text
 video: H.264, 56 frames, 64x32, 24 fps, 2.333333 s
@@ -320,13 +392,13 @@ peak GPU allocation: 9706357024 bytes (about 9.04 GiB)
 ```
 
 This result was reproduced byte-for-byte by both the lower-level end-to-end
-test and the public CLI. All 56 decoded video frames had distinct frame hashes;
-the decoded audio measured -27.5 dB mean and -14.5 dB peak, ruling out a frozen
-or silent container.
+test and the public CLI. All 56 decoded video frames had distinct frame hashes
+and the audio was non-silent, but these checks did not detect that the video
+content was noise. It is now a negative fixture, not a quality baseline.
 
 The E2E test also accepts `VDN_E2E_FRAMES`, `VDN_E2E_LATENT_H`,
 `VDN_E2E_LATENT_W`, `VDN_E2E_AUDIO_LATENTS`, and `VDN_E2E_NFE` while retaining
-the fast 64x32 defaults. The stable-release production gate uses:
+the fast 64x32 defaults. The former mechanical production gate used:
 
 ```sh
 HIP_VISIBLE_DEVICES=4 \
@@ -339,12 +411,14 @@ VDN_E2E_AUDIO_LATENTS=93 VDN_E2E_NFE=8 \
   outputs/vdn-e2e-production.mp4
 ```
 
-Two consecutive production runs completed in 486.49 and 487.20 seconds. Both
+Two consecutive mechanical runs completed in 486.49 and 487.20 seconds. Both
 produced the same 2,315,918-byte, 56-frame 512x512 MP4 with SHA-256
 `ee267508d2c988629811ce86db8d6ac7a1a8291957b792583348dc0be90eea43`.
 The denoised latent, decoded F32 video, PCM, RGB24, and final MP4 hashes all
 matched across runs; all 56 decoded frames were distinct and the audio measured
--23.5 dB mean / -9.8 dB peak.
+-23.5 dB mean / -9.8 dB peak. Visual inspection later established that the
+video is colored block noise, so these values only prove deterministic
+execution and media plumbing.
 
 The schema-v2 profiling baseline reproduced that total at 486.53 and 487.19
 seconds. A representative exact run attributed 243.05 seconds to all eight NFE
@@ -424,9 +498,11 @@ a userspace host cache were rejected because the measured physical read volume
 was only 0.356 GiB for 440.927 GiB of logical reads; Linux page cache already
 serves more than 99.9% of that stream.
 
-### OpenVDN v0.1.0 stable scope
+### Previous OpenVDN v0.1.0 scope (withdrawn)
 
-The first stable release intentionally keeps a narrow correctness surface:
+The following was the intended narrow release surface. It is retained as
+historical implementation scope, but is not a current stable guarantee until
+the upstream PyTorch semantic-parity plan passes:
 
 - `stage-dmd-step-250`, default plus turbo adapters, and exactly 8 NFE are
   validated end to end. `stage-b-step-2000` metadata is validated, but its
@@ -434,7 +510,7 @@ The first stable release intentionally keeps a narrow correctness surface:
 - The VDN path always uses all 50 blocks with `--reuse 1`, `--core-reuse 1`, no
   token reduction, and no int8 row FC2. Unsupported speed combinations fail
   explicitly rather than being silently ignored.
-- `--prompt-embeds` is the stable VDN input API and accepts the official
+- `--prompt-embeds` is the current VDN input API and accepts the official
   variable-length `[L,5120]` contract. Raw `-p` remains an explicit external
   preprocessing step because the released VDN checkpoint omits its 62 GB
   Qwen3-VL-32B conditioner.

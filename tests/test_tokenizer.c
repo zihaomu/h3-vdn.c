@@ -51,6 +51,9 @@ int main(int argc, char **argv) {
                sizeof(emoji) / sizeof(emoji[0]));
     const uint32_t special[] = {151644};
     check_case(tokenizer, "<|im_start|>", special, 1);
+    const uint32_t picture_prefix[] = {21604, 3826, 220, 16, 26818, 220};
+    check_case(tokenizer, "<Picture 1>: ", picture_prefix,
+               sizeof(picture_prefix) / sizeof(picture_prefix[0]));
     const uint32_t cinematic[] = {32, 64665, 3265, 5239, 315, 264, 8866,
                                   1778, 11958, 4633, 10971, 13};
     check_case(tokenizer,

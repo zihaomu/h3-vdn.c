@@ -59,15 +59,19 @@ static void compare_golden(const char *path, const uint32_t *ids,
     h3_st_header header;
     char error[512];
     if (!h3_st_read_header(path, &header, error, sizeof(error))) fail(error);
-    const h3_st_tensor *ids_tensor = h3_st_find(&header, "x.ids");
-    const h3_st_tensor *output_tensor = h3_st_find(&header, "x.output");
+    const h3_st_tensor *ids_tensor = h3_st_find(&header, "input.token_ids");
+    const h3_st_tensor *output_tensor = h3_st_find(
+        &header, "text.layer_50.output");
+    /* Keep legacy MLX fixtures usable as developer-only cross-checks. */
+    if (!ids_tensor) ids_tensor = h3_st_find(&header, "x.ids");
+    if (!output_tensor) output_tensor = h3_st_find(&header, "x.output");
     size_t elements = token_count * embedding->width;
     if (!ids_tensor || ids_tensor->dtype != H3_DTYPE_I32 ||
         h3_st_tensor_elements(ids_tensor) != (uint64_t)token_count ||
         !output_tensor || output_tensor->dtype != H3_DTYPE_BF16 ||
         h3_st_tensor_elements(output_tensor) != (uint64_t)elements) {
         h3_st_free_header(&header);
-        fail("real-prompt MLX fixture has the wrong schema");
+        fail("real-prompt upstream fixture has the wrong schema");
     }
     int32_t *expected_ids = malloc(token_count * sizeof(*expected_ids));
     uint16_t *expected = malloc(elements * sizeof(*expected));
@@ -81,7 +85,7 @@ static void compare_golden(const char *path, const uint32_t *ids,
     }
     for (size_t index = 0; index < token_count; index++) {
         if (expected_ids[index] < 0 || ids[index] != (uint32_t)expected_ids[index]) {
-            fail("native and MLX prompt token IDs differ");
+            fail("native and upstream prompt token IDs differ");
         }
     }
     double maximum_error = 0.0;
@@ -101,10 +105,10 @@ static void compare_golden(const char *path, const uint32_t *ids,
                                              maximum_value : 1e-12);
     double relative_l2 = sqrt(squared_error / (squared_value > 1e-24 ?
                                                 squared_value : 1e-24));
-    printf("MLX layer-50 parity: relative-max %.6g, absolute-max %.6g, "
+    printf("upstream layer-50 parity: relative-max %.6g, absolute-max %.6g, "
            "relative-L2 %.6g\n", relative_max, maximum_error, relative_l2);
     if (relative_l2 >= 0.05 || relative_max >= 0.1) {
-        fail("released Qwen output exceeds the MLX error bound");
+        fail("released Qwen output exceeds the upstream error bound");
     }
     free(expected_ids);
     free(expected);
@@ -113,7 +117,8 @@ static void compare_golden(const char *path, const uint32_t *ids,
 
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 4) {
-        fprintf(stderr, "usage: %s MODEL_ROOT [MLX_GOLDEN] [PROMPT]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL_ROOT [UPSTREAM_GOLDEN] [PROMPT]\n",
+                argv[0]);
         return 2;
     }
     const char *prompt = argc >= 4 ? argv[3] :

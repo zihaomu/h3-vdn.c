@@ -2,6 +2,7 @@
 #include "h3_safetensors.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -30,8 +31,12 @@ int main(int argc, char **argv) {
     h3_st_header fixture;
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
         die(error);
-    const h3_st_tensor *latent_tensor = h3_st_find(&fixture, "x.latent");
-    const h3_st_tensor *waveform_tensor = h3_st_find(&fixture, "x.waveform");
+    const h3_st_tensor *latent_tensor = h3_st_find(
+        &fixture, "audio.decode.normalized_latent");
+    const h3_st_tensor *waveform_tensor = h3_st_find(
+        &fixture, "audio.decode.pcm_f32");
+    if (!latent_tensor) latent_tensor = h3_st_find(&fixture, "x.latent");
+    if (!waveform_tensor) waveform_tensor = h3_st_find(&fixture, "x.waveform");
     if (!latent_tensor || latent_tensor->dtype != H3_DTYPE_F32 ||
         h3_st_tensor_elements(latent_tensor) != LATENT_COUNT ||
         !waveform_tensor || waveform_tensor->dtype != H3_DTYPE_F32 ||
@@ -68,14 +73,19 @@ int main(int argc, char **argv) {
     printf("AudioVAE waveform: max abs %.7g, relative L2 %.7g\n",
            maximum, relative_l2);
     printf("AudioVAE: %.3f GiB allocated, %.3f GPU seconds, "
-           "%llu MPS convolutions, %llu submissions\n",
+           "%llu convolution dispatches, %llu submissions\n",
            (double)got.gpu_stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
            (unsigned long long)got.gpu_stats.mps_conv_dispatches,
            (unsigned long long)got.gpu_stats.submissions);
     if (maximum >= 1e-3 || relative_l2 >= 0.05)
         die("native AudioVAE exceeds MLX parity bound");
-    if (got.gpu_stats.mps_conv_dispatches != 136 ||
+#ifdef H3_BACKEND_HIP
+    const uint64_t expected_convolutions = 135;
+#else
+    const uint64_t expected_convolutions = 136;
+#endif
+    if (got.gpu_stats.mps_conv_dispatches != expected_convolutions ||
         got.gpu_stats.submissions != 16)
         die("native AudioVAE dispatch structure changed unexpectedly");
 
@@ -83,6 +93,6 @@ int main(int argc, char **argv) {
     free(latent);
     free(want);
     h3_st_free_header(&fixture);
-    puts("ok: native Metal AudioVAE matches the corrected MLX waveform");
+    puts("ok: native AudioVAE matches the upstream waveform oracle");
     return 0;
 }

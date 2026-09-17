@@ -2,6 +2,7 @@
 #include "h3_safetensors.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -23,8 +24,12 @@ int main(int argc, char **argv) {
     h3_st_header fixture;
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
         die(error);
-    const h3_st_tensor *waveform_tensor = h3_st_find(&fixture, "x.waveform");
-    const h3_st_tensor *latent_tensor = h3_st_find(&fixture, "x.latent");
+    const h3_st_tensor *waveform_tensor = h3_st_find(
+        &fixture, "audio.encode.pcm_f32");
+    const h3_st_tensor *latent_tensor = h3_st_find(
+        &fixture, "audio.encode.normalized_latent");
+    if (!waveform_tensor) waveform_tensor = h3_st_find(&fixture, "x.waveform");
+    if (!latent_tensor) latent_tensor = h3_st_find(&fixture, "x.latent");
     if (!waveform_tensor || waveform_tensor->dtype != H3_DTYPE_F32 ||
         waveform_tensor->ndim != 3 || waveform_tensor->shape[0] != 1 ||
         waveform_tensor->shape[1] != 2 || !latent_tensor ||
@@ -69,7 +74,7 @@ int main(int argc, char **argv) {
     printf("audio encoder: max abs %.7g, relative L2 %.7g\n",
            maximum, relative_l2);
     printf("audio encoder: %.3f GiB allocated, %.3f GPU seconds, "
-           "%llu MPS convolutions, %llu MPS attention, %llu submissions\n",
+           "%llu convolution dispatches, %llu attention, %llu submissions\n",
            (double)got.gpu_stats.allocated_bytes /
                (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
@@ -78,7 +83,12 @@ int main(int argc, char **argv) {
            (unsigned long long)got.gpu_stats.submissions);
     if (maximum >= 2e-3 || relative_l2 >= 0.02)
         die("native audio encoder exceeds MLX parity bound");
-    if (got.gpu_stats.mps_conv_dispatches != 38 ||
+#ifdef H3_BACKEND_HIP
+    const uint64_t expected_convolutions = 22;
+#else
+    const uint64_t expected_convolutions = 38;
+#endif
+    if (got.gpu_stats.mps_conv_dispatches != expected_convolutions ||
         got.gpu_stats.mps_sdpa_dispatches != 1 ||
         got.gpu_stats.submissions != 26)
         die("native audio encoder dispatch structure changed unexpectedly");
@@ -87,6 +97,6 @@ int main(int argc, char **argv) {
     h3_st_free_header(&fixture);
     free(waveform);
     free(want);
-    puts("ok: native Metal audio encoder matches the MLX posterior mean");
+    puts("ok: native audio encoder matches the upstream posterior mean");
     return 0;
 }

@@ -229,12 +229,17 @@ static void h3_gpu_destroy_staging_events(h3_gpu *gpu) {
     gpu->staging_events_initialized = 0;
 }
 
+static double h3_gpu_now(void);
+
 static int h3_gpu_finish_staging_copy(h3_gpu *gpu, unsigned slot,
                                       size_t *pending_bytes, int profile) {
     if (!*pending_bytes) return 1;
+    double wait_start = profile ? h3_gpu_now() : 0.0;
     if (!h3_gpu_check(gpu, hipEventSynchronize(gpu->staging_copy_end[slot]),
                       "hipEventSynchronize weight upload")) return 0;
     if (profile) {
+        gpu->profile_totals.weight_staging_wait_seconds +=
+            h3_gpu_now() - wait_start;
         float milliseconds = 0.0f;
         if (!h3_gpu_check(
                 gpu, hipEventElapsedTime(&milliseconds,
@@ -503,7 +508,8 @@ static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
     constexpr double gib = 1024.0 * 1024.0 * 1024.0;
     std::fprintf(stderr,
         "h3 profile: %-20s %-14s read=%8.3fs (%7.3fGiB, %6.2fGiB/s) "
-        "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s) staging-hit=%llu/%llu\n",
+        "upload=%8.3fs (%7.3fGiB, %6.2fGiB/s) host-wait=%8.3fs "
+        "staging-hit=%llu/%llu\n",
         gpu->profile_label[0] ? gpu->profile_label : "HIP context",
         "weight-load", gpu->profile_totals.weight_read_seconds,
         static_cast<double>(gpu->profile_totals.weight_read_bytes) / gib,
@@ -515,6 +521,7 @@ static void h3_gpu_profile_emit_load(h3_gpu *gpu) {
         gpu->profile_totals.weight_upload_seconds > 0.0 ?
             static_cast<double>(gpu->profile_totals.weight_upload_bytes) / gib /
                 gpu->profile_totals.weight_upload_seconds : 0.0,
+        gpu->profile_totals.weight_staging_wait_seconds,
         static_cast<unsigned long long>(gpu->staging_hits),
         static_cast<unsigned long long>(gpu->staging_hits +
                                         gpu->staging_misses));
@@ -864,8 +871,15 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                           hipMemcpyAsync(destination, staging,
                                          static_cast<size_t>(got),
                                          hipMemcpyHostToDevice, gpu->stream),
-                          "hipMemcpyAsync file-to-device") ||
-            !h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
+                          "hipMemcpyAsync file-to-device")) {
+            if (error && error_size)
+                std::snprintf(error, error_size, "%s", gpu->error);
+            h3_gpu_release_staging(gpu, staging);
+            close(descriptor);
+            return 0;
+        }
+        double wait_start = profile ? h3_gpu_now() : 0.0;
+        if (!h3_gpu_check(gpu, hipStreamSynchronize(gpu->stream),
                           "hipStreamSynchronize weight upload")) {
             if (error && error_size)
                 std::snprintf(error, error_size, "%s", gpu->error);
@@ -874,6 +888,8 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
             return 0;
         }
         if (profile) {
+            gpu->profile_totals.weight_staging_wait_seconds +=
+                h3_gpu_now() - wait_start;
             gpu->profile_totals.weight_upload_seconds +=
                 h3_gpu_now() - upload_start;
             gpu->profile_totals.weight_upload_bytes +=
@@ -961,6 +977,22 @@ static int h3_gpu_count_2d(h3_gpu *gpu, uint32_t rows, uint32_t columns,
     return 1;
 }
 
+static int h3_gpu_count_dimensions(h3_gpu *gpu, const uint32_t *dimensions,
+                                   size_t dimension_count, size_t *count,
+                                   const char *label) {
+    size_t result = 1;
+    for (size_t index = 0; index < dimension_count; index++) {
+        if (!dimensions[index] || result > SIZE_MAX / dimensions[index]) {
+            h3_gpu_set_error(gpu, "invalid or overflowing %s dimensions",
+                             label);
+            return 0;
+        }
+        result *= dimensions[index];
+    }
+    *count = result;
+    return 1;
+}
+
 static int h3_gpu_require_compute(h3_gpu *gpu, const char *operation) {
     if (!gpu || !gpu->recording) {
         if (gpu)
@@ -1038,6 +1070,115 @@ __global__ static void h3_hip_binary_kernel(const T *left, const T *right,
     }
 }
 
+__global__ static void h3_hip_embedding_bf16_kernel(
+        const hip_bfloat16 *weight, const uint32_t *token_ids,
+        hip_bfloat16 *output, uint32_t elements, uint32_t vocab_size,
+        uint32_t width) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t token = index / width;
+    uint32_t column = index % width;
+    uint32_t identifier = token_ids[token];
+    output[index] = identifier < vocab_size ?
+        weight[static_cast<size_t>(identifier) * width + column] :
+        hip_bfloat16(0.0f);
+}
+
+/* Match the Metal/MLX reference operation boundary: one thread owns a whole
+ * head, so the F32 sum and in-place writes have a deterministic order. */
+__global__ static void h3_hip_head_rms_norm_bf16_kernel(
+        hip_bfloat16 *tensor, const hip_bfloat16 *weight,
+        uint32_t head_rows, uint32_t head_dim, float epsilon) {
+    uint32_t head_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (head_row >= head_rows) return;
+    size_t base = static_cast<size_t>(head_row) * head_dim;
+    float sum = 0.0f;
+    for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+        float value = static_cast<float>(tensor[base + dimension]);
+        sum = fmaf(value, value, sum);
+    }
+    float inverse = rsqrtf(sum / static_cast<float>(head_dim) + epsilon);
+    for (uint32_t dimension = 0; dimension < head_dim; dimension++) {
+        float value = static_cast<float>(tensor[base + dimension]);
+        tensor[base + dimension] = hip_bfloat16(
+            value * inverse * static_cast<float>(weight[dimension]));
+    }
+}
+
+__global__ static void h3_hip_rope_text_bf16_kernel(
+        hip_bfloat16 *query, hip_bfloat16 *key, const float *rope_cos,
+        const float *rope_sin, uint32_t sequence, uint32_t query_heads,
+        uint32_t kv_heads, uint32_t head_dim, uint32_t maximum_heads) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_rows = sequence * maximum_heads;
+    if (index >= head_rows) return;
+    uint32_t row = index / maximum_heads;
+    uint32_t head = index % maximum_heads;
+    uint32_t half_dim = head_dim / 2;
+    size_t rope_base = static_cast<size_t>(row) * half_dim;
+    if (head < query_heads) {
+        size_t base = (static_cast<size_t>(row) * query_heads + head) *
+                      head_dim;
+        for (uint32_t dimension = 0; dimension < half_dim; dimension++) {
+            float first = static_cast<float>(query[base + dimension]);
+            float second = static_cast<float>(
+                query[base + half_dim + dimension]);
+            float cosine = rope_cos[rope_base + dimension];
+            float sine = rope_sin[rope_base + dimension];
+            query[base + dimension] =
+                hip_bfloat16(first * cosine - second * sine);
+            query[base + half_dim + dimension] =
+                hip_bfloat16(second * cosine + first * sine);
+        }
+    }
+    if (head < kv_heads) {
+        size_t base = (static_cast<size_t>(row) * kv_heads + head) * head_dim;
+        for (uint32_t dimension = 0; dimension < half_dim; dimension++) {
+            float first = static_cast<float>(key[base + dimension]);
+            float second = static_cast<float>(key[base + half_dim + dimension]);
+            float cosine = rope_cos[rope_base + dimension];
+            float sine = rope_sin[rope_base + dimension];
+            key[base + dimension] =
+                hip_bfloat16(first * cosine - second * sine);
+            key[base + half_dim + dimension] =
+                hip_bfloat16(second * cosine + first * sine);
+        }
+    }
+}
+
+__global__ static void h3_hip_vision_qkv_rope_bf16_kernel(
+        const hip_bfloat16 *qkv, const hip_bfloat16 *rope_cos,
+        const hip_bfloat16 *rope_sin, hip_bfloat16 *query,
+        hip_bfloat16 *key, hip_bfloat16 *value, uint32_t elements,
+        uint32_t heads, uint32_t head_dim, uint32_t rope_half) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t dimension = index % head_dim;
+    uint32_t head_row = index / head_dim;
+    uint32_t row = head_row / heads;
+    size_t inner = static_cast<size_t>(heads) * head_dim;
+    size_t row_base = static_cast<size_t>(row) * inner * 3;
+    size_t q_base = row_base + static_cast<size_t>(head_row % heads) *
+                    head_dim;
+    size_t k_base = q_base + inner;
+    size_t v_base = q_base + inner * 2;
+    uint32_t pair = dimension < rope_half ? dimension + rope_half :
+                                               dimension - rope_half;
+    size_t rope_index = static_cast<size_t>(row) * rope_half +
+                        dimension % rope_half;
+    float cosine = static_cast<float>(rope_cos[rope_index]);
+    float sine = static_cast<float>(rope_sin[rope_index]);
+    float q0 = static_cast<float>(qkv[q_base + dimension]);
+    float k0 = static_cast<float>(qkv[k_base + dimension]);
+    float q1 = static_cast<float>(qkv[q_base + pair]);
+    float k1 = static_cast<float>(qkv[k_base + pair]);
+    query[index] = hip_bfloat16(dimension < rope_half ?
+        q0 * cosine - q1 * sine : q0 * cosine + q1 * sine);
+    key[index] = hip_bfloat16(dimension < rope_half ?
+        k0 * cosine - k1 * sine : k0 * cosine + k1 * sine);
+    value[index] = qkv[v_base + dimension];
+}
+
 __global__ static void h3_hip_add_scaled_f32_kernel(
         const float *left, const float *right, float *output,
         float left_scale, float right_scale, uint32_t elements) {
@@ -1060,6 +1201,200 @@ __global__ static void h3_hip_clip_f32_kernel(
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elements)
         output[index] = fminf(maximum, fmaxf(minimum, input[index]));
+}
+
+__global__ static void h3_hip_audio_qkv_split_f32_kernel(
+        const float *qkv, const float *q_bias, const float *k_bias,
+        const float *v_bias, float *query, float *key, float *value,
+        uint32_t elements, uint32_t width) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t column = index % width;
+    uint32_t row = index / width;
+    size_t base = static_cast<size_t>(row) * width * 3;
+    query[index] = qkv[base + column] + q_bias[column];
+    key[index] = qkv[base + width + column] + k_bias[column];
+    value[index] = qkv[base + width * 2 + column] + v_bias[column];
+}
+
+__global__ static void h3_hip_audio_attention_pool_f32_kernel(
+        const float *attended, float *output, uint32_t elements,
+        uint32_t heads, uint32_t head_dim, uint32_t output_dim) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t column = index % output_dim;
+    uint32_t row = index / output_dim;
+    uint32_t pool = head_dim / output_dim;
+    float sum = 0.0f;
+    for (uint32_t head = 0; head < heads; head++) {
+        size_t base = (static_cast<size_t>(row) * heads + head) * head_dim +
+                      static_cast<size_t>(column) * pool;
+        for (uint32_t item = 0; item < pool; item++)
+            sum += attended[base + item];
+    }
+    output[index] = sum /
+        (static_cast<float>(heads) * static_cast<float>(pool));
+}
+
+__global__ static void h3_hip_geglu_f32_kernel(
+        const float *gate, const float *linear, float *output,
+        uint32_t elements) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float value = gate[index];
+    float cube = value * value * value;
+    float gelu = 0.5f * value *
+        (1.0f + tanhf(0.7978845608028654f *
+                      (value + 0.044715f * cube)));
+    output[index] = gelu * linear[index];
+}
+
+__device__ static int h3_hip_reflect_coordinate(int coordinate, int length) {
+    if (coordinate < 0) return -coordinate;
+    if (coordinate >= length) return 2 * length - coordinate - 2;
+    return coordinate;
+}
+
+__global__ static void h3_hip_vae_encoder_pad_f32_kernel(
+        const float *input, float *output, uint32_t output_elements,
+        uint32_t depth, uint32_t height, uint32_t width, uint32_t channels,
+        uint32_t depth_front, uint32_t height_before, uint32_t height_after,
+        uint32_t width_before, uint32_t width_after) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= output_elements) return;
+    uint32_t output_width = width + width_before + width_after;
+    uint32_t output_height = height + height_before + height_after;
+    uint32_t output_depth = depth + depth_front;
+    uint32_t remaining = index;
+    uint32_t channel = remaining % channels;
+    remaining /= channels;
+    uint32_t out_x = remaining % output_width;
+    remaining /= output_width;
+    uint32_t out_y = remaining % output_height;
+    remaining /= output_height;
+    uint32_t out_t = remaining % output_depth;
+    uint32_t batch_index = remaining / output_depth;
+    if (out_t < depth_front) {
+        output[index] = 0.0f;
+        return;
+    }
+    int source_y = h3_hip_reflect_coordinate(
+        static_cast<int>(out_y) - static_cast<int>(height_before),
+        static_cast<int>(height));
+    int source_x = h3_hip_reflect_coordinate(
+        static_cast<int>(out_x) - static_cast<int>(width_before),
+        static_cast<int>(width));
+    uint32_t source_t = out_t - depth_front;
+    size_t source = ((((static_cast<size_t>(batch_index) * depth + source_t) *
+                       height + static_cast<uint32_t>(source_y)) * width +
+                      static_cast<uint32_t>(source_x)) * channels + channel);
+    output[index] = input[source];
+}
+
+__global__ static void h3_hip_conv3d_f32_kernel(
+        const float *input, const float *weight, const float *bias,
+        float *output, uint32_t output_elements, uint32_t depth,
+        uint32_t height, uint32_t width, uint32_t input_channels,
+        uint32_t output_channels, uint32_t kernel_depth,
+        uint32_t kernel_height, uint32_t kernel_width,
+        uint32_t stride_depth, uint32_t stride_height, uint32_t stride_width,
+        uint32_t output_depth, uint32_t output_height,
+        uint32_t output_width) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= output_elements) return;
+    uint32_t remaining = index;
+    uint32_t output_channel = remaining % output_channels;
+    remaining /= output_channels;
+    uint32_t out_x = remaining % output_width;
+    remaining /= output_width;
+    uint32_t out_y = remaining % output_height;
+    remaining /= output_height;
+    uint32_t out_t = remaining % output_depth;
+    uint32_t batch_index = remaining / output_depth;
+    float sum = bias ? bias[output_channel] : 0.0f;
+    for (uint32_t input_channel = 0; input_channel < input_channels;
+         input_channel++) {
+        for (uint32_t kernel_t = 0; kernel_t < kernel_depth; kernel_t++) {
+            uint32_t source_t = out_t * stride_depth + kernel_t;
+            for (uint32_t kernel_y = 0; kernel_y < kernel_height; kernel_y++) {
+                uint32_t source_y = out_y * stride_height + kernel_y;
+                for (uint32_t kernel_x = 0; kernel_x < kernel_width;
+                     kernel_x++) {
+                    uint32_t source_x = out_x * stride_width + kernel_x;
+                    size_t input_index =
+                        ((((static_cast<size_t>(batch_index) * depth + source_t) *
+                            height + source_y) * width + source_x) *
+                          input_channels + input_channel);
+                    size_t weight_index =
+                        ((((static_cast<size_t>(output_channel) *
+                            input_channels + input_channel) * kernel_depth +
+                           kernel_t) * kernel_height + kernel_y) *
+                         kernel_width + kernel_x);
+                    sum = fmaf(input[input_index], weight[weight_index], sum);
+                }
+            }
+        }
+    }
+    output[index] = sum;
+}
+
+__global__ static void h3_hip_vae_encoder_group_norm_silu_f32_kernel(
+        const float *input, const float *weight, const float *bias,
+        float *output, uint32_t rows, uint32_t height, uint32_t width,
+        uint32_t channels, uint32_t groups, float epsilon) {
+    uint32_t row = blockIdx.x;
+    uint32_t lane = threadIdx.x;
+    if (row >= rows) return;
+    uint32_t channels_per_group = channels / groups;
+    uint32_t group_index = row % groups;
+    uint32_t temporal_plane = row / groups;
+    uint32_t elements = height * width * channels_per_group;
+    extern __shared__ float reduction[];
+    float local = 0.0f;
+    for (uint32_t index = lane; index < elements; index += blockDim.x) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel = group_index * channels_per_group +
+                           index % channels_per_group;
+        size_t source = (static_cast<size_t>(temporal_plane) * height * width +
+                         spatial) * channels + channel;
+        local += input[source];
+    }
+    reduction[lane] = local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    float mean = reduction[0] / static_cast<float>(elements);
+    local = 0.0f;
+    for (uint32_t index = lane; index < elements; index += blockDim.x) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel = group_index * channels_per_group +
+                           index % channels_per_group;
+        size_t source = (static_cast<size_t>(temporal_plane) * height * width +
+                         spatial) * channels + channel;
+        float centered = input[source] - mean;
+        local = fmaf(centered, centered, local);
+    }
+    reduction[lane] = local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(reduction[0] / static_cast<float>(elements) +
+                           epsilon);
+    for (uint32_t index = lane; index < elements; index += blockDim.x) {
+        uint32_t spatial = index / channels_per_group;
+        uint32_t channel = group_index * channels_per_group +
+                           index % channels_per_group;
+        size_t destination =
+            (static_cast<size_t>(temporal_plane) * height * width + spatial) *
+            channels + channel;
+        float normalized = (input[destination] - mean) * inverse *
+                           weight[channel] + bias[channel];
+        output[destination] = normalized / (1.0f + expf(-normalized));
+    }
 }
 
 template <typename T>
@@ -1178,9 +1513,13 @@ __global__ static void h3_hip_swiglu_bf16_kernel(
     uint32_t row = index / width;
     uint32_t column = index % width;
     size_t base = static_cast<size_t>(row) * width * 2;
-    float gate = static_cast<float>(fused[base + column]);
-    float up = static_cast<float>(fused[base + width + column]);
-    output[index] = hip_bfloat16(gate / (1.0f + expf(-gate)) * up);
+    /* Diffusers SwiGLU stores [value, gate] and evaluates
+     * value * silu(gate).  Treating the first half as the gate is finite and
+     * deterministic, but semantically destroys the refiner/DiT MLP. */
+    float value = static_cast<float>(fused[base + column]);
+    float gate = static_cast<float>(fused[base + width + column]);
+    output[index] = hip_bfloat16(
+        value * (gate / (1.0f + expf(-gate))));
 }
 
 __global__ static void h3_hip_silu_mul_bf16_kernel(
@@ -1372,18 +1711,23 @@ __global__ static void h3_hip_swiglu_f32_kernel(
     uint32_t row = index / width;
     uint32_t column = index % width;
     size_t base = static_cast<size_t>(row) * width * 2;
+    /* Original H3's Video VAE FeedForward splits w1 as [gate, value]
+       and evaluates SiLU(gate) * value.  Keep this F32 path aligned with
+       the upstream module and the Metal implementation. */
     float gate = fused[base + column];
-    output[index] = gate / (1.0f + expf(-gate)) *
-                    fused[base + width + column];
+    float value = fused[base + width + column];
+    output[index] = (gate / (1.0f + expf(-gate))) * value;
 }
 
 __global__ static void h3_hip_patch_linear_bf16_kernel(
         const float *input, size_t input_offset, const float *weight,
         const float *bias, hip_bfloat16 *output, size_t output_offset,
         const uint32_t *row_map, uint32_t rows, uint32_t input_dim,
-        uint32_t output_dim, int has_bias, int mapped) {
-    uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t row = blockIdx.y;
+        uint32_t output_dim, uint32_t column_blocks,
+        int has_bias, int mapped) {
+    uint32_t row = blockIdx.x / column_blocks;
+    uint32_t column_block = blockIdx.x - row * column_blocks;
+    uint32_t column = column_block * blockDim.x + threadIdx.x;
     if (row >= rows || column >= output_dim) return;
     const float *values = input + input_offset +
                           static_cast<size_t>(row) * input_dim;
@@ -1642,8 +1986,8 @@ __global__ static void h3_hip_vdn_qk_rope_bf16_kernel(
         hip_bfloat16 *query, hip_bfloat16 *key, uint32_t sequence,
         uint32_t heads, uint32_t head_dim, uint32_t rope_half,
         float epsilon) {
-    uint32_t head = blockIdx.x;
-    uint32_t row = blockIdx.y;
+    uint32_t head = blockIdx.x % heads;
+    uint32_t row = blockIdx.x / heads;
     uint32_t lane = threadIdx.x;
     if (head >= heads || row >= sequence) return;
     extern __shared__ float reduction[];
@@ -2526,6 +2870,36 @@ __global__ static void h3_hip_sdpa_kernel(
     }
 }
 
+/* QK and PV are rocBLAS BF16 GEMMs below.  This kernel preserves the two
+ * materialization boundaries between them: BF16 scaling and F32 softmax
+ * followed by BF16 probabilities, exactly as Transformers eager specifies. */
+__global__ static void h3_hip_gqa_softmax_bf16_kernel(
+        hip_bfloat16 *scores, uint32_t sequence, uint32_t query_heads,
+        float scale) {
+    uint32_t item = blockIdx.x;
+    uint32_t query_row = item % sequence;
+    uint32_t query_head = item / sequence;
+    if (threadIdx.x || query_head >= query_heads) return;
+    hip_bfloat16 *row = scores +
+        (static_cast<size_t>(query_head) * sequence + query_row) * sequence;
+    uint32_t key_count = query_row + 1;
+    float maximum = -INFINITY;
+    for (uint32_t key_row = 0; key_row < key_count; key_row++) {
+        row[key_row] = hip_bfloat16(
+            static_cast<float>(row[key_row]) * scale);
+        maximum = fmaxf(maximum, static_cast<float>(row[key_row]));
+    }
+    float denominator = 0.0f;
+    for (uint32_t key_row = 0; key_row < key_count; key_row++)
+        denominator += expf(static_cast<float>(row[key_row]) - maximum);
+    float inverse = 1.0f / denominator;
+    for (uint32_t key_row = 0; key_row < key_count; key_row++)
+        row[key_row] = hip_bfloat16(
+            expf(static_cast<float>(row[key_row]) - maximum) * inverse);
+    for (uint32_t key_row = key_count; key_row < sequence; key_row++)
+        row[key_row] = hip_bfloat16(0.0f);
+}
+
 /* Exact specialization for the video VAE shape. The scalar
  * D=64 kernel starts with 256 threads, but only lanes 0..63 contribute. Its
  * 128/64 reduction steps add zero before d and d+32 are paired. One wave can
@@ -2806,8 +3180,15 @@ static int h3_gpu_patch_linear(h3_gpu *gpu, h3_gpu_tensor *output,
         (row_map && !h3_gpu_require_tensor(gpu, row_map, rows, H3_GPU_U32,
                                            "patch row map")))
         return 0;
+    uint32_t column_blocks =
+        (output_dim + H3_HIP_THREADS - 1) / H3_HIP_THREADS;
+    uint64_t grid_blocks = (uint64_t)rows * column_blocks;
+    if (grid_blocks > UINT32_MAX) {
+        h3_gpu_set_error(gpu, "patch projection grid is too large");
+        return 0;
+    }
     dim3 block(H3_HIP_THREADS);
-    dim3 grid((output_dim + H3_HIP_THREADS - 1) / H3_HIP_THREADS, rows);
+    dim3 grid((uint32_t)grid_blocks);
     hipLaunchKernelGGL(h3_hip_patch_linear_bf16_kernel, grid, block, 0,
                        gpu->stream, static_cast<const float *>(input->data),
                        input_offset, static_cast<const float *>(weight->data),
@@ -2815,7 +3196,8 @@ static int h3_gpu_patch_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                        static_cast<hip_bfloat16 *>(output->data), output_offset,
                        row_map ? static_cast<const uint32_t *>(row_map->data) :
                                  nullptr,
-                       rows, input_dim, output_dim, bias ? 1 : 0,
+                       rows, input_dim, output_dim, column_blocks,
+                       bias ? 1 : 0,
                        row_map ? 1 : 0);
     return h3_gpu_kernel_enqueued(gpu, "patch projection kernel");
 }
@@ -3851,7 +4233,44 @@ extern "C" int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
                        const h3_gpu_tensor *v_bias, uint32_t batch,
                        uint32_t length, uint32_t heads,
                        uint32_t head_dim) {
-    return h3_gpu_unsupported(gpu, __func__);
+    uint32_t width_dimensions[] = {heads, head_dim};
+    uint32_t tensor_dimensions[] = {batch, length, heads, head_dim};
+    size_t width_size, elements_size;
+    if (!h3_gpu_require_compute(gpu, __func__) ||
+        !h3_gpu_count_dimensions(gpu, width_dimensions, 2, &width_size,
+                                 "audio QKV width") ||
+        !h3_gpu_count_dimensions(gpu, tensor_dimensions, 4, &elements_size,
+                                 "audio QKV tensor") ||
+        width_size > UINT32_MAX || elements_size > UINT32_MAX ||
+        elements_size > SIZE_MAX / 3)
+        return 0;
+    uint32_t width = static_cast<uint32_t>(width_size);
+    uint32_t elements = static_cast<uint32_t>(elements_size);
+    if (!h3_gpu_require_tensor(gpu, qkv, static_cast<size_t>(elements) * 3,
+                               H3_GPU_F32, "audio QKV") ||
+        !h3_gpu_require_tensor(gpu, q_bias, width, H3_GPU_F32,
+                               "audio Q bias") ||
+        !h3_gpu_require_tensor(gpu, k_bias, width, H3_GPU_F32,
+                               "audio K bias") ||
+        !h3_gpu_require_tensor(gpu, v_bias, width, H3_GPU_F32,
+                               "audio V bias") ||
+        !h3_gpu_require_tensor(gpu, query, elements, H3_GPU_F32,
+                               "audio query") ||
+        !h3_gpu_require_tensor(gpu, key, elements, H3_GPU_F32,
+                               "audio key") ||
+        !h3_gpu_require_tensor(gpu, value, elements, H3_GPU_F32,
+                               "audio value"))
+        return 0;
+    hipLaunchKernelGGL(h3_hip_audio_qkv_split_f32_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream, static_cast<const float *>(qkv->data),
+                       static_cast<const float *>(q_bias->data),
+                       static_cast<const float *>(k_bias->data),
+                       static_cast<const float *>(v_bias->data),
+                       static_cast<float *>(query->data),
+                       static_cast<float *>(key->data),
+                       static_cast<float *>(value->data), elements, width);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_sdpa_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3869,13 +4288,48 @@ extern "C" int h3_gpu_audio_attention_pool_f32(h3_gpu *gpu,
                        const h3_gpu_tensor *attended, uint32_t batch,
                        uint32_t length, uint32_t heads,
                        uint32_t head_dim, uint32_t output_dim) {
-    return h3_gpu_unsupported(gpu, __func__);
+    uint32_t input_dimensions[] = {batch, length, heads, head_dim};
+    uint32_t output_dimensions[] = {batch, length, output_dim};
+    size_t input_count, output_count;
+    if (!h3_gpu_require_compute(gpu, __func__) || !output_dim ||
+        head_dim % output_dim ||
+        !h3_gpu_count_dimensions(gpu, input_dimensions, 4, &input_count,
+                                 "audio attended values") ||
+        !h3_gpu_count_dimensions(gpu, output_dimensions, 3, &output_count,
+                                 "audio pooled values") ||
+        output_count > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, attended, input_count, H3_GPU_F32,
+                               "audio attended values") ||
+        !h3_gpu_require_tensor(gpu, output, output_count, H3_GPU_F32,
+                               "audio pooled values"))
+        return 0;
+    uint32_t elements = static_cast<uint32_t>(output_count);
+    hipLaunchKernelGGL(h3_hip_audio_attention_pool_f32_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream,
+                       static_cast<const float *>(attended->data),
+                       static_cast<float *>(output->data), elements, heads,
+                       head_dim, output_dim);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_geglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *gate,
                      const h3_gpu_tensor *linear, uint32_t elements) {
-    return h3_gpu_unsupported(gpu, __func__);
+    if (!h3_gpu_require_compute(gpu, __func__) || !elements ||
+        !h3_gpu_require_tensor(gpu, gate, elements, H3_GPU_F32,
+                               "GeGLU gate") ||
+        !h3_gpu_require_tensor(gpu, linear, elements, H3_GPU_F32,
+                               "GeGLU linear") ||
+        !h3_gpu_require_tensor(gpu, output, elements, H3_GPU_F32,
+                               "GeGLU output"))
+        return 0;
+    hipLaunchKernelGGL(h3_hip_geglu_f32_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream, static_cast<const float *>(gate->data),
+                       static_cast<const float *>(linear->data),
+                       static_cast<float *>(output->data), elements);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_clip_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3901,7 +4355,43 @@ extern "C" int h3_gpu_vae_encoder_pad_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     uint32_t channels, uint32_t depth_front,
                     uint32_t height_before, uint32_t height_after,
                     uint32_t width_before, uint32_t width_after) {
-    return h3_gpu_unsupported(gpu, __func__);
+    if (!h3_gpu_require_compute(gpu, __func__) || !batch || !depth ||
+        height < 2 || width < 2 || !channels || height_before >= height ||
+        height_after >= height || width_before >= width ||
+        width_after >= width || depth_front > UINT32_MAX - depth ||
+        height_before > UINT32_MAX - height ||
+        height_after > UINT32_MAX - height - height_before ||
+        width_before > UINT32_MAX - width ||
+        width_after > UINT32_MAX - width - width_before)
+        return 0;
+    uint32_t output_depth = depth + depth_front;
+    uint32_t output_height = height + height_before + height_after;
+    uint32_t output_width = width + width_before + width_after;
+    uint32_t input_dimensions[] = {
+        batch, depth, height, width, channels
+    };
+    uint32_t output_dimensions[] = {
+        batch, output_depth, output_height, output_width, channels
+    };
+    size_t input_count, output_count;
+    if (!h3_gpu_count_dimensions(gpu, input_dimensions, 5, &input_count,
+                                 "VAE encoder pad input") ||
+        !h3_gpu_count_dimensions(gpu, output_dimensions, 5, &output_count,
+                                 "VAE encoder pad output") ||
+        output_count > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, input, input_count, H3_GPU_F32,
+                               "VAE encoder pad input") ||
+        !h3_gpu_require_tensor(gpu, output, output_count, H3_GPU_F32,
+                               "VAE encoder pad output"))
+        return 0;
+    uint32_t elements = static_cast<uint32_t>(output_count);
+    hipLaunchKernelGGL(h3_hip_vae_encoder_pad_f32_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream, static_cast<const float *>(input->data),
+                       static_cast<float *>(output->data), elements, depth,
+                       height, width, channels, depth_front, height_before,
+                       height_after, width_before, width_after);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3913,7 +4403,55 @@ extern "C" int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t kernel_depth, uint32_t kernel_height,
                       uint32_t kernel_width, uint32_t stride_depth,
                       uint32_t stride_height, uint32_t stride_width) {
-    return h3_gpu_unsupported(gpu, __func__);
+    if (!h3_gpu_require_compute(gpu, __func__) || !batch || !depth ||
+        !height || !width || !input_channels || !output_channels ||
+        !kernel_depth || !kernel_height || !kernel_width || !stride_depth ||
+        !stride_height || !stride_width || depth < kernel_depth ||
+        height < kernel_height || width < kernel_width)
+        return 0;
+    uint32_t output_depth = (depth - kernel_depth) / stride_depth + 1;
+    uint32_t output_height = (height - kernel_height) / stride_height + 1;
+    uint32_t output_width = (width - kernel_width) / stride_width + 1;
+    uint32_t input_dimensions[] = {
+        batch, depth, height, width, input_channels
+    };
+    uint32_t weight_dimensions[] = {
+        output_channels, input_channels, kernel_depth, kernel_height,
+        kernel_width
+    };
+    uint32_t output_dimensions[] = {
+        batch, output_depth, output_height, output_width, output_channels
+    };
+    size_t input_count, weight_count, output_count;
+    if (!h3_gpu_count_dimensions(gpu, input_dimensions, 5, &input_count,
+                                 "Conv3d input") ||
+        !h3_gpu_count_dimensions(gpu, weight_dimensions, 5, &weight_count,
+                                 "Conv3d weight") ||
+        !h3_gpu_count_dimensions(gpu, output_dimensions, 5, &output_count,
+                                 "Conv3d output") ||
+        output_count > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, input, input_count, H3_GPU_F32,
+                               "Conv3d input") ||
+        !h3_gpu_require_tensor(gpu, weight, weight_count, H3_GPU_F32,
+                               "Conv3d weight") ||
+        !h3_gpu_require_tensor(gpu, output, output_count, H3_GPU_F32,
+                               "Conv3d output") ||
+        (bias && !h3_gpu_require_tensor(gpu, bias, output_channels,
+                                        H3_GPU_F32, "Conv3d bias")))
+        return 0;
+    uint32_t elements = static_cast<uint32_t>(output_count);
+    hipLaunchKernelGGL(h3_hip_conv3d_f32_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream, static_cast<const float *>(input->data),
+                       static_cast<const float *>(weight->data),
+                       bias ? static_cast<const float *>(bias->data) : nullptr,
+                       static_cast<float *>(output->data), elements, depth,
+                       height, width, input_channels, output_channels,
+                       kernel_depth, kernel_height, kernel_width, stride_depth,
+                       stride_height, stride_width, output_depth,
+                       output_height, output_width);
+    gpu->stats.mps_conv_dispatches++;
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_vae_encoder_group_norm_silu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -3922,7 +4460,39 @@ extern "C" int h3_gpu_vae_encoder_group_norm_silu_f32(h3_gpu *gpu, h3_gpu_tensor
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon) {
-    return h3_gpu_unsupported(gpu, __func__);
+    if (!h3_gpu_require_compute(gpu, __func__) || !groups ||
+        channels % groups || !(epsilon > 0.0f) || !std::isfinite(epsilon))
+        return 0;
+    uint32_t dimensions[] = {batch, depth, height, width, channels};
+    uint32_t row_dimensions[] = {batch, depth, groups};
+    uint32_t group_dimensions[] = {height, width, channels / groups};
+    size_t count, rows_size, group_elements;
+    if (!h3_gpu_count_dimensions(gpu, dimensions, 5, &count,
+                                 "VAE encoder norm tensor") ||
+        !h3_gpu_count_dimensions(gpu, row_dimensions, 3, &rows_size,
+                                 "VAE encoder norm rows") ||
+        !h3_gpu_count_dimensions(gpu, group_dimensions, 3, &group_elements,
+                                 "VAE encoder norm group") ||
+        rows_size > UINT32_MAX || group_elements > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, input, count, H3_GPU_F32,
+                               "VAE encoder norm input") ||
+        !h3_gpu_require_tensor(gpu, weight, channels, H3_GPU_F32,
+                               "VAE encoder norm weight") ||
+        !h3_gpu_require_tensor(gpu, bias, channels, H3_GPU_F32,
+                               "VAE encoder norm bias") ||
+        !h3_gpu_require_tensor(gpu, output, count, H3_GPU_F32,
+                               "VAE encoder norm output"))
+        return 0;
+    uint32_t rows = static_cast<uint32_t>(rows_size);
+    hipLaunchKernelGGL(h3_hip_vae_encoder_group_norm_silu_f32_kernel,
+                       dim3(rows), dim3(H3_HIP_THREADS),
+                       H3_HIP_THREADS * sizeof(float), gpu->stream,
+                       static_cast<const float *>(input->data),
+                       static_cast<const float *>(weight->data),
+                       static_cast<const float *>(bias->data),
+                       static_cast<float *>(output->data), rows, height,
+                       width, channels, groups, epsilon);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -4268,7 +4838,42 @@ extern "C" int h3_gpu_vision_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                      const h3_gpu_tensor *rope_sin, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim,
                      uint32_t rope_half) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t head_rows, elements, rope_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) ||
+        rope_half > UINT32_MAX / 2 || rope_half * 2 != head_dim ||
+        !h3_gpu_count_2d(gpu, sequence, heads, &head_rows,
+                         "vision QKV rows") ||
+        head_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(head_rows), head_dim,
+                         &elements, "vision QKV output") ||
+        elements > UINT32_MAX || elements > SIZE_MAX / 3 ||
+        !h3_gpu_count_2d(gpu, sequence, rope_half, &rope_elements,
+                         "vision RoPE table") ||
+        !h3_gpu_require_tensor(gpu, qkv, elements * 3, H3_GPU_BF16,
+                               "vision QKV") ||
+        !h3_gpu_require_tensor(gpu, rope_cos, rope_elements, H3_GPU_BF16,
+                               "vision RoPE cosine") ||
+        !h3_gpu_require_tensor(gpu, rope_sin, rope_elements, H3_GPU_BF16,
+                               "vision RoPE sine") ||
+        !h3_gpu_require_tensor(gpu, query, elements, H3_GPU_BF16,
+                               "vision query") ||
+        !h3_gpu_require_tensor(gpu, key, elements, H3_GPU_BF16,
+                               "vision key") ||
+        !h3_gpu_require_tensor(gpu, value, elements, H3_GPU_BF16,
+                               "vision value"))
+        return 0;
+    uint32_t count = static_cast<uint32_t>(elements);
+    hipLaunchKernelGGL(h3_hip_vision_qkv_rope_bf16_kernel,
+                       h3_gpu_grid_1d(count), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream,
+                       static_cast<const hip_bfloat16 *>(qkv->data),
+                       static_cast<const hip_bfloat16 *>(rope_cos->data),
+                       static_cast<const hip_bfloat16 *>(rope_sin->data),
+                       static_cast<hip_bfloat16 *>(query->data),
+                       static_cast<hip_bfloat16 *>(key->data),
+                       static_cast<hip_bfloat16 *>(value->data), count, heads,
+                       head_dim, rope_half);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_adaln_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -4473,7 +5078,9 @@ extern "C" int h3_gpu_vdn_qk_rope_bf16(
                      uint32_t head_dim, uint32_t rope_half,
                      float epsilon) {
     size_t inner, elements, rope_elements;
+    uint64_t blocks = (uint64_t)sequence * heads;
     if (!h3_gpu_require_compute(gpu, __func__) || !heads || !head_dim ||
+        blocks > UINT32_MAX ||
         rope_half > head_dim / 2 || epsilon < 0.0f ||
         !h3_gpu_count_2d(gpu, heads, head_dim, &inner, "VDN QK inner") ||
         inner > UINT32_MAX ||
@@ -4501,7 +5108,8 @@ extern "C" int h3_gpu_vdn_qk_rope_bf16(
                                "VDN key"))
         return 0;
     hipLaunchKernelGGL(h3_hip_vdn_qk_rope_bf16_kernel,
-                       dim3(heads, sequence), dim3(H3_HIP_THREADS),
+                       dim3(static_cast<uint32_t>(blocks)),
+                       dim3(H3_HIP_THREADS),
                        H3_HIP_THREADS * sizeof(float) * 2, gpu->stream,
                        static_cast<const hip_bfloat16 *>(query_raw->data),
                        static_cast<const hip_bfloat16 *>(key_raw->data),
@@ -5493,7 +6101,29 @@ extern "C" int h3_gpu_embedding_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *weight,
                           const h3_gpu_tensor *token_ids, uint32_t tokens,
                           uint32_t vocab_size, uint32_t width) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t weight_elements, output_elements;
+    if (!h3_gpu_require_compute(gpu, __func__) ||
+        !h3_gpu_count_2d(gpu, vocab_size, width, &weight_elements,
+                         "embedding weight") ||
+        !h3_gpu_count_2d(gpu, tokens, width, &output_elements,
+                         "embedding output") ||
+        output_elements > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, weight, weight_elements, H3_GPU_BF16,
+                               "embedding weight") ||
+        !h3_gpu_require_tensor(gpu, token_ids, tokens, H3_GPU_U32,
+                               "token IDs") ||
+        !h3_gpu_require_tensor(gpu, output, output_elements, H3_GPU_BF16,
+                               "embedding output"))
+        return 0;
+    uint32_t elements = static_cast<uint32_t>(output_elements);
+    hipLaunchKernelGGL(h3_hip_embedding_bf16_kernel,
+                       h3_gpu_grid_1d(elements), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream,
+                       static_cast<const hip_bfloat16 *>(weight->data),
+                       static_cast<const uint32_t *>(token_ids->data),
+                       static_cast<hip_bfloat16 *>(output->data), elements,
+                       vocab_size, width);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_text_qk_rope_bf16(h3_gpu *gpu,
@@ -5515,7 +6145,27 @@ extern "C" int h3_gpu_head_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
                               const h3_gpu_tensor *weight,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, float epsilon) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t head_rows_size, elements;
+    if (!h3_gpu_require_compute(gpu, __func__) || epsilon < 0.0f ||
+        !std::isfinite(epsilon) ||
+        !h3_gpu_count_2d(gpu, sequence, heads, &head_rows_size,
+                         "head RMSNorm rows") ||
+        head_rows_size > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(head_rows_size),
+                         head_dim, &elements, "head RMSNorm tensor") ||
+        !h3_gpu_require_tensor(gpu, tensor, elements, H3_GPU_BF16,
+                               "head norm tensor") ||
+        !h3_gpu_require_tensor(gpu, weight, head_dim, H3_GPU_BF16,
+                               "head norm weight"))
+        return 0;
+    uint32_t head_rows = static_cast<uint32_t>(head_rows_size);
+    hipLaunchKernelGGL(h3_hip_head_rms_norm_bf16_kernel,
+                       h3_gpu_grid_1d(head_rows), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream,
+                       static_cast<hip_bfloat16 *>(tensor->data),
+                       static_cast<const hip_bfloat16 *>(weight->data),
+                       head_rows, head_dim, epsilon);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
@@ -5524,7 +6174,43 @@ extern "C" int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t query_rows, key_rows, query_elements, key_elements, rope_elements;
+    uint32_t maximum_heads = query_heads > kv_heads ? query_heads : kv_heads;
+    if (!h3_gpu_require_compute(gpu, __func__) || !kv_heads ||
+        query_heads % kv_heads || head_dim % 2 ||
+        !h3_gpu_count_2d(gpu, sequence, query_heads, &query_rows,
+                         "text RoPE query rows") ||
+        query_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(query_rows), head_dim,
+                         &query_elements, "text RoPE query") ||
+        !h3_gpu_count_2d(gpu, sequence, kv_heads, &key_rows,
+                         "text RoPE key rows") ||
+        key_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(key_rows), head_dim,
+                         &key_elements, "text RoPE key") ||
+        !h3_gpu_count_2d(gpu, sequence, head_dim / 2, &rope_elements,
+                         "text RoPE table") ||
+        static_cast<size_t>(sequence) * maximum_heads > UINT32_MAX ||
+        !h3_gpu_require_tensor(gpu, query, query_elements, H3_GPU_BF16,
+                               "RoPE query") ||
+        !h3_gpu_require_tensor(gpu, key, key_elements, H3_GPU_BF16,
+                               "RoPE key") ||
+        !h3_gpu_require_tensor(gpu, rope_cos_f32, rope_elements, H3_GPU_F32,
+                               "RoPE cosine") ||
+        !h3_gpu_require_tensor(gpu, rope_sin_f32, rope_elements, H3_GPU_F32,
+                               "RoPE sine"))
+        return 0;
+    uint32_t head_rows = sequence * maximum_heads;
+    hipLaunchKernelGGL(h3_hip_rope_text_bf16_kernel,
+                       h3_gpu_grid_1d(head_rows), dim3(H3_HIP_THREADS), 0,
+                       gpu->stream,
+                       static_cast<hip_bfloat16 *>(query->data),
+                       static_cast<hip_bfloat16 *>(key->data),
+                       static_cast<const float *>(rope_cos_f32->data),
+                       static_cast<const float *>(rope_sin_f32->data),
+                       sequence, query_heads, kv_heads, head_dim,
+                       maximum_heads);
+    return h3_gpu_kernel_enqueued(gpu, __func__);
 }
 
 extern "C" int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -5534,7 +6220,112 @@ extern "C" int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            uint32_t sequence, uint32_t query_heads,
                            uint32_t kv_heads, uint32_t head_dim,
                            float scale) {
-    return h3_gpu_unsupported(gpu, __func__);
+    size_t query_rows, kv_rows, query_elements, kv_elements;
+    size_t score_rows, score_elements;
+    uint64_t query_stride = static_cast<uint64_t>(query_heads) * head_dim;
+    uint64_t kv_stride = static_cast<uint64_t>(kv_heads) * head_dim;
+    if (!h3_gpu_require_compute(gpu, __func__) || !sequence || !query_heads ||
+        !kv_heads || !head_dim ||
+        query_heads % kv_heads ||
+        sequence > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        query_heads > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        kv_heads > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        head_dim > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        query_stride > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+        kv_stride > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+        !std::isfinite(scale) ||
+        !h3_gpu_count_2d(gpu, sequence, query_heads, &query_rows,
+                         "causal GQA query rows") ||
+        query_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(query_rows), head_dim,
+                         &query_elements, "causal GQA query") ||
+        !h3_gpu_count_2d(gpu, sequence, kv_heads, &kv_rows,
+                         "causal GQA KV rows") ||
+        kv_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, query_heads, sequence, &score_rows,
+                         "causal GQA score rows") ||
+        score_rows > UINT32_MAX ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(score_rows), sequence,
+                         &score_elements, "causal GQA scores") ||
+        !h3_gpu_count_2d(gpu, static_cast<uint32_t>(kv_rows), head_dim,
+                         &kv_elements, "causal GQA KV") ||
+        !h3_gpu_require_tensor(gpu, query, query_elements, H3_GPU_BF16,
+                               "GQA query") ||
+        !h3_gpu_require_tensor(gpu, key, kv_elements, H3_GPU_BF16,
+                               "GQA key") ||
+        !h3_gpu_require_tensor(gpu, value, kv_elements, H3_GPU_BF16,
+                               "GQA value") ||
+        !h3_gpu_require_tensor(gpu, output, query_elements, H3_GPU_BF16,
+                               "GQA output"))
+        return 0;
+    h3_gpu_tensor *score_tensor = h3_gpu_tensor_new_bf16(gpu, score_elements);
+    if (!score_tensor) return 0;
+    h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    auto *query_data = static_cast<const hip_bfloat16 *>(query->data);
+    auto *key_data = static_cast<const hip_bfloat16 *>(key->data);
+    auto *value_data = static_cast<const hip_bfloat16 *>(value->data);
+    auto *output_data = static_cast<hip_bfloat16 *>(output->data);
+    auto *score_data = static_cast<hip_bfloat16 *>(score_tensor->data);
+    uint32_t groups = query_heads / kv_heads;
+    for (uint32_t query_head = 0; query_head < query_heads; query_head++) {
+        uint32_t kv_head = query_head / groups;
+        rocblas_status status = rocblas_gemm_ex(
+            gpu->blas, rocblas_operation_transpose, rocblas_operation_none,
+            static_cast<rocblas_int>(sequence),
+            static_cast<rocblas_int>(sequence),
+            static_cast<rocblas_int>(head_dim), &alpha,
+            key_data + static_cast<size_t>(kv_head) * head_dim,
+            rocblas_datatype_bf16_r,
+            static_cast<rocblas_int>(kv_stride),
+            query_data + static_cast<size_t>(query_head) * head_dim,
+            rocblas_datatype_bf16_r,
+            static_cast<rocblas_int>(query_stride), &beta,
+            score_data + static_cast<size_t>(query_head) * sequence * sequence,
+            rocblas_datatype_bf16_r, static_cast<rocblas_int>(sequence),
+            score_data + static_cast<size_t>(query_head) * sequence * sequence,
+            rocblas_datatype_bf16_r, static_cast<rocblas_int>(sequence),
+            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        if (!h3_gpu_check_blas(gpu, status, "rocblas Qwen QK")) {
+            h3_gpu_tensor_free(score_tensor);
+            return 0;
+        }
+    }
+    hipLaunchKernelGGL(h3_hip_gqa_softmax_bf16_kernel,
+                       dim3(sequence * query_heads), dim3(1), 0, gpu->stream,
+                       score_data, sequence, query_heads, scale);
+    if (!h3_gpu_kernel_enqueued(gpu, "Qwen GQA softmax")) {
+        h3_gpu_tensor_free(score_tensor);
+        return 0;
+    }
+    for (uint32_t query_head = 0; query_head < query_heads; query_head++) {
+        uint32_t kv_head = query_head / groups;
+        rocblas_status status = rocblas_gemm_ex(
+            gpu->blas, rocblas_operation_none, rocblas_operation_none,
+            static_cast<rocblas_int>(head_dim),
+            static_cast<rocblas_int>(sequence),
+            static_cast<rocblas_int>(sequence), &alpha,
+            value_data + static_cast<size_t>(kv_head) * head_dim,
+            rocblas_datatype_bf16_r,
+            static_cast<rocblas_int>(kv_stride),
+            score_data + static_cast<size_t>(query_head) * sequence * sequence,
+            rocblas_datatype_bf16_r, static_cast<rocblas_int>(sequence),
+            &beta, output_data + static_cast<size_t>(query_head) * head_dim,
+            rocblas_datatype_bf16_r,
+            static_cast<rocblas_int>(query_stride),
+            output_data + static_cast<size_t>(query_head) * head_dim,
+            rocblas_datatype_bf16_r,
+            static_cast<rocblas_int>(query_stride),
+            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        if (!h3_gpu_check_blas(gpu, status, "rocblas Qwen PV")) {
+            h3_gpu_tensor_free(score_tensor);
+            return 0;
+        }
+    }
+    h3_gpu_tensor_free(score_tensor);
+    gpu->stats.mps_sdpa_dispatches++;
+    return 1;
 }
 
 extern "C" int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

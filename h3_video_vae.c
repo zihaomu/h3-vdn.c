@@ -358,10 +358,13 @@ static int load_latent_normalization(const char *weight_directory,
         fail(error, error_size, "out of memory resolving video VAE config");
         return 0;
     }
-    snprintf(path, path_size, "%s/config.json", weight_directory);
+    /* The official bundle stores latent normalization in the component
+       config one level above source/model.safetensors.  Prefer that file;
+       retain the in-directory fallback for legacy flattened layouts. */
+    snprintf(path, path_size, "%s/../config.json", weight_directory);
     FILE *file = fopen(path, "rb");
     if (!file) {
-        snprintf(path, path_size, "%s/../config.json", weight_directory);
+        snprintf(path, path_size, "%s/config.json", weight_directory);
         file = fopen(path, "rb");
     }
     if (!file || fseek(file, 0, SEEK_END)) {

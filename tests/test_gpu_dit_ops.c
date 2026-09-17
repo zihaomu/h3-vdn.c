@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint16_t bf16(float value) {
@@ -53,6 +54,8 @@ int main(void) {
         fprintf(stderr, "cannot create HIP context: %s\n", error);
         return 1;
     }
+    float *large_patch_input = NULL;
+    uint16_t *large_patch_output = NULL;
 
     h3_gpu_tensor *owned[32] = {0};
     size_t owned_count = 0;
@@ -124,6 +127,29 @@ int main(void) {
     h3_gpu_tensor *patch_output_t = OWN(h3_gpu_tensor_new_bf16(gpu, 4));
     CHECK(patch_input_t && patch_weight_t && patch_bias_t && patch_output_t);
 
+    /* Cross the HIP grid.y limit that the official VDN geometry exceeds.
+     * Width one keeps this launch-boundary regression small. */
+    enum { LARGE_PATCH_ROWS = 65536 };
+    large_patch_input = malloc(
+        (size_t)LARGE_PATCH_ROWS * sizeof(*large_patch_input));
+    large_patch_output = malloc(
+        (size_t)LARGE_PATCH_ROWS * sizeof(*large_patch_output));
+    CHECK(large_patch_input && large_patch_output);
+    for (size_t row = 0; row < LARGE_PATCH_ROWS; row++)
+        large_patch_input[row] = (float)((int)(row % 17) - 8);
+    const float large_patch_weight[] = {0.5f};
+    const float large_patch_bias[] = {0.25f};
+    h3_gpu_tensor *large_patch_input_t = OWN(h3_gpu_tensor_from_f32(
+        gpu, large_patch_input, LARGE_PATCH_ROWS));
+    h3_gpu_tensor *large_patch_weight_t = OWN(h3_gpu_tensor_from_f32(
+        gpu, large_patch_weight, 1));
+    h3_gpu_tensor *large_patch_bias_t = OWN(h3_gpu_tensor_from_f32(
+        gpu, large_patch_bias, 1));
+    h3_gpu_tensor *large_patch_output_t = OWN(
+        h3_gpu_tensor_new_bf16(gpu, LARGE_PATCH_ROWS));
+    CHECK(large_patch_input_t && large_patch_weight_t && large_patch_bias_t &&
+          large_patch_output_t);
+
     const float mlp_input_f[] = {1.0f, -2.0f};
     const float mlp_fc1_f[] = {1, 0, 0, 1, 2, 1, -1, 1};
     const float mlp_fc2_f[] = {1, 2, -1, 0.5f};
@@ -155,6 +181,9 @@ int main(void) {
                            2, 1, 4, 0.5f));
     CHECK(h3_gpu_patch_linear_bf16(gpu, patch_output_t, patch_input_t,
                                    patch_weight_t, patch_bias_t, 2, 3, 2));
+    CHECK(h3_gpu_patch_linear_bf16(
+        gpu, large_patch_output_t, large_patch_input_t, large_patch_weight_t,
+        large_patch_bias_t, LARGE_PATCH_ROWS, 1, 1));
     CHECK(h3_gpu_mlp_bf16(gpu, mlp_output_t, mlp_input_t, mlp_fc1_t,
                           mlp_fc2_t, 1, 2, 2, 2));
     CHECK(h3_gpu_submit(gpu));
@@ -220,15 +249,37 @@ int main(void) {
     const float patch_expected[] = {-1.75f, 3.5f, -2.75f, -2.0f};
     CHECK(h3_gpu_tensor_read_bf16(patch_output_t, patch, 4));
     CHECK(compare(patch, patch_expected, 4, 0.02f, "patch projection"));
+    CHECK(h3_gpu_tensor_read_bf16(
+        large_patch_output_t, large_patch_output, LARGE_PATCH_ROWS));
+    for (size_t row = 0; row < LARGE_PATCH_ROWS; row++) {
+        uint16_t expected_value = bf16(large_patch_input[row] * 0.5f + 0.25f);
+        if (large_patch_output[row] != expected_value) {
+            fprintf(stderr, "large patch projection[%zu]: got %.7f expected %.7f\n",
+                    row, f32(large_patch_output[row]), f32(expected_value));
+            ok = 0;
+            goto done;
+        }
+    }
 
     uint16_t mlp_output[2];
-    float gate = -2.0f;
-    float activated = f32(bf16(gate / (1.0f + expf(-gate)) * -3.0f));
-    const float mlp_expected[] = {activated * 2.0f, activated * 0.5f};
+    const float value0 = 1.0f;
+    const float value1 = -2.0f;
+    const float gate0 = 0.0f;
+    const float gate1 = -3.0f;
+    const float activated0 = f32(bf16(
+        value0 * gate0 / (1.0f + expf(-gate0))));
+    const float activated1 = f32(bf16(
+        value1 * gate1 / (1.0f + expf(-gate1))));
+    const float mlp_expected[] = {
+        activated0 + activated1 * 2.0f,
+        -activated0 + activated1 * 0.5f,
+    };
     CHECK(h3_gpu_tensor_read_bf16(mlp_output_t, mlp_output, 2));
     CHECK(compare(mlp_output, mlp_expected, 2, 0.025f, "fused MLP"));
 
 done:
+    free(large_patch_output);
+    free(large_patch_input);
     for (size_t index = owned_count; index; index--)
         h3_gpu_tensor_free(owned[index - 1]);
     h3_gpu_free(gpu);

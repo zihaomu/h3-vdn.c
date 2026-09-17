@@ -1,0 +1,64 @@
+From 17b2fb9443b519356fe4913a53c21e6181d8003b Mon Sep 17 00:00:00 2001
+From: VDN-H3 Authors <vdn-h3@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 06:56:49 +0000
+Subject: [PATCH 1/2] MiniMaxH3: pin the AdaLN SiLU to fp32 explicitly
+
+Both modulation classes activated at temb's incoming precision and relied on that being
+float32. Under FSDP2 it is not: MixedPrecisionPolicy defaults to cast_forward_inputs=True,
+so wrapping a transformer block casts every forward input -- temb included -- to
+param_dtype at the block boundary, and silu(temb) silently became silu(temb.bfloat16()).
+
+Measured on the H3 Stage-B config: 3.5e-3 norm-relative error on the AdaLN projection
+output, 55% of its elements changed. It biases every block's modulation identically at
+every sampling step, so it accumulates coherently along the denoising trajectory rather
+than averaging out.
+
+MiniMaxH3AdaLayerNormOut had the same line and the same problem.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../transformers/transformer_minimax_h3.py    | 24 +++++++++++++------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/src/diffusers/models/transformers/transformer_minimax_h3.py b/src/diffusers/models/transformers/transformer_minimax_h3.py
+index 5b2be83bdbbde888238f14b9c5a44bc69756fd5e..fded2b622487f06beb629e8e211b4f2c2633bd86 100644
+--- a/src/diffusers/models/transformers/transformer_minimax_h3.py
++++ b/src/diffusers/models/transformers/transformer_minimax_h3.py
+@@ -120,11 +120,19 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
+         self.linear = nn.Linear(time_embed_dim, 6 * hidden_size * MINIMAX_H3_MODALITY_NUM, bias=True)
+ 
+     def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+-        # The activation runs at `temb`'s own precision — float32, since `time_embedder` is a float32 module in this
+-        # mixed-precision checkpoint — and only its result is cast down to the bfloat16 projection. Every block reads
+-        # the same `temb`, so a rounding applied before the activation biases every block's modulation parameters
+-        # identically at every sampling step, which accumulates coherently over the denoising trajectory.
+-        temb = self.linear(nn.functional.silu(temb).to(get_parameter_dtype(self.linear)))
++        # The activation runs in float32 and only its result is cast down to the bfloat16
++        # projection. Every block reads the same `temb`, so a rounding applied BEFORE the
++        # activation biases every block's modulation parameters identically at every
++        # sampling step, which accumulates coherently over the denoising trajectory.
++        #
++        # `.float()` is explicit rather than relying on temb arriving as float32. Under
++        # FSDP2 it does not: MixedPrecisionPolicy defaults to cast_forward_inputs=True,
++        # so wrapping a block casts every forward input — temb included — to param_dtype
++        # at the block boundary, and this line then silently became silu(temb.bfloat16()).
++        # Measured 2026-08-15 on the Stage-B config: 3.5e-3 norm-relative error on the
++        # AdaLN projection output, 55% of its elements changed. Stage-A does not wrap
++        # blocks this way and was unaffected, which is why it never showed up there.
++        temb = self.linear(nn.functional.silu(temb.float()).to(get_parameter_dtype(self.linear)))
+         temb = temb.view(-1, 6 * self.hidden_size)
+         return temb.chunk(6, dim=-1)
+ 
+@@ -146,8 +154,10 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
+         self.linear = nn.Linear(time_embed_dim, 2 * hidden_size, bias=True)
+ 
+     def forward(self, hidden_states: torch.Tensor, temb: torch.Tensor, timestep_indices: torch.Tensor) -> torch.Tensor:
+-        # As in `MiniMaxH3AdaLayerNormModulation`: activate at `temb`'s precision, cast to the projection's dtype after.
+-        shift, scale = self.linear(nn.functional.silu(temb).to(get_parameter_dtype(self.linear))).chunk(2, dim=-1)
++        # As in `MiniMaxH3AdaLayerNormModulation`: activate in fp32, cast to the projection's
++        # dtype after. `.float()` explicit for the same reason — see the note there.
++        shift, scale = self.linear(
++            nn.functional.silu(temb.float()).to(get_parameter_dtype(self.linear))).chunk(2, dim=-1)
+         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
+         hidden_states = self.norm(hidden_states)
+         return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(

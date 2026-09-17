@@ -9,6 +9,10 @@ typedef enum {
     H3_IMAGE_FIT_COVER = 1
 } h3_image_fit;
 
+/* Fail before expensive generation when the selected FFmpeg executable is
+ * not reachable. H3_FFMPEG may select an explicit executable. */
+int h3_ffmpeg_check_available(char *error, size_t error_size);
+
 /* Inspect the first visual stream without decoding it. H3_FFPROBE may select
  * an explicit ffprobe-compatible executable. */
 int h3_ffprobe_visual_size(const char *path, int *width, int *height,

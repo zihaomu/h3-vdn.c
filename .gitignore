@@ -5,6 +5,7 @@ models/
 outputs/
 .ruff_cache/
 .venv/
+.text-oracle-deps/
 .tools/
 __pycache__/
 *.pyc

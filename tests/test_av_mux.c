@@ -12,8 +12,10 @@ static void die(const char *message) {
 }
 
 int main(int argc, char **argv) {
-    enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
+    enum { WIDTH = 32, HEIGHT = 32, FRAMES = 48, SAMPLES = 64000 };
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
+    char error[512];
+    if (!h3_ffmpeg_check_available(error, sizeof(error))) die(error);
     uint8_t *rgb = malloc(WIDTH * HEIGHT * 3 * FRAMES);
     float *pcm = malloc(2 * SAMPLES * sizeof(*pcm));
     if (!rgb || !pcm) die("out of memory creating mux fixture");
@@ -24,7 +26,7 @@ int main(int argc, char **argv) {
                                 (size_t)y * WIDTH + (size_t)x) * 3;
                 rgb[pixel] = (uint8_t)(x * 8);
                 rgb[pixel + 1] = (uint8_t)(y * 8);
-                rgb[pixel + 2] = (uint8_t)(frame * 32);
+                rgb[pixel + 2] = (uint8_t)(frame * 5);
             }
     for (int channel = 0; channel < 2; channel++)
         for (int sample = 0; sample < SAMPLES; sample++)
@@ -32,7 +34,6 @@ int main(int argc, char **argv) {
                 0.05f * sinf(2.0f * 3.14159265358979323846f *
                              (float)(220 + channel * 110) * (float)sample /
                              32000.0f);
-    char error[512];
     if (!h3_ffmpeg_write_av_rgb24_f32(path, rgb, FRAMES, WIDTH, HEIGHT, 24,
                                       pcm, SAMPLES, 2, 32000,
                                       error, sizeof(error))) die(error);
@@ -72,7 +73,7 @@ int main(int argc, char **argv) {
     if (!h3_ffmpeg_read_video_f32(path, WIDTH, HEIGHT, FRAMES,
                                   &decoded, &decoded_frames,
                                   error, sizeof(error))) die(error);
-    if (decoded_frames != 5)
+    if (decoded_frames != 39)
         die("FFmpeg video input did not align to 5+17k frames");
     size_t decoded_values = (size_t)3 * decoded_frames * WIDTH * HEIGHT;
     for (size_t index = 0; index < decoded_values; index++) {

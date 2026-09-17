@@ -54,6 +54,11 @@ static double dit_now(void) {
     return (double)value.tv_sec + (double)value.tv_nsec / 1.0e9;
 }
 
+static int dit_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && *value && strcmp(value, "0");
+}
+
 static uint64_t dit_counter_delta(uint64_t value, uint64_t start) {
     return value >= start ? value - start : 0;
 }
@@ -123,6 +128,9 @@ static void dit_profile_stats_delta(const h3_gpu_profile_stats *start,
         stop->weight_read_seconds, start->weight_read_seconds);
     delta->weight_upload_seconds = dit_seconds_delta(
         stop->weight_upload_seconds, start->weight_upload_seconds);
+    delta->weight_staging_wait_seconds = dit_seconds_delta(
+        stop->weight_staging_wait_seconds,
+        start->weight_staging_wait_seconds);
     delta->weight_read_bytes = dit_counter_delta(
         stop->weight_read_bytes, start->weight_read_bytes);
     delta->weight_upload_bytes = dit_counter_delta(
@@ -220,12 +228,22 @@ int h3_vdn_layout_build(const h3_text_embedding *prompt,
            layout->audio_rows);
     memset(layout->token_tags + layout->video_start, 0,
            layout->video_rows);
-    float inverse[VDN_ROPE_HALF / 3];
-    for (uint32_t frequency = 0; frequency < VDN_ROPE_HALF / 3;
-         frequency++) {
-        inverse[frequency] = expf(-logf(10000.0f) * (float)frequency /
-                                  (float)(VDN_ROPE_HALF / 3));
-    }
+    /* Exact F32 values produced by the released upstream expression:
+     *   1 / (10000 ** (arange(0, 32, 2, float32) / 32))
+     * Computing the equivalent expression through the host math library can
+     * differ by one ULP and cross a BF16 boundary after cos/sin. MiniMax-H3
+     * fixes both theta and frequency count, so pinning the values also makes
+     * the native layout independent of the host libm implementation. */
+    static const float inverse[VDN_ROPE_HALF / 3] = {
+        0x1.000000p+0f, 0x1.1feb34p-1f,
+        0x1.43d136p-2f, 0x1.6c310ep-3f,
+        0x1.99999ap-4f, 0x1.ccab84p-5f,
+        0x1.030dc6p-5f, 0x1.235a72p-6f,
+        0x1.47ae14p-7f, 0x1.708938p-8f,
+        0x1.9e7c70p-9f, 0x1.d22a50p-10f,
+        0x1.0624dep-10f, 0x1.26d42cp-11f,
+        0x1.4b96c0p-12f, 0x1.74eea6p-13f
+    };
     for (uint32_t row = 0; row < layout->sequence; row++) {
         const h3_position *position = &layout->packed.positions[row];
         const double axes[3] = {position->t, position->h, position->w};
@@ -248,34 +266,52 @@ failed:
 }
 
 static int run_refiner(h3_gpu *gpu, const h3_vdn_refiner_weights *weights,
-                       uint32_t rows,
+                       unsigned block, uint32_t rows,
                        h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                        h3_gpu_tensor *query_raw, h3_gpu_tensor *key_raw,
                        h3_gpu_tensor *value, h3_gpu_tensor *query,
                        h3_gpu_tensor *key, h3_gpu_tensor *attended,
                        h3_gpu_tensor *branch, h3_gpu_tensor *fc1,
                        h3_gpu_tensor *activated, h3_gpu_tensor *dummy_rope,
+                       h3_vdn_refiner_observer observer,
+                       void *observer_opaque,
                        char *error, size_t error_size) {
 #define OP(call, label) do {                                                   \
     if (!dit_op(gpu, (call), label, error, error_size)) return 0;             \
 } while (0)
+#define OBSERVE(suffix, tensor) do {                                           \
+    if (observer) {                                                            \
+        char stage[96];                                                        \
+        int length = snprintf(stage, sizeof(stage), "block_%u.%s",            \
+                              block, suffix);                                  \
+        if (length < 0 || (size_t)length >= sizeof(stage) ||                   \
+            !observer(gpu, stage, tensor, observer_opaque,                     \
+                      error, error_size)) return 0;                            \
+    }                                                                         \
+} while (0)
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weights->norm1,
                             rows, VDN_HIDDEN, 1e-5f),
        "VDN refiner attention RMSNorm");
+    OBSERVE("norm1", norm);
     OP(h3_gpu_linear_bf16(gpu, query_raw, norm, weights->q, NULL,
                           rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner Q projection");
+    OBSERVE("q_raw", query_raw);
     OP(h3_gpu_linear_bf16(gpu, key_raw, norm, weights->k, NULL,
                           rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner K projection");
+    OBSERVE("k_raw", key_raw);
     OP(h3_gpu_linear_bf16(gpu, value, norm, weights->v, NULL,
                           rows, VDN_HIDDEN, VDN_INNER),
        "VDN refiner V projection");
+    OBSERVE("v_raw", value);
     OP(h3_gpu_vdn_qk_rope_bf16(
            gpu, query, key, query_raw, key_raw, weights->q_norm,
            weights->k_norm, dummy_rope, dummy_rope, rows,
            VDN_HEADS, VDN_HEAD_DIM, 0, 1e-5f),
        "VDN refiner QK normalization");
+    OBSERVE("q_norm", query);
+    OBSERVE("k_norm", key);
     OP(h3_gpu_sdpa_bf16(gpu, attended, query, key, value,
                         rows, VDN_HEADS, VDN_HEAD_DIM,
                         1.0f / sqrtf((float)VDN_HEAD_DIM)),
@@ -283,23 +319,31 @@ static int run_refiner(h3_gpu *gpu, const h3_vdn_refiner_weights *weights,
     OP(h3_gpu_linear_bf16(gpu, branch, attended, weights->out, NULL,
                           rows, VDN_INNER, VDN_HIDDEN),
        "VDN refiner attention output");
+    OBSERVE("attention_output", branch);
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, branch,
                        rows * VDN_HIDDEN),
        "VDN refiner attention residual");
+    OBSERVE("attention_residual", hidden);
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weights->norm2,
                             rows, VDN_HIDDEN, 1e-5f),
        "VDN refiner MLP RMSNorm");
+    OBSERVE("norm2", norm);
     OP(h3_gpu_linear_bf16(gpu, fc1, norm, weights->fc1, NULL,
                           rows, VDN_HIDDEN, VDN_FFN * 2),
        "VDN refiner MLP input");
+    OBSERVE("ff_fused", fc1);
     OP(h3_gpu_swiglu_bf16(gpu, activated, fc1, rows, VDN_FFN),
        "VDN refiner SwiGLU");
+    OBSERVE("ff_activated", activated);
     OP(h3_gpu_linear_bf16(gpu, branch, activated, weights->fc2, NULL,
                           rows, VDN_FFN, VDN_HIDDEN),
        "VDN refiner MLP output");
+    OBSERVE("ff_output", branch);
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, branch,
                        rows * VDN_HIDDEN),
        "VDN refiner MLP residual");
+    OBSERVE("output", hidden);
+#undef OBSERVE
 #undef OP
     return 1;
 }
@@ -307,6 +351,15 @@ static int run_refiner(h3_gpu *gpu, const h3_vdn_refiner_weights *weights,
 h3_gpu_tensor *h3_vdn_refine_prompt(
         h3_gpu *gpu, const h3_vdn_model_weights *weights,
         const h3_text_embedding *prompt, char *error, size_t error_size) {
+    return h3_vdn_refine_prompt_observed(
+        gpu, weights, prompt, NULL, NULL, error, error_size);
+}
+
+h3_gpu_tensor *h3_vdn_refine_prompt_observed(
+        h3_gpu *gpu, const h3_vdn_model_weights *weights,
+        const h3_text_embedding *prompt,
+        h3_vdn_refiner_observer observer, void *observer_opaque,
+        char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!gpu || !weights || !prompt || !prompt->values || !prompt->tokens ||
         prompt->tokens > UINT32_MAX / VDN_HIDDEN ||
@@ -351,16 +404,22 @@ h3_gpu_tensor *h3_vdn_refine_prompt(
                     gpu, hidden, source, weights->context_weight,
                     weights->context_bias, rows, VDN_TEXT_WIDTH,
                     VDN_HIDDEN), "VDN context projection", error, error_size) &&
-         run_refiner(gpu, &weights->refiner[0], rows, hidden, norm, query_raw,
+         (!observer || observer(gpu, "context_projection", hidden,
+                                observer_opaque, error, error_size)) &&
+         run_refiner(gpu, &weights->refiner[0], 0, rows, hidden, norm, query_raw,
                      key_raw, value, query, key, attended, branch, fc1,
-                     activated, dummy_rope, error, error_size) &&
-         run_refiner(gpu, &weights->refiner[1], rows, hidden, norm, query_raw,
+                     activated, dummy_rope, observer, observer_opaque,
+                     error, error_size) &&
+         run_refiner(gpu, &weights->refiner[1], 1, rows, hidden, norm, query_raw,
                      key_raw, value, query, key, attended, branch, fc1,
-                     activated, dummy_rope, error, error_size) &&
+                     activated, dummy_rope, observer, observer_opaque,
+                     error, error_size) &&
          dit_op(gpu, h3_gpu_rms_norm_bf16(
                     gpu, hidden, hidden, weights->refiner_final_norm,
                     rows, VDN_HIDDEN, 1e-5f),
                 "VDN refiner final RMSNorm", error, error_size) &&
+         (!observer || observer(gpu, "final", hidden, observer_opaque,
+                                error, error_size)) &&
          dit_op(gpu, h3_gpu_submit(gpu), "submit VDN prompt refinement",
                 error, error_size);
 cleanup:
@@ -563,62 +622,39 @@ int h3_vdn_run_block(
     h3_gpu_tensor *linear_projected = NULL, *video_branch = NULL;
     h3_gpu_tensor *norm_mlp = NULL, *fc1 = NULL, *activated = NULL;
     h3_gpu_tensor *mlp_branch = NULL;
-#define BF(field, count) (field = h3_gpu_tensor_new_bf16(gpu, (count)))
-#define F32(field, count) (field = h3_gpu_tensor_new_f32(gpu, (count)))
-    BF(norm_attn, packed_elements); BF(query_raw, qkv_elements);
-    BF(key_raw, qkv_elements); BF(value_raw, qkv_elements);
-    BF(query, qkv_elements); BF(key, qkv_elements); BF(attended, qkv_elements);
-    BF(softmax_logits, (size_t)sequence * VDN_HEADS);
-    BF(softmax_gated, qkv_elements); BF(branch, packed_elements);
-    BF(video_x, inner_hidden); BF(video_q_raw, inner_features);
-    BF(video_k_raw, inner_features); BF(video_v_raw, inner_features);
-    BF(linear_q, inner_features); BF(linear_k, inner_features);
-    BF(linear_v, inner_features); BF(video_beta, (size_t)inner_rows * VDN_HEADS);
-    BF(gate_down, (size_t)inner_rows * VDN_HEAD_DIM);
-    BF(gate_logits, inner_features); F32(frame_mean, (size_t)inner_frames * VDN_HIDDEN);
-    F32(alpha_down_w, (size_t)VDN_HEAD_DIM * VDN_HIDDEN);
-    F32(alpha_up_w, (size_t)VDN_INNER * VDN_HEAD_DIM);
-    F32(alpha_hidden, (size_t)inner_frames * VDN_HEAD_DIM);
-    F32(alpha_delta, (size_t)inner_frames * VDN_INNER);
-    F32(alpha, (size_t)inner_frames * VDN_INNER);
-    F32(a, state_elements); F32(b, state_elements);
-    F32(transition, state_elements); F32(injection, state_elements);
-    BF(text_k, (size_t)text_rows * VDN_INNER);
-    BF(text_v, (size_t)text_rows * VDN_INNER);
-    BF(text_beta, (size_t)text_rows * VDN_HEADS);
-    F32(text_a, text_state_elements); F32(text_b, text_state_elements);
-    float ones[VDN_INNER];
-    for (size_t index = 0; index < VDN_INNER; index++) ones[index] = 1.0f;
-    text_alpha = h3_gpu_tensor_from_f32(gpu, ones, VDN_INNER);
-    F32(text_transition, text_state_elements);
-    F32(text_injection, text_state_elements);
-    F32(prefix, state_elements); F32(suffix, state_elements);
-    BF(linear_readout, inner_features); BF(linear_projected, inner_hidden);
-    BF(video_branch, inner_hidden); BF(norm_mlp, packed_elements);
-    BF(fc1, (size_t)sequence * VDN_FFN * 2);
-    BF(activated, (size_t)sequence * VDN_FFN);
-    BF(mlp_branch, packed_elements);
-#undef F32
-#undef BF
-    int ok = norm_attn && query_raw && key_raw && value_raw && query && key &&
-        attended && softmax_logits && softmax_gated && branch && video_x &&
-        video_q_raw && video_k_raw && video_v_raw && linear_q && linear_k &&
-        linear_v && video_beta && gate_down && gate_logits && frame_mean &&
-        alpha_down_w && alpha_up_w && alpha_hidden && alpha_delta && alpha &&
-        a && b && transition && injection && text_k && text_v && text_beta &&
-        text_a && text_b && text_alpha && text_transition && text_injection &&
-        prefix && suffix && linear_readout && linear_projected && video_branch &&
-        norm_mlp && fc1 && activated && mlp_branch;
-    if (!ok) {
-        dit_fail(error, error_size, "cannot allocate VDN block activations: %s",
-                 h3_gpu_error(gpu));
-        goto cleanup;
-    }
+    int ok = 1;
+#define ALLOC(field, call) do {                                                \
+    field = (call);                                                           \
+    if (!field) {                                                             \
+        dit_fail(error, error_size,                                           \
+                 "cannot allocate VDN block activation %s: %s",             \
+                 #field, h3_gpu_error(gpu));                                  \
+        ok = 0; goto cleanup;                                                 \
+    }                                                                         \
+} while (0)
 #define OP(call, label) do {                                                   \
     if (!dit_op(gpu, (call), label, error, error_size)) {                     \
         ok = 0; goto cleanup;                                                  \
     }                                                                         \
 } while (0)
+#define RELEASE(field) do {                                                    \
+    h3_gpu_tensor_free(field);                                                 \
+    field = NULL;                                                              \
+} while (0)
+
+    /* Phase 1: the window-attention branch. Keeping all block scratch live at
+     * once exceeds 31.9 GiB at the released 102816-row video geometry. */
+    ALLOC(norm_attn, h3_gpu_tensor_new_bf16(gpu, packed_elements));
+    ALLOC(query_raw, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(key_raw, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(value_raw, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(query, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(key, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(attended, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(softmax_logits, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)sequence * VDN_HEADS));
+    ALLOC(softmax_gated, h3_gpu_tensor_new_bf16(gpu, qkv_elements));
+    ALLOC(branch, h3_gpu_tensor_new_bf16(gpu, packed_elements));
     OP(h3_gpu_begin(gpu), "begin VDN transformer block");
     OP(h3_gpu_adaln_bf16(gpu, norm_attn, hidden, weights->norm1, modulation,
                          row_map, sequence, VDN_HIDDEN, VDN_ADALN_SLOTS,
@@ -648,6 +684,35 @@ int h3_vdn_run_block(
                           sequence, VDN_INNER, VDN_HIDDEN),
        "VDN softmax output projection");
 
+    OP(h3_gpu_submit(gpu), "submit VDN window attention");
+    RELEASE(query);
+    RELEASE(key);
+    RELEASE(attended);
+    RELEASE(softmax_logits);
+    RELEASE(softmax_gated);
+
+    /* Phase 2: copy the inner-video source and finish the small text state
+     * before retiring the sequence-wide Q/K/V and normalized input. */
+    ALLOC(video_x, h3_gpu_tensor_new_bf16(gpu, inner_hidden));
+    ALLOC(video_q_raw, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(video_k_raw, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(video_v_raw, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(text_k, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)text_rows * VDN_INNER));
+    ALLOC(text_v, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)text_rows * VDN_INNER));
+    ALLOC(text_beta, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)text_rows * VDN_HEADS));
+    ALLOC(text_a, h3_gpu_tensor_new_f32(gpu, text_state_elements));
+    ALLOC(text_b, h3_gpu_tensor_new_f32(gpu, text_state_elements));
+    float ones[VDN_INNER];
+    for (size_t index = 0; index < VDN_INNER; index++) ones[index] = 1.0f;
+    ALLOC(text_alpha, h3_gpu_tensor_from_f32(gpu, ones, VDN_INNER));
+    ALLOC(text_transition, h3_gpu_tensor_new_f32(
+        gpu, text_state_elements));
+    ALLOC(text_injection, h3_gpu_tensor_new_f32(
+        gpu, text_state_elements));
+    OP(h3_gpu_begin(gpu), "begin VDN linear source preparation");
     OP(h3_gpu_copy_bf16(gpu, video_x, 0, norm_attn, video_hidden_offset,
                         inner_hidden), "copy VDN linear video hidden");
     OP(h3_gpu_copy_bf16(gpu, video_q_raw, 0, query_raw,
@@ -659,6 +724,57 @@ int h3_vdn_run_block(
     OP(h3_gpu_copy_bf16(gpu, video_v_raw, 0, value_raw,
                         video_feature_offset, inner_features),
        "copy VDN linear raw V");
+    OP(h3_gpu_vdn_text_features_bf16(
+           gpu, text_k, text_v, key_raw, value_raw, text_rows,
+           VDN_HEADS, VDN_HEAD_DIM, 1e-6f), "VDN text features");
+    OP(h3_gpu_linear_bf16(gpu, text_beta, norm_attn,
+                          weights->linear.beta, NULL, text_rows,
+                          VDN_HIDDEN, VDN_HEADS), "VDN text beta projection");
+    OP(h3_gpu_vdn_frame_stats_bf16(
+           gpu, text_a, text_b, text_k, text_v, text_beta, 1, text_rows,
+           VDN_HEADS, VDN_HEAD_DIM), "VDN text statistics");
+    OP(h3_gpu_vdn_solve_f32(
+           gpu, text_transition, text_injection, text_a, text_b, text_alpha,
+           1, VDN_HEADS, VDN_HEAD_DIM), "VDN text-state Cholesky solve");
+    OP(h3_gpu_submit(gpu), "submit VDN linear source preparation");
+    RELEASE(norm_attn);
+    RELEASE(query_raw);
+    RELEASE(key_raw);
+    RELEASE(value_raw);
+    RELEASE(text_k);
+    RELEASE(text_v);
+    RELEASE(text_beta);
+    RELEASE(text_a);
+    RELEASE(text_b);
+    RELEASE(text_alpha);
+    RELEASE(text_transition);
+
+    /* Phase 3: linear features, gates, frame statistics and solve. */
+    ALLOC(linear_q, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(linear_k, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(linear_v, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(video_beta, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)inner_rows * VDN_HEADS));
+    ALLOC(gate_down, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)inner_rows * VDN_HEAD_DIM));
+    ALLOC(gate_logits, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    ALLOC(frame_mean, h3_gpu_tensor_new_f32(
+        gpu, (size_t)inner_frames * VDN_HIDDEN));
+    ALLOC(alpha_down_w, h3_gpu_tensor_new_f32(
+        gpu, (size_t)VDN_HEAD_DIM * VDN_HIDDEN));
+    ALLOC(alpha_up_w, h3_gpu_tensor_new_f32(
+        gpu, (size_t)VDN_INNER * VDN_HEAD_DIM));
+    ALLOC(alpha_hidden, h3_gpu_tensor_new_f32(
+        gpu, (size_t)inner_frames * VDN_HEAD_DIM));
+    ALLOC(alpha_delta, h3_gpu_tensor_new_f32(
+        gpu, (size_t)inner_frames * VDN_INNER));
+    ALLOC(alpha, h3_gpu_tensor_new_f32(
+        gpu, (size_t)inner_frames * VDN_INNER));
+    ALLOC(a, h3_gpu_tensor_new_f32(gpu, state_elements));
+    ALLOC(b, h3_gpu_tensor_new_f32(gpu, state_elements));
+    ALLOC(transition, h3_gpu_tensor_new_f32(gpu, state_elements));
+    ALLOC(injection, h3_gpu_tensor_new_f32(gpu, state_elements));
+    OP(h3_gpu_begin(gpu), "begin VDN linear attention solve");
     OP(h3_gpu_vdn_linear_features_bf16(
            gpu, linear_q, linear_k, linear_v, video_q_raw, video_k_raw,
            video_v_raw, weights->linear.k_spatial, weights->linear.k_temporal,
@@ -701,27 +817,54 @@ int h3_vdn_run_block(
     OP(h3_gpu_vdn_solve_f32(gpu, transition, injection, a, b, alpha,
                             inner_frames, VDN_HEADS, VDN_HEAD_DIM),
        "VDN video Cholesky solve");
+    OP(h3_gpu_submit(gpu), "submit VDN linear attention solve");
+    RELEASE(video_x);
+    RELEASE(video_q_raw);
+    RELEASE(video_k_raw);
+    RELEASE(video_v_raw);
+    RELEASE(linear_k);
+    RELEASE(linear_v);
+    RELEASE(video_beta);
+    RELEASE(gate_down);
+    RELEASE(frame_mean);
+    RELEASE(alpha_down_w);
+    RELEASE(alpha_up_w);
+    RELEASE(alpha_hidden);
+    RELEASE(alpha_delta);
+    RELEASE(a);
+    RELEASE(b);
 
-    OP(h3_gpu_vdn_text_features_bf16(
-           gpu, text_k, text_v, key_raw, value_raw, text_rows,
-           VDN_HEADS, VDN_HEAD_DIM, 1e-6f), "VDN text features");
-    OP(h3_gpu_linear_bf16(gpu, text_beta, norm_attn,
-                          weights->linear.beta, NULL, text_rows,
-                          VDN_HIDDEN, VDN_HEADS), "VDN text beta projection");
-    OP(h3_gpu_vdn_frame_stats_bf16(
-           gpu, text_a, text_b, text_k, text_v, text_beta, 1, text_rows,
-           VDN_HEADS, VDN_HEAD_DIM), "VDN text statistics");
-    OP(h3_gpu_vdn_solve_f32(
-           gpu, text_transition, text_injection, text_a, text_b, text_alpha,
-           1, VDN_HEADS, VDN_HEAD_DIM), "VDN text-state Cholesky solve");
+    /* Phase 4: bidirectional state scan. */
+    ALLOC(prefix, h3_gpu_tensor_new_f32(gpu, state_elements));
+    ALLOC(suffix, h3_gpu_tensor_new_f32(gpu, state_elements));
+    OP(h3_gpu_begin(gpu), "begin VDN bidirectional scan");
     OP(h3_gpu_vdn_scan_f32(
            gpu, prefix, suffix, transition, injection, text_injection, 0.5f,
            inner_frames, VDN_HEADS, VDN_HEAD_DIM), "VDN bidirectional scan");
+    OP(h3_gpu_submit(gpu), "submit VDN bidirectional scan");
+    RELEASE(transition);
+    RELEASE(injection);
+
+    /* Phase 5: read out the linear branch, then retire its state. */
+    ALLOC(linear_readout, h3_gpu_tensor_new_bf16(gpu, inner_features));
+    OP(h3_gpu_begin(gpu), "begin VDN linear readout");
     OP(h3_gpu_vdn_readout_bf16(
            gpu, linear_readout, linear_q, prefix, suffix, alpha,
            text_injection, 0.5f, weights->linear.norm, gate_logits,
            inner_frames, tokens_per_frame, VDN_HEADS, VDN_HEAD_DIM,
            radius, chunk, 1e-6f), "VDN linear readout");
+    OP(h3_gpu_submit(gpu), "submit VDN linear readout");
+    RELEASE(linear_q);
+    RELEASE(prefix);
+    RELEASE(suffix);
+    RELEASE(alpha);
+    RELEASE(text_injection);
+    RELEASE(gate_logits);
+
+    /* Phase 6: merge both attention branches and apply the residual gate. */
+    ALLOC(linear_projected, h3_gpu_tensor_new_bf16(gpu, inner_hidden));
+    ALLOC(video_branch, h3_gpu_tensor_new_bf16(gpu, inner_hidden));
+    OP(h3_gpu_begin(gpu), "begin VDN attention branch merge");
     OP(h3_gpu_linear_bf16(gpu, linear_projected, linear_readout,
                           weights->linear.to_out, NULL, inner_rows,
                           VDN_INNER, VDN_HIDDEN),
@@ -737,21 +880,48 @@ int h3_vdn_run_block(
     OP(h3_gpu_gate_bf16(gpu, hidden, hidden, branch, modulation, row_map,
                         sequence, VDN_HIDDEN, VDN_ADALN_SLOTS, 2),
        "VDN attention residual gate");
+    OP(h3_gpu_submit(gpu), "submit VDN attention branch merge");
+    RELEASE(branch);
+    RELEASE(linear_readout);
+    RELEASE(linear_projected);
+    RELEASE(video_branch);
+
+    /* Phase 7: stage the large MLP scratch so FC1 and its activated output do
+     * not coexist with the attention scratch set. */
+    ALLOC(norm_mlp, h3_gpu_tensor_new_bf16(gpu, packed_elements));
+    ALLOC(fc1, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)sequence * VDN_FFN * 2));
+    OP(h3_gpu_begin(gpu), "begin VDN MLP projection");
     OP(h3_gpu_adaln_bf16(gpu, norm_mlp, hidden, weights->norm2, modulation,
                          row_map, sequence, VDN_HIDDEN, VDN_ADALN_SLOTS,
                          3, 4, 1e-5f), "VDN MLP AdaLN");
     OP(h3_gpu_linear_bf16(gpu, fc1, norm_mlp, weights->fc1, NULL,
                           sequence, VDN_HIDDEN, VDN_FFN * 2),
        "VDN MLP input projection");
+    OP(h3_gpu_submit(gpu), "submit VDN MLP projection");
+    RELEASE(norm_mlp);
+
+    ALLOC(activated, h3_gpu_tensor_new_bf16(
+        gpu, (size_t)sequence * VDN_FFN));
+    OP(h3_gpu_begin(gpu), "begin VDN SwiGLU");
     OP(h3_gpu_swiglu_bf16(gpu, activated, fc1, sequence, VDN_FFN),
        "VDN SwiGLU");
+    OP(h3_gpu_submit(gpu), "submit VDN SwiGLU");
+    RELEASE(fc1);
+
+    ALLOC(mlp_branch, h3_gpu_tensor_new_bf16(gpu, packed_elements));
+    OP(h3_gpu_begin(gpu), "begin VDN MLP output");
     OP(h3_gpu_linear_bf16(gpu, mlp_branch, activated, weights->fc2, NULL,
                           sequence, VDN_FFN, VDN_HIDDEN),
        "VDN MLP output projection");
     OP(h3_gpu_gate_bf16(gpu, hidden, hidden, mlp_branch, modulation, row_map,
                         sequence, VDN_HIDDEN, VDN_ADALN_SLOTS, 5),
        "VDN MLP residual gate");
-    OP(h3_gpu_submit(gpu), "submit VDN transformer block");
+    OP(h3_gpu_submit(gpu), "submit VDN MLP output");
+    RELEASE(activated);
+    RELEASE(mlp_branch);
+#undef RELEASE
+#undef ALLOC
 #undef OP
 cleanup:
 #define FREE(field) h3_gpu_tensor_free(field)
@@ -835,6 +1005,8 @@ static int h3_vdn_forward_impl(h3_gpu *gpu, h3_vdn_weight_store *store,
                    h3_vdn_layer_observer observer, void *observer_opaque,
                    h3_vdn_velocity *velocity,
                    h3_vdn_forward_timing *timing,
+                   h3_vdn_block_timing *block_timings,
+                   unsigned block_timing_capacity,
                    char *error, size_t error_size) {
     double timing_start = dit_now();
     double timing_phase = timing_start;
@@ -964,9 +1136,48 @@ static int h3_vdn_forward_impl(h3_gpu *gpu, h3_vdn_weight_store *store,
     if (timing) timing->timestep_seconds = dit_now() - timing_phase;
     timing_phase = dit_now();
     for (unsigned layer = 0; layer < VDN_BLOCKS; layer++) {
+        h3_vdn_block_timing *block_timing =
+            block_timings && layer < block_timing_capacity ?
+            &block_timings[layer] : NULL;
+        h3_gpu_stats load_gpu_start, load_gpu_stop;
+        h3_gpu_profile_stats load_profile_start, load_profile_stop;
+        double load_start = block_timing ? dit_now() : 0.0;
+        if (block_timing) {
+            memset(block_timing, 0, sizeof(*block_timing));
+            block_timing->block_index = layer;
+            memset(&load_gpu_start, 0, sizeof(load_gpu_start));
+            memset(&load_gpu_stop, 0, sizeof(load_gpu_stop));
+            memset(&load_profile_start, 0, sizeof(load_profile_start));
+            memset(&load_profile_stop, 0, sizeof(load_profile_stop));
+            (void)h3_gpu_get_stats(gpu, &load_gpu_start);
+            (void)h3_gpu_get_profile_stats(gpu, &load_profile_start);
+        }
         if (!h3_vdn_block_weights_load(store, gpu, layer, &block,
                                        error, error_size)) {
-            ok = 0; goto cleanup;
+            ok = 0;
+            goto cleanup;
+        }
+        if (block_timing) {
+            double load_stop = dit_now();
+            (void)h3_gpu_get_stats(gpu, &load_gpu_stop);
+            (void)h3_gpu_get_profile_stats(gpu, &load_profile_stop);
+            block_timing->load_wall_seconds = load_stop - load_start;
+            dit_gpu_stats_delta(&load_gpu_start, &load_gpu_stop,
+                                &block_timing->load_gpu);
+            dit_profile_stats_delta(
+                &load_profile_start, &load_profile_stop,
+                &block_timing->load_profile);
+        }
+        h3_gpu_stats execute_gpu_start, execute_gpu_stop;
+        h3_gpu_profile_stats execute_profile_start, execute_profile_stop;
+        double execute_start = block_timing ? dit_now() : 0.0;
+        if (block_timing) {
+            memset(&execute_gpu_start, 0, sizeof(execute_gpu_start));
+            memset(&execute_gpu_stop, 0, sizeof(execute_gpu_stop));
+            memset(&execute_profile_start, 0, sizeof(execute_profile_start));
+            memset(&execute_profile_stop, 0, sizeof(execute_profile_stop));
+            (void)h3_gpu_get_stats(gpu, &execute_gpu_start);
+            (void)h3_gpu_get_profile_stats(gpu, &execute_profile_start);
         }
         modulation = h3_vdn_block_modulation(
             gpu, &block, time_embedding, time_rows, error, error_size);
@@ -975,11 +1186,32 @@ static int h3_vdn_forward_impl(h3_gpu *gpu, h3_vdn_weight_store *store,
                 rope_sin, layout->sequence, layout->text_rows,
                 layout->video_start, layout->frames, layout->frame_height,
                 layout->frame_width, radius, chunk, error, error_size)) {
-            ok = 0; goto cleanup;
+            ok = 0;
+            goto cleanup;
         }
+        double execute_stop = block_timing ? dit_now() : 0.0;
+        if (block_timing) {
+            (void)h3_gpu_get_stats(gpu, &execute_gpu_stop);
+            (void)h3_gpu_get_profile_stats(gpu, &execute_profile_stop);
+            block_timing->execute_wall_seconds = execute_stop - execute_start;
+            dit_gpu_stats_delta(&execute_gpu_start, &execute_gpu_stop,
+                                &block_timing->execute_gpu);
+            dit_profile_stats_delta(&execute_profile_start,
+                                    &execute_profile_stop,
+                                    &block_timing->execute_profile);
+        }
+        double release_start = block_timing ? dit_now() : 0.0;
         h3_gpu_tensor_free(modulation);
         modulation = NULL;
         h3_vdn_block_weights_free(&block);
+        double release_stop = block_timing ? dit_now() : 0.0;
+        if (block_timing) {
+            block_timing->release_wall_seconds =
+                release_stop - release_start;
+            block_timing->wall_seconds = block_timing->load_wall_seconds +
+                block_timing->execute_wall_seconds +
+                block_timing->release_wall_seconds;
+        }
         if (observer && !observer(gpu, layer + 1, VDN_BLOCKS, hidden,
                                   observer_opaque, error, error_size)) {
             ok = 0; goto cleanup;
@@ -1087,7 +1319,8 @@ int h3_vdn_forward(h3_gpu *gpu, h3_vdn_weight_store *store,
     return h3_vdn_forward_impl(
         gpu, store, weights, refined_prompt, layout, video_rows, audio_rows,
         video_timestep, audio_timestep, radius, chunk, progress,
-        progress_opaque, NULL, NULL, velocity, timing, error, error_size);
+        progress_opaque, NULL, NULL, velocity, timing, NULL, 0, error,
+        error_size);
 }
 
 int h3_vdn_forward_observed(
@@ -1107,11 +1340,11 @@ int h3_vdn_forward_observed(
     return h3_vdn_forward_impl(
         gpu, store, weights, refined_prompt, layout, video_rows, audio_rows,
         video_timestep, audio_timestep, radius, chunk, progress,
-        progress_opaque, observer, observer_opaque, velocity, timing, error,
-        error_size);
+        progress_opaque, observer, observer_opaque, velocity, timing, NULL, 0,
+        error, error_size);
 }
 
-int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
+int h3_vdn_denoise_observed(h3_gpu *gpu, h3_vdn_weight_store *store,
                    const h3_vdn_model_weights *weights,
                    const h3_gpu_tensor *refined_prompt,
                    const h3_vdn_layout *layout,
@@ -1119,6 +1352,7 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                    unsigned evaluations, uint32_t radius, uint32_t chunk,
                    h3_vdn_layer_progress layer_progress,
                    h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
+                   h3_vdn_nfe_observer observer, void *observer_opaque,
                    h3_vdn_denoise_timing *timing,
                    char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -1129,6 +1363,16 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
         dit_fail(error, error_size, "invalid VDN denoising arguments");
         return 0;
     }
+    int block_profile_requested = dit_env_enabled("H3_VDN_BLOCK_PROFILE");
+    if (block_profile_requested &&
+        (!dit_env_enabled("H3_PROFILE") ||
+         evaluations > H3_VDN_PROFILE_MAX_NFE)) {
+        dit_fail(error, error_size,
+                 "H3_VDN_BLOCK_PROFILE requires H3_PROFILE=1 and at most %u NFE",
+                 H3_VDN_PROFILE_MAX_NFE);
+        return 0;
+    }
+    if (timing) timing->block_profile_enabled = block_profile_requested;
     h3_gpu_profile_set_label(gpu, "OpenVDN DiT");
     h3_sigma_schedule schedule;
     if (!h3_serving_schedule_build((int)evaluations, &schedule)) {
@@ -1162,11 +1406,16 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
         h3_vdn_forward_timing forward_timing;
         memset(&velocity, 0, sizeof(velocity));
         memset(&forward_timing, 0, sizeof(forward_timing));
-        if (!h3_vdn_forward(
+        unsigned block_offset = timing ? timing->block_timing_count : 0;
+        h3_vdn_block_timing *block_timings =
+            timing && timing->block_profile_enabled ?
+            &timing->block_timings[block_offset] : NULL;
+        if (!h3_vdn_forward_impl(
                 gpu, store, weights, refined_prompt, layout, video_rows,
                 audio_rows, video_timestep, audio_timestep, radius, chunk,
-                layer_progress, progress_opaque, &velocity,
-                timing ? &forward_timing : NULL,
+                layer_progress, progress_opaque, NULL, NULL, &velocity,
+                timing ? &forward_timing : NULL, block_timings,
+                block_timings ? H3_VDN_PROFILE_BLOCKS_PER_NFE : 0,
                 error, error_size)) return 0;
         double scheduler_start = dit_now();
         /* Match MiniMaxH3Scheduler exactly: sigma_from_t is recovered from
@@ -1195,6 +1444,10 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
                         error, error_size);
         h3_vdn_velocity_free(&velocity);
         if (!ok) return 0;
+        if (observer && !observer(
+                gpu, step + 1, evaluations, video_rows, audio_rows,
+                observer_opaque, error, error_size))
+            return 0;
         double nfe_stop = dit_now();
         (void)h3_gpu_get_stats(gpu, &gpu_stop);
         (void)h3_gpu_get_profile_stats(gpu, &profile_stop);
@@ -1210,10 +1463,33 @@ int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
             dit_gpu_stats_delta(&gpu_start, &gpu_stop, &entry->gpu);
             dit_profile_stats_delta(
                 &profile_start, &profile_stop, &entry->profile);
+            if (timing->block_profile_enabled) {
+                entry->block_timing_offset = block_offset;
+                entry->block_timing_count =
+                    H3_VDN_PROFILE_BLOCKS_PER_NFE;
+                timing->block_timing_count +=
+                    H3_VDN_PROFILE_BLOCKS_PER_NFE;
+            }
             timing->count = step + 1;
         }
         h3_gpu_profile_mark(gpu, "NFE");
         if (nfe_progress) nfe_progress(step + 1, evaluations, progress_opaque);
     }
     return 1;
+}
+
+int h3_vdn_denoise(h3_gpu *gpu, h3_vdn_weight_store *store,
+                   const h3_vdn_model_weights *weights,
+                   const h3_gpu_tensor *refined_prompt,
+                   const h3_vdn_layout *layout,
+                   h3_gpu_tensor *video_rows, h3_gpu_tensor *audio_rows,
+                   unsigned evaluations, uint32_t radius, uint32_t chunk,
+                   h3_vdn_layer_progress layer_progress,
+                   h3_vdn_nfe_progress nfe_progress, void *progress_opaque,
+                   h3_vdn_denoise_timing *timing,
+                   char *error, size_t error_size) {
+    return h3_vdn_denoise_observed(
+        gpu, store, weights, refined_prompt, layout, video_rows, audio_rows,
+        evaluations, radius, chunk, layer_progress, nfe_progress,
+        progress_opaque, NULL, NULL, timing, error, error_size);
 }

@@ -29,9 +29,11 @@ static void progress(int completed, int total, void *opaque) {
 }
 
 static void read_tensor(const h3_st_header *fixture, const char *name,
+                        const char *legacy_name,
                         h3_dtype dtype, void *values, size_t bytes,
                         size_t elements) {
     const h3_st_tensor *tensor = h3_st_find(fixture, name);
+    if (!tensor && legacy_name) tensor = h3_st_find(fixture, legacy_name);
     if (!tensor || tensor->dtype != dtype ||
         h3_st_tensor_elements(tensor) != elements)
         die("fixture tensor is absent or malformed");
@@ -76,7 +78,9 @@ int main(int argc, char **argv) {
     char error[512];
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
         die(error);
-    const h3_st_tensor *pixel_tensor = h3_st_find(&fixture, "x.pixels");
+    const h3_st_tensor *pixel_tensor = h3_st_find(
+        &fixture, "media.pixels_f32");
+    if (!pixel_tensor) pixel_tensor = h3_st_find(&fixture, "x.pixels");
     if (!pixel_tensor || pixel_tensor->dtype != H3_DTYPE_F32 ||
         pixel_tensor->ndim != 4 ||
         (pixel_tensor->shape[0] != 1 && pixel_tensor->shape[0] != 2) ||
@@ -92,7 +96,7 @@ int main(int argc, char **argv) {
     float *pixels = malloc(pixel_count * sizeof(*pixels));
     uint16_t *want = malloc(tokens * WIDTH * sizeof(*want));
     if (!pixels || !want) die("out of memory loading vision fixture");
-    read_tensor(&fixture, "x.pixels", H3_DTYPE_F32, pixels,
+    read_tensor(&fixture, "media.pixels_f32", "x.pixels", H3_DTYPE_F32, pixels,
                 pixel_count * sizeof(*pixels), pixel_count);
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/text_encoder", model_root);
@@ -103,14 +107,15 @@ int main(int argc, char **argv) {
     if (output.grid_h != height / 16 || output.grid_w != width / 16 ||
         output.tokens != tokens)
         die("native vision output geometry mismatch");
-    read_tensor(&fixture, "x.merged", H3_DTYPE_BF16, want,
+    read_tensor(&fixture, "vision.merged", "x.merged", H3_DTYPE_BF16, want,
                 tokens * WIDTH * sizeof(*want), tokens * WIDTH);
     compare("vision merged", output.merged, want, tokens * WIDTH);
     for (unsigned index = 0; index < H3_VISION_DEEPSTACKS; index++) {
-        char name[64], label[64];
-        snprintf(name, sizeof(name), "x.deepstack_%u", index);
+        char name[64], legacy_name[64], label[64];
+        snprintf(name, sizeof(name), "vision.deepstack_%u", index);
+        snprintf(legacy_name, sizeof(legacy_name), "x.deepstack_%u", index);
         snprintf(label, sizeof(label), "vision deepstack %u", index);
-        read_tensor(&fixture, name, H3_DTYPE_BF16, want,
+        read_tensor(&fixture, name, legacy_name, H3_DTYPE_BF16, want,
                     tokens * WIDTH * sizeof(*want), tokens * WIDTH);
         compare(label, output.deepstack[index], want,
                 tokens * WIDTH);
@@ -127,6 +132,6 @@ int main(int argc, char **argv) {
     h3_st_free_header(&fixture);
     free(pixels);
     free(want);
-    puts("ok: native Metal Qwen3-VL vision tower matches the MLX oracle");
+    puts("ok: native Qwen3-VL vision tower matches the upstream oracle");
     return 0;
 }

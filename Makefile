@@ -47,7 +47,7 @@ CXXFLAGS += -DH3_BACKEND_HIP $(HIP_OFFLOAD_FLAGS)
 LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lrocsolver -lrocblas -lamdhip64 -licuuc -licui18n \
 	-lm -lpthread -ldl
-LIB_C += h3_tokenizer_stub.c
+LIB_C += h3_tokenizer.c
 LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c
 LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp h3_vdn_sage_bridge.cpp
 SAGEATTENTION_OBJ := $(SAGEATTENTION_BUILD_DIR)/sage_attention.o \
@@ -67,12 +67,22 @@ VDN_WEIGHT_SUPPORT_OBJ := h3_vdn_weights.o h3_weights.o h3_safetensors.o \
 
 .PHONY: all test backend-test gpu-storage-test gpu-ops-test gpu-dit-ops-test json-test \
 	vdn-metadata-test vdn-reference-test vdn-block-loader-test vdn-prompt-test \
+	vdn-upstream-oracle-test vdn-block0-oracle-test vdn-forward-oracle-test \
+	vdn-denoise-oracle-test \
 	vdn-gpu-ops-test vdn-sage-test vdn-refiner-smoke-test vdn-block-smoke-test \
 	vdn-stack-smoke-test vdn-forward-smoke-test vdn-denoise-smoke-test \
-	vdn-video-vae-smoke-test vdn-audio-vae-smoke-test \
+	vdn-video-vae-smoke-test vdn-audio-vae-smoke-test vdn-vae-oracle-test \
 	vdn-e2e-test vdn-input-contract-test \
 	sageattention-check sage-upstream-contract-test sage-upstream-gpu-test \
 	sage-upstream-isa-test sage-upstream-bench \
+	h3-hip-capability-report h3-hip-reference-ready \
+	h3-reference-preflight h3-reference-preflight-fl2va \
+	h3-reference-model-plan h3-oracle-validate \
+	h3-reference-ops-test h3-text-oracle-test h3-vision-oracle-test \
+	h3-multimodal-oracle-test \
+	h3-audio-oracle-test \
+	h3-video-oracle-test \
+	h3-mux-oracle-test h3-correctness \
 	parity real-parity clean
 
 all: h3 libh3.a
@@ -112,6 +122,18 @@ h3_gpu_dit_ops_tests: tests/test_gpu_dit_ops.o $(BACKEND_PROBE_OBJ) \
 
 gpu-dit-ops-test: h3_gpu_dit_ops_tests
 	./h3_gpu_dit_ops_tests
+
+h3_gpu_h3_reference_ops_tests: tests/test_gpu_h3_reference_ops.o \
+		$(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3-reference-ops-test: h3_gpu_h3_reference_ops_tests
+	@if [ "$(BACKEND)" = "hip" ] && [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
+		echo "h3-reference-ops-test requires H3_PHYSICAL_GPU=4" >&2; exit 2; \
+	fi
+	$(if $(filter hip,$(BACKEND)),HIP_VISIBLE_DEVICES=4) \
+		./h3_gpu_h3_reference_ops_tests
 
 h3_json_tests: tests/test_json.o h3_json.o
 	$(CC) -o $@ $^ -lm
@@ -154,6 +176,73 @@ h3_vdn_prompt_tests: tests/test_vdn_prompt.o h3_vdn_prompt.o h3_safetensors.o
 vdn-prompt-test: h3_vdn_prompt_tests
 	./h3_vdn_prompt_tests \
 		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors
+
+h3_vdn_upstream_oracle_tests: tests/test_vdn_upstream_oracle.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+VDN_UPSTREAM_ORACLE ?= misc/fixtures/vdn_upstream_input_small.safetensors
+vdn-upstream-oracle-test: h3_vdn_upstream_oracle_tests
+	@test -f $(VDN_UPSTREAM_ORACLE) || { \
+		echo "missing upstream oracle: $(VDN_UPSTREAM_ORACLE)" >&2; exit 2; \
+	}
+	./h3_vdn_upstream_oracle_tests $(VDN_UPSTREAM_ORACLE)
+
+h3_vdn_block0_oracle_tests: tests/test_vdn_block0_oracle.o h3_vdn_dit.o h3_host.o \
+		$(VDN_WEIGHT_SUPPORT_OBJ) $(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+VDN_BLOCK0_ORACLE ?= misc/fixtures/vdn_upstream_block0_stage_dmd_small.safetensors
+vdn-block0-oracle-test: h3_vdn_block0_oracle_tests
+	@test -f $(VDN_BLOCK0_ORACLE) || { \
+		echo "missing block-0 oracle: $(VDN_BLOCK0_ORACLE)" >&2; exit 2; \
+	}
+	./h3_vdn_block0_oracle_tests \
+		$(VDN_METADATA_ROOT)/h3-base \
+		$(VDN_METADATA_ROOT)/stage-dmd-step-250 \
+		$(VDN_BLOCK0_ORACLE)
+
+h3_vdn_forward_oracle_tests: tests/test_vdn_forward_oracle.o h3_vdn_dit.o \
+		h3_host.o h3_vdn_prompt.o $(VDN_WEIGHT_SUPPORT_OBJ) \
+		$(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+VDN_FORWARD_ORACLE ?= misc/fixtures/vdn_upstream_forward50_stage_dmd_small.safetensors
+vdn-forward-oracle-test: h3_vdn_forward_oracle_tests
+	@test -f $(VDN_BLOCK0_ORACLE) || { \
+		echo "missing block-0 oracle: $(VDN_BLOCK0_ORACLE)" >&2; exit 2; \
+	}
+	@test -f $(VDN_FORWARD_ORACLE) || { \
+		echo "missing forward oracle: $(VDN_FORWARD_ORACLE)" >&2; exit 2; \
+	}
+	./h3_vdn_forward_oracle_tests \
+		$(VDN_METADATA_ROOT)/h3-base \
+		$(VDN_METADATA_ROOT)/stage-dmd-step-250 \
+		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors \
+		$(VDN_BLOCK0_ORACLE) \
+		$(VDN_FORWARD_ORACLE)
+
+h3_vdn_denoise_oracle_tests: tests/test_vdn_denoise_oracle.o h3_vdn_dit.o \
+		h3_host.o h3_vdn_prompt.o $(VDN_WEIGHT_SUPPORT_OBJ) \
+		$(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+VDN_DENOISE_ORACLE ?= misc/fixtures/vdn_upstream_denoise8_stage_dmd_small.safetensors
+vdn-denoise-oracle-test: h3_vdn_denoise_oracle_tests
+	@test -f $(VDN_BLOCK0_ORACLE) || { \
+		echo "missing block-0 oracle: $(VDN_BLOCK0_ORACLE)" >&2; exit 2; \
+	}
+	@test -f $(VDN_DENOISE_ORACLE) || { \
+		echo "missing denoise oracle: $(VDN_DENOISE_ORACLE)" >&2; exit 2; \
+	}
+	./h3_vdn_denoise_oracle_tests \
+		$(VDN_METADATA_ROOT)/h3-base \
+		$(VDN_METADATA_ROOT)/stage-dmd-step-250 \
+		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors \
+		$(VDN_BLOCK0_ORACLE) \
+		$(VDN_DENOISE_ORACLE)
 
 h3_vdn_input_contract_tests: tests/test_vdn_input_contract.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
@@ -245,11 +334,16 @@ h3_vdn_refiner_smoke_tests: tests/test_vdn_refiner_smoke.o h3_vdn_dit.o h3_host.
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+VDN_REFINER_ORACLE ?= misc/fixtures/vdn_upstream_refiner_stage_dmd_example0.safetensors
 vdn-refiner-smoke-test: h3_vdn_refiner_smoke_tests
+	@test -f $(VDN_REFINER_ORACLE) || { \
+		echo "missing refiner oracle: $(VDN_REFINER_ORACLE)" >&2; exit 2; \
+	}
 	./h3_vdn_refiner_smoke_tests \
 		$(VDN_METADATA_ROOT)/h3-base \
 		$(VDN_METADATA_ROOT)/stage-dmd-step-250 \
-		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors
+		$(VDN_METADATA_ROOT)/prompts/example_0.safetensors \
+		$(VDN_REFINER_ORACLE)
 
 h3_vdn_block_smoke_tests: tests/test_vdn_block_smoke.o h3_vdn_dit.o h3_host.o \
 		h3_vdn_prompt.o $(VDN_WEIGHT_SUPPORT_OBJ) \
@@ -298,6 +392,19 @@ h3_vdn_audio_vae_smoke_tests: tests/test_vdn_audio_vae_smoke.o $(LIB_OBJ)
 
 vdn-audio-vae-smoke-test: h3_vdn_audio_vae_smoke_tests
 	./h3_vdn_audio_vae_smoke_tests $(VDN_METADATA_ROOT)/h3-base/audio_vae
+
+h3_vdn_vae_oracle_tests: tests/test_vdn_vae_oracle.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+VDN_VAE_ORACLE ?= misc/fixtures/vdn_upstream_dual_vae_stage_dmd_small.safetensors
+vdn-vae-oracle-test: h3_vdn_vae_oracle_tests
+	@test -f $(VDN_VAE_ORACLE) || { \
+		echo "missing VAE oracle: $(VDN_VAE_ORACLE)" >&2; exit 2; \
+	}
+	./h3_vdn_vae_oracle_tests \
+		$(VDN_METADATA_ROOT)/h3-base/vae \
+		$(VDN_METADATA_ROOT)/h3-base/audio_vae \
+		$(VDN_VAE_ORACLE)
 
 h3_vdn_e2e_tests: tests/test_vdn_e2e.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
@@ -380,6 +487,9 @@ h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 h3_real_multimodal_text_test: tests/test_real_multimodal_text.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_real_qwen_gqa_test: tests/test_real_qwen_gqa.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
 h3_real_ref_video_text_test: tests/test_real_ref_video_text.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
@@ -413,6 +523,179 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
+
+H3_REFERENCE_MODEL_ROOT ?= MiniMax-H3
+H3_REFERENCE_FIXTURE_DIR ?= misc/fixtures
+H3_REFERENCE_PHYSICAL_GPU ?= 4
+H3_REFERENCE_BDF ?= 0000:e3:00.0
+H3_REFERENCE_MODEL_REVISION ?= 42ed227ee7df40d41602854ae760620d6eb651fe
+H3_REFERENCE_SCOPE ?= both
+H3_REFERENCE_TEXT_ORACLE ?= $(H3_REFERENCE_FIXTURE_DIR)/h3_upstream_fl2va_text_v1.safetensors
+H3_REFERENCE_VISION_ORACLE ?= $(H3_REFERENCE_FIXTURE_DIR)/h3_upstream_fl2va_vision_64_v1.safetensors
+H3_REFERENCE_MULTIMODAL_ORACLE ?= $(H3_REFERENCE_FIXTURE_DIR)/h3_upstream_fl2va_multimodal_64_v2.safetensors
+H3_REFERENCE_AUDIO_ORACLE ?= $(H3_REFERENCE_FIXTURE_DIR)/h3_upstream_fl2va_audio_vae_v1.safetensors
+H3_REFERENCE_VIDEO_ORACLE ?= $(H3_REFERENCE_FIXTURE_DIR)/h3_upstream_fl2va_video_vae_v1.safetensors
+
+h3-hip-capability-report:
+	python3 scripts/audit_h3_hip_capabilities.py --format markdown
+
+h3-hip-reference-ready:
+	python3 scripts/audit_h3_hip_capabilities.py \
+		--format markdown --fail-on-reference-gaps
+
+h3-reference-preflight: h3
+	python3 scripts/check_h3_reference_env.py \
+		--model-root $(H3_REFERENCE_MODEL_ROOT) \
+		--fixture-dir $(H3_REFERENCE_FIXTURE_DIR) \
+		--physical-gpu $(H3_REFERENCE_PHYSICAL_GPU) \
+		--expected-bdf $(H3_REFERENCE_BDF)
+
+h3-reference-preflight-fl2va: h3
+	python3 scripts/check_h3_reference_env.py \
+		--model-root $(H3_REFERENCE_MODEL_ROOT) \
+		--fixture-dir $(H3_REFERENCE_FIXTURE_DIR) \
+		--physical-gpu $(H3_REFERENCE_PHYSICAL_GPU) \
+		--expected-bdf $(H3_REFERENCE_BDF) --fl2va-only
+
+h3-reference-model-plan:
+	python3 scripts/inspect_h3_reference_snapshot.py \
+		--revision $(H3_REFERENCE_MODEL_REVISION) \
+		--scope $(H3_REFERENCE_SCOPE) \
+		--destination $(H3_REFERENCE_MODEL_ROOT)
+
+ifndef H3_ORACLE_FIXTURE
+h3-oracle-validate:
+	@echo "error: set H3_ORACLE_FIXTURE=/path/to/oracle.safetensors" >&2
+	@exit 2
+else
+h3-oracle-validate:
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_ORACLE_FIXTURE)
+endif
+
+h3-audio-oracle-test: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-audio-oracle-test: h3_real_audio_vae_test h3_real_audio_encoder_test
+	@test "$(H3_REFERENCE_PHYSICAL_GPU)" = "4" || \
+		{ echo "error: original H3 GPU tests are restricted to physical GPU 4" >&2; exit 2; }
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_AUDIO_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_audio_vae_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_AUDIO_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_audio_encoder_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_AUDIO_ORACLE)
+
+h3-text-oracle-test: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-text-oracle-test: h3_real_prompt_test
+	@test "$(H3_REFERENCE_PHYSICAL_GPU)" = "4" || \
+		{ echo "error: original H3 GPU tests are restricted to physical GPU 4" >&2; exit 2; }
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_TEXT_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_prompt_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_TEXT_ORACLE)
+
+h3-vision-oracle-test: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-vision-oracle-test: h3_real_qwen_vision_test
+	@test "$(H3_REFERENCE_PHYSICAL_GPU)" = "4" || \
+		{ echo "error: original H3 GPU tests are restricted to physical GPU 4" >&2; exit 2; }
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_VISION_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_qwen_vision_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VISION_ORACLE)
+
+h3-multimodal-oracle-test: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-multimodal-oracle-test: h3_real_qwen_gqa_test h3_real_multimodal_text_test
+	@test "$(H3_REFERENCE_PHYSICAL_GPU)" = "4" || \
+		{ echo "error: original H3 GPU tests are restricted to physical GPU 4" >&2; exit 2; }
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_MULTIMODAL_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_qwen_gqa_test $(H3_REFERENCE_MULTIMODAL_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_multimodal_text_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_MULTIMODAL_ORACLE) 50
+
+h3-video-oracle-test: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-video-oracle-test: h3_real_video_vae_test h3_real_video_encoder_test
+	@test "$(H3_REFERENCE_PHYSICAL_GPU)" = "4" || \
+		{ echo "error: original H3 GPU tests are restricted to physical GPU 4" >&2; exit 2; }
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_VIDEO_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_video_vae_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VIDEO_ORACLE) $(H3_REFERENCE_VIDEO_ORACLE)
+	HIP_VISIBLE_DEVICES=$(H3_REFERENCE_PHYSICAL_GPU) \
+		./h3_real_video_encoder_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VIDEO_ORACLE)
+
+H3_REFERENCE_MUX_OUTPUT ?= outputs/h3-original-mux-oracle.mp4
+
+h3-mux-oracle-test: h3_av_mux_test
+	mkdir -p $(dir $(H3_REFERENCE_MUX_OUTPUT))
+	LD_LIBRARY_PATH=$(CURDIR)/.tools/ffmpeg/usr/lib/x86_64-linux-gnu$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} \
+	H3_FFMPEG=$(CURDIR)/.tools/ffmpeg/usr/bin/ffmpeg \
+	H3_FFPROBE=$(CURDIR)/.tools/ffmpeg/usr/bin/ffprobe \
+		./h3_av_mux_test $(H3_REFERENCE_MUX_OUTPUT)
+	LD_LIBRARY_PATH=$(CURDIR)/.tools/ffmpeg/usr/lib/x86_64-linux-gnu$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH} \
+	H3_FFPROBE=$(CURDIR)/.tools/ffmpeg/usr/bin/ffprobe \
+		python3 scripts/validate_h3_mux.py $(H3_REFERENCE_MUX_OUTPUT) \
+		--width 32 --height 32 --frames 48 --fps 24 \
+		--sample-rate 32000 --channels 2 --duration 2
+
+H3_CORRECTNESS_BINARIES := h3_tests h3_metal_tests h3_bf16_tests \
+	h3_tokenizer_tests h3_text_tests h3_audio_gpu_tests \
+	h3_gpu_h3_reference_ops_tests \
+	h3_real_prompt_test h3_real_dit_block_test h3_real_dit_schedule_test \
+	h3_real_dit_test h3_semantic_dit_test h3_real_video_vae_test \
+	h3_semantic_vae_test h3_real_audio_vae_test h3_real_audio_encoder_test \
+	h3_real_video_encoder_test h3_real_qwen_vision_test h3_real_qwen_gqa_test \
+	h3_real_multimodal_text_test h3_real_ref_video_text_test h3_av_mux_test
+
+# This is a release gate, not a developer smoke target.  Preflight and the HIP
+# capability audit deliberately fail instead of silently skipping absent model
+# trees, fixtures, tools, devices, or reference kernels.
+h3-correctness: export HIP_VISIBLE_DEVICES := $(H3_REFERENCE_PHYSICAL_GPU)
+h3-correctness: h3-reference-preflight h3-hip-reference-ready \
+		$(H3_CORRECTNESS_BINARIES)
+	./h3_tests
+	./h3_metal_tests $(H3_REFERENCE_FIXTURE_DIR)/h3_dit.safetensors
+	./h3_bf16_tests $(H3_REFERENCE_FIXTURE_DIR)/h3_dit_bf16.safetensors
+	./h3_tokenizer_tests $(H3_REFERENCE_MODEL_ROOT)/FL2VA/tokenizer/tokenizer.json
+	./h3_text_tests $(H3_REFERENCE_FIXTURE_DIR)/h3_text_bf16.safetensors
+	./h3_audio_gpu_tests
+	$(if $(filter hip,$(BACKEND)),HIP_VISIBLE_DEVICES=4) \
+		./h3_gpu_h3_reference_ops_tests
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_TEXT_ORACLE)
+	./h3_real_prompt_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_TEXT_ORACLE)
+	./h3_real_dit_block_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_dit_block0_bf16.safetensors
+	./h3_real_dit_schedule_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_dit_block0_bf16.safetensors
+	./h3_real_dit_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_dit_block0_bf16.safetensors \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_dit_step0_bf16.safetensors \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_dit_denoise20_bf16.safetensors
+	./h3_semantic_dit_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_prompt_bf16.safetensors \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_semantic_256x22_seed42.safetensors
+	./h3_real_video_vae_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VIDEO_ORACLE) $(H3_REFERENCE_VIDEO_ORACLE)
+	./h3_semantic_vae_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_semantic_256x22_seed42.safetensors
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_AUDIO_ORACLE)
+	./h3_real_audio_vae_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_AUDIO_ORACLE)
+	./h3_real_audio_encoder_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_AUDIO_ORACLE)
+	./h3_real_video_encoder_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VIDEO_ORACLE)
+	./h3_real_qwen_vision_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_VISION_ORACLE)
+	python3 scripts/validate_h3_oracle_fixture.py $(H3_REFERENCE_MULTIMODAL_ORACLE)
+	./h3_real_qwen_gqa_test $(H3_REFERENCE_MULTIMODAL_ORACLE)
+	./h3_real_multimodal_text_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_MULTIMODAL_ORACLE) 50
+	./h3_real_ref_video_text_test $(H3_REFERENCE_MODEL_ROOT) \
+		$(H3_REFERENCE_FIXTURE_DIR)/h3_real_ref_video_text_64.safetensors
+	$(MAKE) BACKEND=$(BACKEND) h3-mux-oracle-test
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
@@ -555,15 +838,19 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 
 clean:
 	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_gpu_ops_tests \
-		h3_gpu_dit_ops_tests h3_json_tests h3_sha256_tests h3_vdn_metadata_tests \
+		h3_gpu_dit_ops_tests h3_gpu_h3_reference_ops_tests \
+		h3_json_tests h3_sha256_tests h3_vdn_metadata_tests \
+		h3_vdn_block0_oracle_tests h3_vdn_forward_oracle_tests \
+		h3_vdn_denoise_oracle_tests \
 		h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_vdn_reference_tests h3_vdn_block_loader_tests h3_vdn_prompt_tests \
+		h3_vdn_upstream_oracle_tests \
 		h3_vdn_input_contract_tests h3_vdn_gpu_ops_tests \
 		h3_vdn_feature_tests h3_vdn_solve_tests h3_vdn_scan_tests \
 		h3_vdn_sage_tests \
 		h3_vdn_refiner_smoke_tests h3_vdn_block_smoke_tests \
 		h3_vdn_forward_smoke_tests h3_vdn_video_vae_smoke_tests \
-		h3_vdn_audio_vae_smoke_tests h3_vdn_e2e_tests \
+		h3_vdn_audio_vae_smoke_tests h3_vdn_vae_oracle_tests h3_vdn_e2e_tests \
 		h3_vdn_int8_gemm_bench h3_vdn_fp8_gemm_bench \
 		h3_vdn_block_weight_gemm_bench h3_vae_f32_gemm_bench \
 		h3_vae_f32_compare \
@@ -573,7 +860,7 @@ clean:
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
-		h3_real_video_encoder_test h3_real_qwen_vision_test \
+		h3_real_video_encoder_test h3_real_qwen_vision_test h3_real_qwen_gqa_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \

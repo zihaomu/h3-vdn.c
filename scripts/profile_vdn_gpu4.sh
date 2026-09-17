@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 OUTPUT_DIRECTORY -- COMMAND [ARGUMENT ...]" >&2
-    echo "Runs COMMAND with only HIP ordinal 4 visible and captures 1 Hz GPU, disk, and process telemetry." >&2
+    echo "Runs COMMAND with only H3_PHYSICAL_GPU (default: 4) visible and captures GPU, disk, and process telemetry." >&2
     echo "Set H3_TELEMETRY_DISABLE=1 for a preflighted no-sampling control." >&2
 }
 
@@ -16,12 +16,16 @@ fi
 output_directory=$1
 shift 2
 command=("$@")
-physical_gpu=4
+physical_gpu=${H3_PHYSICAL_GPU:-4}
 sample_interval=${H3_TELEMETRY_INTERVAL:-1}
 telemetry_disabled=${H3_TELEMETRY_DISABLE:-0}
 amd_smi=${AMD_SMI:-/opt/rocm/bin/amd-smi}
 device_probe=${H3_DEVICE_PROBE:-./h3}
 
+if [[ ! $physical_gpu =~ ^[0-9]+$ ]]; then
+    echo "invalid H3_PHYSICAL_GPU=$physical_gpu; use a non-negative HIP ordinal" >&2
+    exit 2
+fi
 if [[ ! $sample_interval =~ ^[1-9][0-9]*$ ]]; then
     echo "invalid H3_TELEMETRY_INTERVAL=$sample_interval; use whole seconds >= 1" >&2
     exit 2
@@ -39,7 +43,7 @@ if [[ ! -x $device_probe ]]; then
     exit 2
 fi
 if ! command -v jq >/dev/null 2>&1; then
-    echo "jq is required to validate the physical GPU 4 identity and idle state" >&2
+    echo "jq is required to validate physical GPU $physical_gpu identity and idle state" >&2
     exit 2
 fi
 
@@ -69,13 +73,14 @@ fi
 mkdir -p "$output_directory"
 
 export HIP_VISIBLE_DEVICES=$physical_gpu
+export H3_PHYSICAL_GPU=$physical_gpu
 selected_device=$($device_probe --list-devices)
 selected_bdf=$(awk -F '\t' '$1 == "0" {print $NF}' <<<"$selected_device")
 amd_smi_gpu=$($amd_smi list --json | jq -r --arg bdf "$selected_bdf" \
     '.[] | select(.bdf == $bdf) | .gpu')
 if [[ -z $selected_bdf || $selected_bdf == "-" ||
       ! $amd_smi_gpu =~ ^[0-9]+$ ]]; then
-    echo "cannot map HIP ordinal 4 to an AMD SMI GPU; refusing to start" >&2
+    echo "cannot map HIP ordinal $physical_gpu to an AMD SMI GPU; refusing to start" >&2
     exit 1
 fi
 identity_json=$($amd_smi static --gpu "$amd_smi_gpu" --asic --bus --json)
@@ -87,17 +92,19 @@ gpu_use=$(jq -r '.gpu_data[0].usage.gfx_activity.value // empty' <<<"$initial_js
 gpu_memory_mb=$(jq -r '.gpu_data[0].mem_usage.used_vram.value // empty' <<<"$initial_json")
 if [[ $identity_gpu != "$amd_smi_gpu" || $identity_bdf != "$selected_bdf" ||
       -z $identity_arch || -z $gpu_use || -z $gpu_memory_mb ]]; then
-    echo "cannot parse physical GPU 4 utilization; refusing to start" >&2
+    echo "cannot parse physical GPU $physical_gpu utilization; refusing to start" >&2
     exit 1
 fi
 if (( gpu_use > 10 || gpu_memory_mb > 256 )); then
-    echo "physical GPU 4 is busy (GPU=${gpu_use}%, used VRAM=${gpu_memory_mb} MiB); refusing to use another GPU" >&2
+    echo "physical GPU $physical_gpu is busy (GPU=${gpu_use}%, used VRAM=${gpu_memory_mb} MiB); refusing to use another GPU" >&2
     exit 1
 fi
 
 # Repeat after device discovery so a process started during the BDF/SMI probe
 # cannot slip through the first workspace-wide check.
 refuse_other_h3_workloads
+export H3_PHYSICAL_GPU_BDF=$identity_bdf
+export H3_AMD_SMI_GPU=$amd_smi_gpu
 
 {
     echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -129,6 +136,7 @@ gpu_sampler_pid=
 disk_sampler_pid=
 process_sampler_pid=
 workspace_guard_pid=
+gpu_contention_guard_pid=
 
 stop_sampler() {
     local pid=$1
@@ -143,6 +151,7 @@ cleanup() {
     stop_sampler "$disk_sampler_pid"
     stop_sampler "$process_sampler_pid"
     stop_sampler "$workspace_guard_pid"
+    stop_sampler "$gpu_contention_guard_pid"
 }
 trap cleanup EXIT INT TERM
 
@@ -179,6 +188,30 @@ echo "workload_pid=$workload_pid" >>"$output_directory/run.meta"
 ) >"$output_directory/concurrency.guard.log" 2>&1 &
 workspace_guard_pid=$!
 
+# The workspace-wide h3 guard above cannot see unrelated Python/ROCm jobs.
+# Reject any process that begins using the selected physical card after this
+# workload starts. We terminate only our own PID and leave the external job
+# untouched; a contended run is not valid benchmark or correctness evidence.
+(
+    while kill -0 "$workload_pid" 2>/dev/null; do
+        if process_json=$($amd_smi process --gpu "$amd_smi_gpu" --json 2>/dev/null); then
+            contender=$(jq -r --argjson workload_pid "$workload_pid" '
+                .[]?.process_list[]?.process_info |
+                select((.pid | tonumber) != $workload_pid and
+                       ((.memory_usage.vram_mem.value // 0) | tonumber) > 0) |
+                "pid=\(.pid) vram_bytes=\(.memory_usage.vram_mem.value) name=\(.name)"' \
+                <<<"$process_json" | head -n 1)
+            if [[ -n $contender ]]; then
+                echo "detected external target-GPU contention ($contender); terminating guarded PID=$workload_pid"
+                kill -TERM "$workload_pid" 2>/dev/null || true
+                exit 0
+            fi
+        fi
+        sleep 1
+    done
+) >"$output_directory/gpu-contention.guard.log" 2>&1 &
+gpu_contention_guard_pid=$!
+
 if [[ $telemetry_disabled == 0 ]]; then
     (
         while kill -0 "$workload_pid" 2>/dev/null; do
@@ -194,7 +227,7 @@ if [[ $telemetry_disabled == 0 ]]; then
             fi
             sleep "$sample_interval"
         done
-    ) >"$output_directory/gpu4.telemetry.log" 2>&1 &
+    ) >"$output_directory/gpu${physical_gpu}.telemetry.log" 2>&1 &
     gpu_sampler_pid=$!
 
     if command -v iostat >/dev/null 2>&1; then

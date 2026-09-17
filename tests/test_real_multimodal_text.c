@@ -28,9 +28,17 @@ static void progress(int completed, int total, void *opaque) {
                 completed, total);
 }
 
-static void read_exact(const h3_st_header *fixture, const char *name,
-                       h3_dtype dtype, void *output, size_t elements) {
+static const h3_st_tensor *find_alias(const h3_st_header *fixture,
+                                      const char *name,
+                                      const char *legacy_name) {
     const h3_st_tensor *tensor = h3_st_find(fixture, name);
+    return tensor || !legacy_name ? tensor : h3_st_find(fixture, legacy_name);
+}
+
+static void read_exact(const h3_st_header *fixture, const char *name,
+                       const char *legacy_name,
+                       h3_dtype dtype, void *output, size_t elements) {
+    const h3_st_tensor *tensor = find_alias(fixture, name, legacy_name);
     if (!tensor || tensor->dtype != dtype ||
         h3_st_tensor_elements(tensor) != elements)
         die("fixture tensor is absent or malformed");
@@ -50,8 +58,10 @@ int main(int argc, char **argv) {
     h3_st_header fixture;
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
         die(error);
-    const h3_st_tensor *ids_tensor = h3_st_find(&fixture, "x.ids");
-    const h3_st_tensor *vision_tensor = h3_st_find(&fixture, "x.vision_merged");
+    const h3_st_tensor *ids_tensor = find_alias(
+        &fixture, "input.token_ids", "x.ids");
+    const h3_st_tensor *vision_tensor = find_alias(
+        &fixture, "vision.merged", "x.vision_merged");
     if (!ids_tensor || ids_tensor->dtype != H3_DTYPE_I32 ||
         ids_tensor->ndim != 2 || ids_tensor->shape[0] != 1 ||
         !vision_tensor || vision_tensor->dtype != H3_DTYPE_BF16 ||
@@ -73,21 +83,28 @@ int main(int argc, char **argv) {
     if (!ids || !positions || !tags_i32 || !tags || !vision ||
         !deepstack[0] || !deepstack[1] || !deepstack[2] || !want)
         die("out of memory loading multimodal fixture");
-    read_exact(&fixture, "x.ids", H3_DTYPE_I32, ids, tokens);
-    read_exact(&fixture, "x.position_ids", H3_DTYPE_I32,
+    read_exact(&fixture, "input.token_ids", "x.ids", H3_DTYPE_I32,
+               ids, tokens);
+    read_exact(&fixture, "layout.position_ids", "x.position_ids", H3_DTYPE_I32,
                positions, 3 * tokens);
-    read_exact(&fixture, "x.tags", H3_DTYPE_I32, tags_i32, tokens);
-    read_exact(&fixture, "x.vision_merged", H3_DTYPE_BF16,
+    read_exact(&fixture, "layout.tags", "x.tags", H3_DTYPE_I32,
+               tags_i32, tokens);
+    read_exact(&fixture, "vision.merged", "x.vision_merged", H3_DTYPE_BF16,
                vision, vision_tokens * 5120);
     for (unsigned index = 0; index < 3; index++) {
-        char name[64];
-        snprintf(name, sizeof(name), "x.vision_deepstack_%u", index);
-        read_exact(&fixture, name, H3_DTYPE_BF16, deepstack[index],
+        char name[64], legacy_name[64];
+        snprintf(name, sizeof(name), "vision.deepstack_%u", index);
+        snprintf(legacy_name, sizeof(legacy_name),
+                 "x.vision_deepstack_%u", index);
+        read_exact(&fixture, name, legacy_name, H3_DTYPE_BF16, deepstack[index],
                    vision_tokens * 5120);
     }
-    char expected_name[64];
-    snprintf(expected_name, sizeof(expected_name), "x.layer_%d", layers - 1);
-    read_exact(&fixture, expected_name, H3_DTYPE_BF16,
+    char expected_name[64], legacy_expected_name[64];
+    snprintf(expected_name, sizeof(expected_name),
+             "text.layer_%02d.output", layers);
+    snprintf(legacy_expected_name, sizeof(legacy_expected_name),
+             "x.layer_%d", layers - 1);
+    read_exact(&fixture, expected_name, legacy_expected_name, H3_DTYPE_BF16,
                want, tokens * 5120);
     size_t first_zero = tokens, zero_count = 0;
     for (size_t index = 0; index < tokens; index++) {
@@ -170,11 +187,12 @@ int main(int argc, char **argv) {
                (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
            (unsigned long long)got.gpu_stats.submissions);
-    /* Prefixes through layer 43 remain tightly numerical. At layer 44 the
-     * released fused attention crosses a sharp token-selection boundary, so a
-     * different Metal reduction order amplifies a small input delta. The full
-     * decoder gate therefore checks representation-level similarity. */
-    double bound = layers <= 43 ? 0.03 : 0.15;
+    /* Canonical v2 fixtures carry the explicit all-ones mask used by the
+     * released Diffusers conditioner and therefore use the strict bound at
+     * every layer.  Retain the wider late-layer bound only for old MLX
+     * fixtures that predate this upstream contract. */
+    int canonical_v2 = h3_st_find(&fixture, "input.attention_mask") != NULL;
+    double bound = canonical_v2 || layers <= 43 ? 0.03 : 0.15;
     if (nonfinite || rel_max >= bound || rel_l2 >= bound)
         die("multimodal Qwen parity bound exceeded");
     h3_text_embedding_free(&got);
@@ -182,7 +200,7 @@ int main(int argc, char **argv) {
     free(ids); free(positions); free(tags_i32); free(tags); free(vision);
     for (unsigned index = 0; index < 3; index++) free(deepstack[index]);
     free(want);
-    printf("ok: native Qwen3-VL presentation matches the MLX layer-%d oracle\n",
+    printf("ok: native Qwen3-VL presentation matches the upstream layer-%d oracle\n",
            layers);
     return 0;
 }

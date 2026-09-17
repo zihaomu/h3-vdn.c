@@ -55,6 +55,7 @@ typedef struct {
     double scan_seconds;
     double weight_read_seconds;
     double weight_upload_seconds;
+    double weight_staging_wait_seconds;
     uint64_t weight_read_bytes;
     uint64_t weight_upload_bytes;
     uint64_t staging_hits;

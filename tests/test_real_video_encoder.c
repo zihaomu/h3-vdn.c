@@ -31,8 +31,12 @@ int main(int argc, char **argv) {
     h3_st_header fixture;
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
         die(error);
-    const h3_st_tensor *pixel_tensor = h3_st_find(&fixture, "x.pixels");
-    const h3_st_tensor *latent_tensor = h3_st_find(&fixture, "x.latent");
+    const h3_st_tensor *pixel_tensor = h3_st_find(
+        &fixture, "video.encode.rgb_f32");
+    const h3_st_tensor *latent_tensor = h3_st_find(
+        &fixture, "video.encode.normalized_latent");
+    if (!pixel_tensor) pixel_tensor = h3_st_find(&fixture, "x.pixels");
+    if (!latent_tensor) latent_tensor = h3_st_find(&fixture, "x.latent");
     if (!pixel_tensor || pixel_tensor->dtype != H3_DTYPE_F32 ||
         (pixel_tensor->ndim != 4 && pixel_tensor->ndim != 5) ||
         pixel_tensor->shape[0] != 1 ||
@@ -84,7 +88,7 @@ int main(int argc, char **argv) {
     printf("visual encoder: max abs %.7g, relative L2 %.7g\n",
            maximum, relative_l2);
     printf("visual encoder: %.3f GiB allocated, %.3f GPU seconds, "
-           "%llu MPS convolutions, %llu submissions\n",
+           "%llu convolution dispatches, %llu submissions\n",
            (double)got.gpu_stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
            (unsigned long long)got.gpu_stats.mps_conv_dispatches,
@@ -99,6 +103,6 @@ int main(int argc, char **argv) {
     h3_st_free_header(&fixture);
     free(pixels);
     free(want);
-    puts("ok: native Metal visual encoder matches the MLX anchor latent");
+    puts("ok: native visual encoder matches the upstream posterior mean");
     return 0;
 }

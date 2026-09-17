@@ -33,6 +33,52 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+int h3_ffmpeg_check_available(char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    const char *program = ffmpeg_program();
+    if (strchr(program, '/')) {
+        if (access(program, X_OK) == 0) return 1;
+        fail(error, error_size,
+             "FFmpeg executable %s is unavailable: %s",
+             program, strerror(errno));
+        return 0;
+    }
+
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin";
+    const char *cursor = path;
+    while (1) {
+        const char *separator = strchr(cursor, ':');
+        size_t directory_length = separator ?
+            (size_t)(separator - cursor) : strlen(cursor);
+        const char *directory = directory_length ? cursor : ".";
+        size_t effective_length = directory_length ? directory_length : 1;
+        size_t program_length = strlen(program);
+        if (effective_length <= SIZE_MAX - program_length - 2) {
+            size_t bytes = effective_length + 1 + program_length + 1;
+            char *candidate = malloc(bytes);
+            if (!candidate) {
+                fail(error, error_size,
+                     "out of memory checking FFmpeg executable");
+                return 0;
+            }
+            memcpy(candidate, directory, effective_length);
+            candidate[effective_length] = '/';
+            memcpy(candidate + effective_length + 1, program,
+                   program_length + 1);
+            int executable = access(candidate, X_OK) == 0;
+            free(candidate);
+            if (executable) return 1;
+        }
+        if (!separator) break;
+        cursor = separator + 1;
+    }
+    fail(error, error_size,
+         "FFmpeg executable %s is not on PATH; source "
+         "scripts/use_vdn_tools.sh or set H3_FFMPEG", program);
+    return 0;
+}
+
 static int make_parents(const char *path, char *error, size_t error_size) {
     char *copy = strdup(path);
     if (!copy) {

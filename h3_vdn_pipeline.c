@@ -299,7 +299,8 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         "  \"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
         "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
         "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
-        "\"h2d_gib_per_second\": %.6f, \"staging_hits\": %" PRIu64 ", "
+        "\"h2d_gib_per_second\": %.6f, \"staging_wait_seconds\": %.6f, "
+        "\"staging_hits\": %" PRIu64 ", "
         "\"staging_misses\": %" PRIu64 "},\n"
         "  \"resident_weight_cache\": {\"budget_bytes\": %" PRIu64 ", "
         "\"resident_bytes\": %" PRIu64 ", \"blocks\": %u, "
@@ -339,6 +340,7 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
         gpu_profile->weight_read_bytes, gpu_profile->weight_read_seconds,
         read_gibps, gpu_profile->weight_upload_bytes,
         gpu_profile->weight_upload_seconds, upload_gibps,
+        gpu_profile->weight_staging_wait_seconds,
         gpu_profile->staging_hits, gpu_profile->staging_misses,
         cache_stats->budget_bytes, cache_stats->resident_bytes,
         cache_stats->resident_blocks, cache_stats->hits, cache_stats->misses,
@@ -386,7 +388,8 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             "\"weight_stream\": {\"read_bytes\": %" PRIu64 ", "
             "\"read_seconds\": %.6f, \"read_gib_per_second\": %.6f, "
             "\"h2d_bytes\": %" PRIu64 ", \"h2d_seconds\": %.6f, "
-            "\"h2d_gib_per_second\": %.6f, \"staging_hits\": %" PRIu64 ", "
+            "\"h2d_gib_per_second\": %.6f, \"staging_wait_seconds\": %.6f, "
+            "\"staging_hits\": %" PRIu64 ", "
             "\"staging_misses\": %" PRIu64 "}}%s\n",
             entry->index, entry->video_timestep, entry->audio_timestep,
             entry->wall_seconds, entry->forward.total_seconds,
@@ -411,10 +414,92 @@ static int write_record(h3_ctx *ctx, const h3_params *params,
             entry->profile.weight_read_seconds, nfe_read_gibps,
             entry->profile.weight_upload_bytes,
             entry->profile.weight_upload_seconds, nfe_upload_gibps,
+            entry->profile.weight_staging_wait_seconds,
             entry->profile.staging_hits, entry->profile.staging_misses,
             index + 1 < denoise_profile->count ? "," : "") >= 0;
     }
-    if (ok) ok = fputs("  ]\n}\n", file) != EOF;
+    if (ok) ok = fprintf(file,
+        "  ],\n  \"block_profile\": {\"schema_version\": 1, "
+        "\"enabled\": %s, \"records\": [\n",
+        denoise_profile->block_profile_enabled ? "true" : "false") >= 0;
+    unsigned written_blocks = 0;
+    for (unsigned nfe_index = 0;
+         ok && nfe_index < denoise_profile->count; nfe_index++) {
+        const h3_vdn_nfe_timing *nfe =
+            &denoise_profile->entries[nfe_index];
+        if (nfe->block_timing_offset > denoise_profile->block_timing_count ||
+            nfe->block_timing_count >
+                denoise_profile->block_timing_count -
+                    nfe->block_timing_offset) {
+            ok = 0;
+            break;
+        }
+        for (unsigned block_index = 0;
+             ok && block_index < nfe->block_timing_count; block_index++) {
+            const h3_vdn_block_timing *block =
+                &denoise_profile->block_timings[
+                    nfe->block_timing_offset + block_index];
+            double phase_accounted = block->load_wall_seconds +
+                block->execute_wall_seconds + block->release_wall_seconds;
+            double phase_residual = block->wall_seconds - phase_accounted;
+            if (phase_residual < 0.0) phase_residual = 0.0;
+            ok = fprintf(file,
+                "      {\"nfe_index\": %u, \"block_index\": %u, "
+                "\"wall_seconds\": %.6f, "
+                "\"phase_seconds\": {\"load\": %.6f, "
+                "\"execute\": %.6f, \"release\": %.6f, "
+                "\"residual\": %.6f}, "
+                "\"load\": {\"read_bytes\": %" PRIu64 ", "
+                "\"read_seconds\": %.6f, \"h2d_bytes\": %" PRIu64 ", "
+                "\"h2d_seconds\": %.6f, \"staging_wait_seconds\": %.6f, "
+                "\"staging_hits\": %" PRIu64 ", "
+                "\"staging_misses\": %" PRIu64 ", "
+                "\"lora_seconds\": %.6f, \"lora_calls\": %" PRIu64 ", "
+                "\"encode_seconds\": %.6f, \"wait_seconds\": %.6f, "
+                "\"submissions\": %" PRIu64 "}, "
+                "\"execute\": {\"encode_seconds\": %.6f, "
+                "\"wait_seconds\": %.6f, \"submissions\": %" PRIu64 ", "
+                "\"linear_seconds\": %.6f, \"lora_seconds\": %.6f, "
+                "\"sdpa_seconds\": %.6f, \"solve_seconds\": %.6f, "
+                "\"scan_seconds\": %.6f, \"linear_calls\": %" PRIu64 ", "
+                "\"lora_calls\": %" PRIu64 ", \"sdpa_calls\": %" PRIu64 ", "
+                "\"solve_calls\": %" PRIu64 ", \"scan_calls\": %" PRIu64
+                "}}%s\n",
+                nfe->index, block->block_index, block->wall_seconds,
+                block->load_wall_seconds, block->execute_wall_seconds,
+                block->release_wall_seconds, phase_residual,
+                block->load_profile.weight_read_bytes,
+                block->load_profile.weight_read_seconds,
+                block->load_profile.weight_upload_bytes,
+                block->load_profile.weight_upload_seconds,
+                block->load_profile.weight_staging_wait_seconds,
+                block->load_profile.staging_hits,
+                block->load_profile.staging_misses,
+                block->load_profile.lora_seconds,
+                block->load_profile.lora_calls,
+                block->load_gpu.command_encode_seconds,
+                block->load_gpu.command_wait_seconds,
+                block->load_gpu.submissions,
+                block->execute_gpu.command_encode_seconds,
+                block->execute_gpu.command_wait_seconds,
+                block->execute_gpu.submissions,
+                block->execute_profile.linear_seconds,
+                block->execute_profile.lora_seconds,
+                block->execute_profile.sdpa_seconds,
+                block->execute_profile.solve_seconds,
+                block->execute_profile.scan_seconds,
+                block->execute_profile.linear_calls,
+                block->execute_profile.lora_calls,
+                block->execute_profile.sdpa_calls,
+                block->execute_profile.solve_calls,
+                block->execute_profile.scan_calls,
+                written_blocks + 1 < denoise_profile->block_timing_count ?
+                    "," : "") >= 0;
+            written_blocks++;
+        }
+    }
+    if (ok && written_blocks != denoise_profile->block_timing_count) ok = 0;
+    if (ok) ok = fputs("    ]}\n}\n", file) != EOF;
     if (fclose(file) != 0) ok = 0;
     if (!ok) snprintf(error, error_size, "cannot write inference record %s",
                       path);
@@ -467,6 +552,11 @@ h3_result *h3_vdn_generate_embedded(h3_ctx *ctx, const h3_params *params) {
 
     if (!params->prompt_embeddings || !*params->prompt_embeddings) {
         h3_set_error(ctx, "VDN generation requires prompt_embeddings");
+        return NULL;
+    }
+    if (params->output_path && *params->output_path &&
+        !h3_ffmpeg_check_available(detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
         return NULL;
     }
     const char *attention_mode = getenv("H3_VDN_SDPA");

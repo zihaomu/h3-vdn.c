@@ -37,24 +37,37 @@ int main(int argc, char **argv) {
     if (!h3_st_read_header(latent_path, &latents, error, sizeof(error))) die(error);
     if (!h3_st_read_header(frame_path, &frames, error, sizeof(error))) die(error);
     enum { LATENT_COUNT = 24 * 2 * 2 * 2, FRAME_COUNT = 3 * 5 * 32 * 32 };
-    const h3_st_tensor *latent_tensor = h3_st_find(&latents, "x.video_after_20");
-    const h3_st_tensor *frame_tensor = h3_st_find(&frames, "x.frames");
-    if (!latent_tensor || latent_tensor->dtype != H3_DTYPE_BF16 ||
+    const h3_st_tensor *latent_tensor = h3_st_find(
+        &latents, "video.decode.normalized_latent");
+    const h3_st_tensor *frame_tensor = h3_st_find(
+        &frames, "video.decode.rgb_f32");
+    int canonical_frames = frame_tensor != NULL;
+    if (!latent_tensor)
+        latent_tensor = h3_st_find(&latents, "x.video_after_20");
+    if (!frame_tensor) frame_tensor = h3_st_find(&frames, "x.frames");
+    if (!latent_tensor ||
+        (latent_tensor->dtype != H3_DTYPE_BF16 &&
+         latent_tensor->dtype != H3_DTYPE_F32) ||
         h3_st_tensor_elements(latent_tensor) != LATENT_COUNT ||
         !frame_tensor || frame_tensor->dtype != H3_DTYPE_F32 ||
         h3_st_tensor_elements(frame_tensor) != FRAME_COUNT)
         die("malformed visual decoder fixture");
+    int latent_is_f32 = latent_tensor->dtype == H3_DTYPE_F32;
     uint16_t latent_bf[LATENT_COUNT];
     float latent[LATENT_COUNT];
     float *want = malloc(FRAME_COUNT * sizeof(*want));
     if (!want) die("out of memory loading expected frames");
-    if (!h3_st_read_data(&latents, latent_tensor, latent_bf, sizeof(latent_bf),
-                         error, sizeof(error)) ||
-        !h3_st_read_data(&frames, frame_tensor, want,
+    int latent_ok = latent_is_f32 ?
+        h3_st_read_data(&latents, latent_tensor, latent, sizeof(latent),
+                        error, sizeof(error)) :
+        h3_st_read_data(&latents, latent_tensor, latent_bf, sizeof(latent_bf),
+                        error, sizeof(error));
+    if (!latent_ok || !h3_st_read_data(&frames, frame_tensor, want,
                          FRAME_COUNT * sizeof(*want), error, sizeof(error)))
         die(error);
-    for (size_t index = 0; index < LATENT_COUNT; index++)
-        latent[index] = bf16_to_f32(latent_bf[index]);
+    if (!latent_is_f32)
+        for (size_t index = 0; index < LATENT_COUNT; index++)
+            latent[index] = bf16_to_f32(latent_bf[index]);
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
     h3_video_frames got;
@@ -70,20 +83,22 @@ int main(int argc, char **argv) {
                 for (int channel = 0; channel < 3; channel++) {
                     size_t native = (((size_t)frame * 32 + (size_t)y) * 32 +
                                      (size_t)x) * 3 + (size_t)channel;
-                    size_t mlx = ((((size_t)channel * 5 + (size_t)frame) * 32 +
-                                  (size_t)y) * 32 + (size_t)x);
-                    double delta = (double)got.rgb[native] - want[mlx];
+                    size_t reference = canonical_frames ? native :
+                        ((((size_t)channel * 5 + (size_t)frame) * 32 +
+                          (size_t)y) * 32 + (size_t)x);
+                    double delta = (double)got.rgb[native] - want[reference];
                     if (fabs(delta) > maximum) maximum = fabs(delta);
-                    if (fabs(want[mlx]) > scale) scale = fabs(want[mlx]);
+                    if (fabs(want[reference]) > scale)
+                        scale = fabs(want[reference]);
                     square_error += delta * delta;
-                    square_value += (double)want[mlx] * want[mlx];
+                    square_value += (double)want[reference] * want[reference];
                 }
     double relative = maximum / (scale > 1e-12 ? scale : 1e-12);
     double l2 = sqrt(square_error / (square_value > 1e-24 ? square_value : 1e-24));
     printf("visual decoder frames: rel-max %.6g abs %.6g rel-L2 %.6g\n",
            relative, maximum, l2);
     printf("visual decoder: %.3f GiB allocated, %.3f GPU seconds, "
-           "%llu MPS linears, %llu SDPA, %llu submission\n",
+           "%llu linears, %llu SDPA, %llu submission\n",
            (double)got.gpu_stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
            (unsigned long long)got.gpu_stats.mps_linear_dispatches,
@@ -91,14 +106,21 @@ int main(int argc, char **argv) {
            (unsigned long long)got.gpu_stats.submissions);
     if (relative >= 0.05 || l2 >= 0.05)
         die("native visual decoder exceeds MLX parity bound");
+    /* HIP records the post-quant and latent embedding linears explicitly;
+       the Metal backend's historical counter folds those two operations. */
+#ifdef H3_BACKEND_HIP
+    const uint64_t expected_linears = 147;
+#else
+    const uint64_t expected_linears = 145;
+#endif
     if (got.gpu_stats.submissions != 38 ||
-        got.gpu_stats.mps_linear_dispatches != 145 ||
+        got.gpu_stats.mps_linear_dispatches != expected_linears ||
         got.gpu_stats.mps_sdpa_dispatches != 36)
         die("visual decoder did not batch/cache the expected hot path");
     h3_video_frames_free(&got);
     free(want);
     h3_st_free_header(&latents);
     h3_st_free_header(&frames);
-    puts("ok: native Metal visual decoder matches five MLX RGB frames");
+    puts("ok: native visual decoder matches five upstream RGB frames");
     return 0;
 }

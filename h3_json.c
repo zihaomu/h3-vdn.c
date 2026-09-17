@@ -27,10 +27,17 @@ struct h3_json_value {
         struct {
             h3_json_value **items;
             size_t count;
+            size_t capacity;
         } array;
         struct {
             h3_json_member *members;
             size_t count;
+            size_t member_capacity;
+            /* Parser-built open-addressed index.  Besides making repeated
+               lookup O(1), this avoids quadratic duplicate-key checks for
+               large objects such as the 151k-entry Qwen vocabulary. */
+            size_t *slots;
+            size_t slot_count;
         } object;
     } as;
 };
@@ -225,19 +232,25 @@ static h3_json_value *h3_json_parse_array(h3_json_parser *parser) {
         h3_json_value *item = h3_json_parse_value(parser);
         if (!item) goto failed_value;
         size_t count = array->as.array.count;
-        if (count == SIZE_MAX / sizeof(*array->as.array.items)) {
-            h3_json_free(item);
-            h3_json_fail(parser, "array is too large");
-            goto failed_value;
+        if (count == array->as.array.capacity) {
+            size_t capacity = array->as.array.capacity ?
+                array->as.array.capacity * 2 : 16;
+            if (capacity < array->as.array.capacity ||
+                capacity > SIZE_MAX / sizeof(*array->as.array.items)) {
+                h3_json_free(item);
+                h3_json_fail(parser, "array is too large");
+                goto failed_value;
+            }
+            h3_json_value **items = realloc(
+                array->as.array.items, capacity * sizeof(*items));
+            if (!items) {
+                h3_json_free(item);
+                h3_json_fail(parser, "out of memory");
+                goto failed_value;
+            }
+            array->as.array.items = items;
+            array->as.array.capacity = capacity;
         }
-        h3_json_value **items = realloc(
-            array->as.array.items, (count + 1) * sizeof(*items));
-        if (!items) {
-            h3_json_free(item);
-            h3_json_fail(parser, "out of memory");
-            goto failed_value;
-        }
-        array->as.array.items = items;
         array->as.array.items[count] = item;
         array->as.array.count++;
         h3_json_ws(parser);
@@ -262,11 +275,59 @@ failed:
     return NULL;
 }
 
-static int h3_json_duplicate_key(const h3_json_value *object,
-                                 const char *key) {
+static size_t h3_json_key_hash(const char *key) {
+    size_t hash = sizeof(size_t) >= 8 ?
+        (size_t)UINT64_C(1469598103934665603) : (size_t)UINT32_C(2166136261);
+    size_t prime = sizeof(size_t) >= 8 ?
+        (size_t)UINT64_C(1099511628211) : (size_t)UINT32_C(16777619);
+    for (const unsigned char *cursor = (const unsigned char *)key; *cursor;
+         cursor++) {
+        hash ^= *cursor;
+        hash *= prime;
+    }
+    return hash;
+}
+
+static size_t h3_json_object_lookup(const h3_json_value *object,
+                                    const char *key) {
+    if (!object->as.object.slot_count) return SIZE_MAX;
+    size_t mask = object->as.object.slot_count - 1;
+    size_t slot = h3_json_key_hash(key) & mask;
+    while (object->as.object.slots[slot]) {
+        size_t index = object->as.object.slots[slot] - 1;
+        if (!strcmp(object->as.object.members[index].key, key)) return index;
+        slot = (slot + 1) & mask;
+    }
+    return SIZE_MAX;
+}
+
+static void h3_json_object_insert(h3_json_value *object, size_t index) {
+    size_t mask = object->as.object.slot_count - 1;
+    size_t slot = h3_json_key_hash(
+        object->as.object.members[index].key) & mask;
+    while (object->as.object.slots[slot]) slot = (slot + 1) & mask;
+    object->as.object.slots[slot] = index + 1;
+}
+
+static int h3_json_object_reserve(h3_json_value *object, size_t members,
+                                  h3_json_parser *parser) {
+    if (members > SIZE_MAX / 2)
+        return h3_json_fail(parser, "object index is too large");
+    size_t wanted = 16;
+    while (wanted < members * 2) {
+        if (wanted > SIZE_MAX / 2)
+            return h3_json_fail(parser, "object index is too large");
+        wanted *= 2;
+    }
+    if (wanted <= object->as.object.slot_count) return 1;
+    size_t *slots = calloc(wanted, sizeof(*slots));
+    if (!slots) return h3_json_fail(parser, "out of memory");
+    free(object->as.object.slots);
+    object->as.object.slots = slots;
+    object->as.object.slot_count = wanted;
     for (size_t index = 0; index < object->as.object.count; index++)
-        if (!strcmp(object->as.object.members[index].key, key)) return 1;
-    return 0;
+        h3_json_object_insert(object, index);
+    return 1;
 }
 
 static h3_json_value *h3_json_parse_object(h3_json_parser *parser) {
@@ -284,7 +345,12 @@ static h3_json_value *h3_json_parse_object(h3_json_parser *parser) {
     for (;;) {
         char *key = h3_json_parse_string(parser);
         if (!key) goto failed_value;
-        if (h3_json_duplicate_key(object, key)) {
+        if (!h3_json_object_reserve(
+                object, object->as.object.count + 1, parser)) {
+            free(key);
+            goto failed_value;
+        }
+        if (h3_json_object_lookup(object, key) != SIZE_MAX) {
             free(key);
             h3_json_fail(parser, "duplicate object key");
             goto failed_value;
@@ -302,23 +368,30 @@ static h3_json_value *h3_json_parse_object(h3_json_parser *parser) {
             goto failed_value;
         }
         size_t count = object->as.object.count;
-        if (count == SIZE_MAX / sizeof(*object->as.object.members)) {
-            free(key);
-            h3_json_free(value);
-            h3_json_fail(parser, "object is too large");
-            goto failed_value;
+        if (count == object->as.object.member_capacity) {
+            size_t capacity = object->as.object.member_capacity ?
+                object->as.object.member_capacity * 2 : 16;
+            if (capacity < object->as.object.member_capacity ||
+                capacity > SIZE_MAX / sizeof(*object->as.object.members)) {
+                free(key);
+                h3_json_free(value);
+                h3_json_fail(parser, "object is too large");
+                goto failed_value;
+            }
+            h3_json_member *members = realloc(
+                object->as.object.members, capacity * sizeof(*members));
+            if (!members) {
+                free(key);
+                h3_json_free(value);
+                h3_json_fail(parser, "out of memory");
+                goto failed_value;
+            }
+            object->as.object.members = members;
+            object->as.object.member_capacity = capacity;
         }
-        h3_json_member *members = realloc(
-            object->as.object.members, (count + 1) * sizeof(*members));
-        if (!members) {
-            free(key);
-            h3_json_free(value);
-            h3_json_fail(parser, "out of memory");
-            goto failed_value;
-        }
-        object->as.object.members = members;
         object->as.object.members[count] = (h3_json_member){key, value};
         object->as.object.count++;
+        h3_json_object_insert(object, count);
         h3_json_ws(parser);
         if (parser->offset >= parser->length) {
             h3_json_fail(parser, "unterminated object");
@@ -552,6 +625,7 @@ void h3_json_free(h3_json_value *value) {
             h3_json_free(value->as.object.members[index].value);
         }
         free(value->as.object.members);
+        free(value->as.object.slots);
     }
     free(value);
 }
@@ -589,10 +663,8 @@ const h3_json_value *h3_json_object_value(const h3_json_value *object,
 const h3_json_value *h3_json_get(const h3_json_value *object,
                                  const char *key) {
     if (!object || object->type != H3_JSON_OBJECT || !key) return NULL;
-    for (size_t index = 0; index < object->as.object.count; index++)
-        if (!strcmp(object->as.object.members[index].key, key))
-            return object->as.object.members[index].value;
-    return NULL;
+    size_t index = h3_json_object_lookup(object, key);
+    return index == SIZE_MAX ? NULL : object->as.object.members[index].value;
 }
 
 const char *h3_json_string_value(const h3_json_value *value) {
