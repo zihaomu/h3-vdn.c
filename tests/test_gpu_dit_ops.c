@@ -36,6 +36,22 @@ static int compare(const uint16_t *actual, const float *expected,
     return 1;
 }
 
+static double relative_l2_bf16(const uint16_t *actual,
+                               const uint16_t *expected, size_t count,
+                               double *maximum) {
+    double error_square = 0.0;
+    double expected_square = 0.0;
+    *maximum = 0.0;
+    for (size_t index = 0; index < count; index++) {
+        double reference = f32(expected[index]);
+        double delta = (double)f32(actual[index]) - reference;
+        error_square += delta * delta;
+        expected_square += reference * reference;
+        *maximum = fmax(*maximum, fabs(delta));
+    }
+    return sqrt(error_square / fmax(expected_square, 1e-24));
+}
+
 #define CHECK(expression)                                                      \
     do {                                                                       \
         if (!(expression)) {                                                   \
@@ -57,7 +73,7 @@ int main(void) {
     float *large_patch_input = NULL;
     uint16_t *large_patch_output = NULL;
 
-    h3_gpu_tensor *owned[32] = {0};
+    h3_gpu_tensor *owned[40] = {0};
     size_t owned_count = 0;
 #define OWN(value) (owned[owned_count++] = (value))
 
@@ -165,6 +181,33 @@ int main(void) {
         h3_gpu_tensor_from_bf16(gpu, mlp_fc2, 4));
     h3_gpu_tensor *mlp_output_t = OWN(h3_gpu_tensor_new_bf16(gpu, 2));
     CHECK(mlp_input_t && mlp_fc1_t && mlp_fc2_t && mlp_output_t);
+
+    enum { FULL_SEQUENCE = 67, FULL_HEADS = 2, FULL_DIMENSION = 128,
+           FULL_ELEMENTS = FULL_SEQUENCE * FULL_HEADS * FULL_DIMENSION };
+    uint16_t full_query[FULL_ELEMENTS], full_key[FULL_ELEMENTS];
+    uint16_t full_value[FULL_ELEMENTS], full_scalar[FULL_ELEMENTS];
+    uint16_t full_tiled[FULL_ELEMENTS], full_repeat[FULL_ELEMENTS];
+    uint16_t full_matrix[FULL_ELEMENTS], full_matrix_repeat[FULL_ELEMENTS];
+    for (size_t index = 0; index < FULL_ELEMENTS; index++) {
+        int centered = (int)(index % 37) - 18;
+        full_query[index] = bf16((float)centered / 23.0f);
+        centered = (int)((index * 7 + 3) % 41) - 20;
+        full_key[index] = bf16((float)centered / 29.0f);
+        centered = (int)((index * 11 + 5) % 43) - 21;
+        full_value[index] = bf16((float)centered / 19.0f);
+    }
+    h3_gpu_tensor *full_query_t = OWN(h3_gpu_tensor_from_bf16(
+        gpu, full_query, FULL_ELEMENTS));
+    h3_gpu_tensor *full_key_t = OWN(h3_gpu_tensor_from_bf16(
+        gpu, full_key, FULL_ELEMENTS));
+    h3_gpu_tensor *full_value_t = OWN(h3_gpu_tensor_from_bf16(
+        gpu, full_value, FULL_ELEMENTS));
+    h3_gpu_tensor *full_output_t = OWN(h3_gpu_tensor_new_bf16(
+        gpu, FULL_ELEMENTS));
+    h3_gpu_tensor *full_repeat_t = OWN(h3_gpu_tensor_new_bf16(
+        gpu, FULL_ELEMENTS));
+    CHECK(full_query_t && full_key_t && full_value_t && full_output_t &&
+          full_repeat_t);
 
     CHECK(h3_gpu_begin(gpu));
     CHECK(h3_gpu_gate_bf16(gpu, gate_t, residual_t, branch_t, mod_t, map_t,
@@ -276,6 +319,79 @@ int main(void) {
     };
     CHECK(h3_gpu_tensor_read_bf16(mlp_output_t, mlp_output, 2));
     CHECK(compare(mlp_output, mlp_expected, 2, 0.025f, "fused MLP"));
+
+    setenv("H3_BF16_SDPA_ROCBLAS", "0", 1);
+    setenv("H3_BF16_SDPA_SCALAR", "1", 1);
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_output_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_output_t, full_scalar, FULL_ELEMENTS));
+    unsetenv("H3_BF16_SDPA_SCALAR");
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_output_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_repeat_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_output_t, full_tiled, FULL_ELEMENTS));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_repeat_t, full_repeat, FULL_ELEMENTS));
+    if (memcmp(full_tiled, full_repeat, sizeof(full_tiled))) {
+        fprintf(stderr, "D=128 tiled SDPA is not repeatable\n");
+        ok = 0;
+        goto done;
+    }
+    double full_maximum = 0.0;
+    double full_relative = relative_l2_bf16(
+        full_tiled, full_scalar, FULL_ELEMENTS, &full_maximum);
+    printf("D=128 tiled/scalar SDPA: max-abs %.8g rel-L2 %.8g; "
+           "repeat bitwise\n", full_maximum, full_relative);
+    if (full_relative >= 0.02) {
+        fprintf(stderr, "D=128 tiled SDPA exceeds scalar tolerance\n");
+        ok = 0;
+        goto done;
+    }
+
+    setenv("H3_BF16_SDPA_ROCBLAS", "1", 1);
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_output_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_repeat_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_output_t, full_matrix, FULL_ELEMENTS));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_repeat_t, full_matrix_repeat, FULL_ELEMENTS));
+    unsetenv("H3_BF16_SDPA_ROCBLAS");
+    if (memcmp(full_matrix, full_matrix_repeat, sizeof(full_matrix))) {
+        fprintf(stderr, "D=128 matrix SDPA is not repeatable\n");
+        ok = 0;
+        goto done;
+    }
+    double matrix_maximum = 0.0;
+    double matrix_relative = relative_l2_bf16(
+        full_matrix, full_scalar, FULL_ELEMENTS, &matrix_maximum);
+    printf("D=128 matrix/scalar SDPA: max-abs %.8g rel-L2 %.8g; "
+           "repeat bitwise\n", matrix_maximum, matrix_relative);
+    if (matrix_relative >= 0.02) {
+        fprintf(stderr, "D=128 matrix SDPA exceeds scalar tolerance\n");
+        ok = 0;
+        goto done;
+    }
 
 done:
     free(large_patch_output);

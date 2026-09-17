@@ -68,8 +68,17 @@ int main(int argc, char **argv) {
     if (!latent_is_f32)
         for (size_t index = 0; index < LATENT_COUNT; index++)
             latent[index] = bf16_to_f32(latent_bf[index]);
-    char weights[1024];
-    snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
+    char weights[1024], modern_index[1024];
+    snprintf(modern_index, sizeof(modern_index),
+             "%s/diffusion_pytorch_model.safetensors.index.json", model_root);
+    FILE *modern = fopen(modern_index, "rb");
+    if (modern) {
+        fclose(modern);
+        snprintf(weights, sizeof(weights), "%s", model_root);
+    } else {
+        snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source",
+                 model_root);
+    }
     h3_video_frames got;
     if (!h3_video_vae_decode(weights, "h3_shaders.metal", latent, 2, 2, 2,
                              progress, NULL, &got, error, sizeof(error)))
@@ -113,7 +122,10 @@ int main(int argc, char **argv) {
 #else
     const uint64_t expected_linears = 145;
 #endif
-    if (got.gpu_stats.submissions != 38 ||
+    /* Modern Diffusers QKV and FFN tensors require one load-time reorder
+       submission apiece per block; the legacy fused checkpoint does not. */
+    if ((got.gpu_stats.submissions != 38 &&
+         got.gpu_stats.submissions != 110) ||
         got.gpu_stats.mps_linear_dispatches != expected_linears ||
         got.gpu_stats.mps_sdpa_dispatches != 36)
         die("visual decoder did not batch/cache the expected hot path");

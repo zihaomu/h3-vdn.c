@@ -206,6 +206,61 @@ cleanup:
     return 0;
 }
 
+static int load_diffusers_w1(vae_context *vae, vae_block *block,
+                             const char *prefix, char *error,
+                             size_t error_size) {
+    char name[192];
+    snprintf(name, sizeof(name), "%sff.net.0.proj.weight", prefix);
+    h3_gpu_tensor *source_w = f2(
+        vae, name, FFN * 2, HIDDEN, error, error_size);
+    snprintf(name, sizeof(name), "%sff.net.0.proj.bias", prefix);
+    h3_gpu_tensor *source_b = f1(
+        vae, name, FFN * 2, error, error_size);
+    if (!source_w || !source_b) goto cleanup;
+
+    block->w1 = h3_gpu_tensor_new_f32(
+        vae->gpu, (size_t)FFN * 2 * HIDDEN);
+    block->w1_b = h3_gpu_tensor_new_f32(vae->gpu, (size_t)FFN * 2);
+    if (!block->w1 || !block->w1_b) {
+        fail(error, error_size, "cannot allocate reordered video VAE FFN: %s",
+             h3_gpu_error(vae->gpu));
+        goto cleanup;
+    }
+
+    /* Diffusers converts the released [gate; up] projection into [up; gate]
+     * for its SwiGLU implementation. Native H3 deliberately retains the
+     * released SiLU(gate) * up kernel, so restore both weight and bias halves
+     * while loading the converted checkpoint. */
+    size_t weight_half = (size_t)FFN * HIDDEN;
+    if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                "begin video VAE FFN reorder") ||
+        !gpu_op(vae, h3_gpu_copy_f32(
+            vae->gpu, block->w1, 0, source_w, weight_half, weight_half),
+            error, error_size, "restore video VAE FFN gate weight") ||
+        !gpu_op(vae, h3_gpu_copy_f32(
+            vae->gpu, block->w1, weight_half, source_w, 0, weight_half),
+            error, error_size, "restore video VAE FFN up weight") ||
+        !gpu_op(vae, h3_gpu_copy_f32(
+            vae->gpu, block->w1_b, 0, source_b, FFN, FFN),
+            error, error_size, "restore video VAE FFN gate bias") ||
+        !gpu_op(vae, h3_gpu_copy_f32(
+            vae->gpu, block->w1_b, FFN, source_b, 0, FFN),
+            error, error_size, "restore video VAE FFN up bias") ||
+        !gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                "submit video VAE FFN reorder")) goto cleanup;
+
+    h3_gpu_tensor_free(source_b);
+    h3_gpu_tensor_free(source_w);
+    return 1;
+
+cleanup:
+    h3_gpu_tensor_free(source_b);
+    h3_gpu_tensor_free(source_w);
+    free_tensor(&block->w1_b);
+    free_tensor(&block->w1);
+    return 0;
+}
+
 static void cleanup(vae_context *vae) {
     if (!vae) return;
     for (int index = 0; index < LAYERS; index++) free_block(&vae->blocks[index]);
@@ -260,8 +315,8 @@ static int load_block(vae_context *vae, int index, char *error,
     F1(norm2, "norm2.weight", HIDDEN);
     snprintf(name, sizeof(name), "%sff.net.0.proj.weight", prefix);
     if (has_weight(vae, name)) {
-        F2(w1, "ff.net.0.proj.weight", FFN * 2, HIDDEN);
-        F1(w1_b, "ff.net.0.proj.bias", FFN * 2);
+        if (!load_diffusers_w1(vae, block, prefix, error, error_size))
+            return 0;
         F2(w2, "ff.net.2.weight", HIDDEN, FFN);
         F1(w2_b, "ff.net.2.bias", HIDDEN);
     } else {

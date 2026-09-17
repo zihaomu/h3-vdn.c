@@ -14,16 +14,22 @@
 #ifndef H3_BENCH_LATENT_W
 #define H3_BENCH_LATENT_W 32
 #endif
+#ifndef H3_BENCH_LATENT_T
+#define H3_BENCH_LATENT_T 7
+#endif
+#ifndef H3_BENCH_AUDIO_T
+#define H3_BENCH_AUDIO_T 37
+#endif
 
 enum {
     TEXT_ROWS = 6,
     TEXT_WIDTH = 5120,
-    LATENT_T = 7,
+    LATENT_T = H3_BENCH_LATENT_T,
     LATENT_H = H3_BENCH_LATENT_H,
     LATENT_W = H3_BENCH_LATENT_W,
     CANVAS_H = LATENT_H * 16,
     CANVAS_W = LATENT_W * 16,
-    AUDIO_T = 37,
+    AUDIO_T = H3_BENCH_AUDIO_T,
     VIDEO_ELEMENTS = 24 * LATENT_T * LATENT_H * LATENT_W,
     AUDIO_ELEMENTS = 32 * 2 * AUDIO_T
 };
@@ -54,6 +60,7 @@ static uint16_t *load_text(const char *path) {
     h3_st_header header;
     if (!h3_st_read_header(path, &header, error, sizeof(error))) die(error);
     const h3_st_tensor *tensor = h3_st_find(&header, "x.output");
+    if (!tensor) tensor = h3_st_find(&header, "input.prompt");
     size_t elements = TEXT_ROWS * TEXT_WIDTH;
     if (!tensor || tensor->dtype != H3_DTYPE_BF16 ||
         h3_st_tensor_elements(tensor) != elements)
@@ -1586,9 +1593,17 @@ int main(int argc, char **argv) {
               ? h3_serving_schedule_build(20, &sigmas)
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
-    char weights[1024];
-    snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,
-             ref_layout ? "Ref2VA" : "FL2VA");
+    char weights[1024], modern_config[1024];
+    snprintf(modern_config, sizeof(modern_config),
+             "%s/transformer/config.json", model_root);
+    FILE *modern = !ref_layout ? fopen(modern_config, "rb") : NULL;
+    if (modern) {
+        fclose(modern);
+        snprintf(weights, sizeof(weights), "%s/transformer", model_root);
+    } else {
+        snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,
+                 ref_layout ? "Ref2VA" : "FL2VA");
+    }
     unsigned active_blocks = 50;
     int reuse_interval = 1;
     const char *layers = getenv("H3_BENCH_LAYERS");

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 enum {
     LATENT_LENGTH = 37,
@@ -51,8 +52,16 @@ int main(int argc, char **argv) {
                          WAVEFORM_COUNT * sizeof(*want), error, sizeof(error)))
         die(error);
 
-    char weights[1024];
-    snprintf(weights, sizeof(weights), "%s/FL2VA/audio_vae", model_root);
+    char weights[1024], modern_weights[1024];
+    snprintf(modern_weights, sizeof(modern_weights),
+             "%s/diffusion_pytorch_model.safetensors", model_root);
+    FILE *modern = fopen(modern_weights, "rb");
+    if (modern) {
+        fclose(modern);
+        snprintf(weights, sizeof(weights), "%s", model_root);
+    } else {
+        snprintf(weights, sizeof(weights), "%s/FL2VA/audio_vae", model_root);
+    }
     h3_audio_waveform got;
     if (!h3_audio_vae_decode(weights, "h3_shaders.metal", latent,
                              LATENT_LENGTH, progress, NULL, &got,

@@ -78,6 +78,7 @@ VDN_WEIGHT_SUPPORT_OBJ := h3_vdn_weights.o h3_weights.o h3_safetensors.o \
 	h3-hip-capability-report h3-hip-reference-ready \
 	h3-reference-preflight h3-reference-preflight-fl2va \
 	h3-reference-model-plan h3-oracle-validate \
+	h3-modern-loader-test h3-diffusers-dit-test \
 	h3-reference-ops-test h3-text-oracle-test h3-vision-oracle-test \
 	h3-multimodal-oracle-test \
 	h3-audio-oracle-test \
@@ -127,6 +128,27 @@ h3_gpu_h3_reference_ops_tests: tests/test_gpu_h3_reference_ops.o \
 		$(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3_diffusers_weights_tests: tests/test_h3_diffusers_weights.o \
+		h3_weights.o h3_safetensors.o \
+		$(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+h3-modern-loader-test: h3_diffusers_weights_tests
+	./h3_diffusers_weights_tests MiniMax-H3/transformer
+
+h3_diffusers_dit_tests: tests/test_h3_diffusers_dit.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
+H3_DIFFUSERS_DIT_ORACLE ?= misc/fixtures/h3_diffusers_dit_oracle.safetensors
+H3_DIFFUSERS_DIT_STEPS ?= 2
+h3-diffusers-dit-test: h3_diffusers_dit_tests
+	@test -f $(H3_DIFFUSERS_DIT_ORACLE) || { \
+		echo "missing Diffusers DiT oracle: $(H3_DIFFUSERS_DIT_ORACLE)" >&2; exit 2; \
+	}
+	./h3_diffusers_dit_tests MiniMax-H3/transformer \
+		$(H3_DIFFUSERS_DIT_ORACLE) $(H3_DIFFUSERS_DIT_STEPS)
 
 h3-reference-ops-test: h3_gpu_h3_reference_ops_tests
 	@if [ "$(BACKEND)" = "hip" ] && [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
@@ -514,9 +536,17 @@ h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_dit_bench_640_124: tests/bench_dit_640_124.o $(LIB_OBJ)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
 tests/bench_dit_864.o: tests/bench_dit.c
 	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_H=30 \
 		-DH3_BENCH_LATENT_W=54 -c $< -o $@
+
+tests/bench_dit_640_124.o: tests/bench_dit.c
+	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_H=24 \
+		-DH3_BENCH_LATENT_W=40 -DH3_BENCH_LATENT_T=37 \
+		-DH3_BENCH_AUDIO_T=207 -c $< -o $@
 
 h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 	$(LINK) -o $@ $^ $(LDLIBS)
@@ -839,6 +869,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_gpu_ops_tests \
 		h3_gpu_dit_ops_tests h3_gpu_h3_reference_ops_tests \
+		h3_diffusers_weights_tests h3_diffusers_dit_tests \
 		h3_json_tests h3_sha256_tests h3_vdn_metadata_tests \
 		h3_vdn_block0_oracle_tests h3_vdn_forward_oracle_tests \
 		h3_vdn_denoise_oracle_tests \
@@ -864,8 +895,9 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 h3_vdn_sdpa_bench h3_f32_sdpa_bench \
-	h3_vdn_sage_sdpa_bench libh3.a *.o *.d tests/*.o tests/*.d \
+	h3_dit_bench h3_dit_bench_864 h3_dit_bench_640_124 \
+		h3_vdn_sdpa_bench h3_f32_sdpa_bench h3_vdn_sage_sdpa_bench \
+		libh3.a *.o *.d tests/*.o tests/*.d \
 	$(SAGEATTENTION_BUILD_DIR)/*.o $(SAGEATTENTION_BUILD_DIR)/*.d \
 	$(SAGEATTENTION_BUILD_DIR)/*.a $(SAGEATTENTION_BUILD_DIR)/*.s \
 	$(SAGEATTENTION_BUILD_DIR)/test_contract \

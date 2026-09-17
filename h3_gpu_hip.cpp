@@ -93,6 +93,8 @@ struct h3_gpu {
     size_t int8_accumulator_workspace_bytes;
     void *f32_sdpa_split_workspace;
     size_t f32_sdpa_split_workspace_bytes;
+    void *bf16_sdpa_score_workspace;
+    size_t bf16_sdpa_score_workspace_bytes;
 };
 
 struct h3_gpu_tensor {
@@ -679,6 +681,29 @@ static int h3_gpu_ensure_f32_sdpa_split_workspace(h3_gpu *gpu,
     return 1;
 }
 
+static int h3_gpu_ensure_bf16_sdpa_score_workspace(h3_gpu *gpu,
+                                                    size_t bytes) {
+    if (gpu->bf16_sdpa_score_workspace_bytes >= bytes) return 1;
+    void *replacement = nullptr;
+    if (!h3_gpu_check(gpu, hipMalloc(&replacement, bytes ? bytes : 1),
+                      "hipMalloc BF16 SDPA score workspace")) return 0;
+    if (gpu->bf16_sdpa_score_workspace) {
+        if (!h3_gpu_check(gpu, hipFree(gpu->bf16_sdpa_score_workspace),
+                          "hipFree old BF16 SDPA score workspace")) {
+            (void)hipFree(replacement);
+            return 0;
+        }
+        gpu->stats.live_bytes -= gpu->bf16_sdpa_score_workspace_bytes;
+    }
+    gpu->bf16_sdpa_score_workspace = replacement;
+    gpu->bf16_sdpa_score_workspace_bytes = bytes;
+    gpu->stats.allocated_bytes += bytes;
+    gpu->stats.live_bytes += bytes;
+    if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+        gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
+}
+
 static int h3_gpu_same_sage_geometry(
         const h3_vdn_sage_bridge_geometry *left,
         const h3_vdn_sage_bridge_geometry *right) {
@@ -738,12 +763,13 @@ static int h3_gpu_copy_from_host(h3_gpu_tensor *tensor, size_t offset,
 }
 
 static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
-                            uint64_t file_offset, size_t elements,
+                            size_t destination_offset, uint64_t file_offset,
+                            size_t elements,
                             h3_gpu_dtype dtype, char *error,
                             size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!tensor || !path || !*path || tensor->dtype != dtype ||
-        tensor->elements != elements ||
+    if (!tensor || !path || !*path ||
+        !h3_gpu_valid_range(tensor, destination_offset, elements, dtype) ||
         file_offset > static_cast<uint64_t>(
             std::numeric_limits<off_t>::max())) {
         if (error && error_size)
@@ -770,7 +796,9 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
     }
 
     size_t completed = 0;
-    size_t bytes = tensor->bytes;
+    size_t item_size = h3_gpu_dtype_size(dtype);
+    size_t bytes = elements * item_size;
+    size_t destination_bytes = destination_offset * item_size;
     int profile = h3_gpu_profile_enabled();
     const char *serial_value = std::getenv("H3_HIP_SERIAL_STAGING");
     int serial = !gpu->staging_cache_enabled ||
@@ -809,7 +837,8 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                 break;
             }
             unsigned char *destination =
-                static_cast<unsigned char *>(tensor->data) + completed;
+                static_cast<unsigned char *>(tensor->data) +
+                destination_bytes + completed;
             ok = h3_gpu_check(
                      gpu, hipEventRecord(gpu->staging_copy_start[slot],
                                          gpu->stream),
@@ -865,7 +894,8 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
             return 0;
         }
         unsigned char *destination =
-            static_cast<unsigned char *>(tensor->data) + completed;
+            static_cast<unsigned char *>(tensor->data) +
+            destination_bytes + completed;
         double upload_start = profile ? h3_gpu_now() : 0.0;
         if (!h3_gpu_check(gpu,
                           hipMemcpyAsync(destination, staging,
@@ -910,7 +940,7 @@ static h3_gpu_tensor *h3_gpu_tensor_load(h3_gpu *gpu, const char *path,
     h3_gpu_tensor *tensor = h3_gpu_tensor_new(gpu, nullptr, elements, dtype);
     if (!tensor) return nullptr;
     char detail[512];
-    if (!h3_gpu_read_file(tensor, path, file_offset, elements, dtype,
+    if (!h3_gpu_read_file(tensor, path, 0, file_offset, elements, dtype,
                           detail, sizeof(detail))) {
         h3_gpu_set_error(gpu, "%s", detail);
         h3_gpu_tensor_free(tensor);
@@ -2870,6 +2900,211 @@ __global__ static void h3_hip_sdpa_kernel(
     }
 }
 
+/* Full-attention specialization for the released H3 D=128 geometry.
+ *
+ * The scalar oracle launches one 256-thread block for every (query, head)
+ * pair and performs a block-wide barrier for every key row. At production
+ * sequence lengths that leaves most lanes idle and executes billions of
+ * barriers per DiT forward. This kernel assigns eight query rows to the eight
+ * wave32s in a block and stages a 64-row K/V tile in LDS. Every wave keeps an
+ * F32 online-softmax state and four output channels per lane. K/V traffic is
+ * shared by the eight queries and synchronization occurs once per tile rather
+ * than once per key.
+ *
+ * The output boundary remains BF16. H3_BF16_SDPA_SCALAR=1 keeps the original
+ * kernel as a close-reference oracle for numerical qualification. */
+__global__ static void h3_hip_sdpa_bf16_d128_tiled_kernel(
+        const hip_bfloat16 *query, const hip_bfloat16 *key,
+        const hip_bfloat16 *value, hip_bfloat16 *output,
+        uint32_t batch, uint32_t sequence, uint32_t heads, float scale) {
+    constexpr uint32_t head_dim = 128;
+    constexpr uint32_t waves_per_block = 8;
+    constexpr uint32_t tile_rows = 64;
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t wave = threadIdx.x >> 5;
+    uint32_t query_row = blockIdx.x * waves_per_block + wave;
+    uint32_t head_batch = blockIdx.y;
+    uint32_t head = head_batch % heads;
+    uint32_t batch_index = head_batch / heads;
+    int active = query_row < sequence && batch_index < batch;
+    size_t batch_base = static_cast<size_t>(batch_index) * sequence * heads *
+                        head_dim;
+    size_t query_base = batch_base +
+        (static_cast<size_t>(query_row) * heads + head) * head_dim;
+
+    float query_values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (active) {
+#pragma unroll
+        for (uint32_t item = 0; item < 4; item++)
+            query_values[item] = static_cast<float>(
+                query[query_base + lane + item * 32]);
+    }
+    float accumulators[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    int have_score = 0;
+
+    extern __shared__ hip_bfloat16 shared_bf16[];
+    hip_bfloat16 *key_tile = shared_bf16;
+    hip_bfloat16 *value_tile = shared_bf16 + tile_rows * head_dim;
+    for (uint32_t tile_start = 0; tile_start < sequence;
+         tile_start += tile_rows) {
+        uint32_t rows = min(tile_rows, sequence - tile_start);
+        uint32_t elements = rows * head_dim;
+        for (uint32_t item = threadIdx.x; item < elements;
+             item += blockDim.x) {
+            uint32_t row = item / head_dim;
+            uint32_t dimension = item % head_dim;
+            size_t source = batch_base +
+                (static_cast<size_t>(tile_start + row) * heads + head) *
+                    head_dim + dimension;
+            key_tile[item] = key[source];
+            value_tile[item] = value[source];
+        }
+        __syncthreads();
+
+        if (active) {
+            for (uint32_t row = 0; row < rows; row++) {
+                size_t base = static_cast<size_t>(row) * head_dim + lane;
+                float score = 0.0f;
+#pragma unroll
+                for (uint32_t item = 0; item < 4; item++)
+                    score = fmaf(query_values[item], static_cast<float>(
+                        key_tile[base + item * 32]), score);
+#pragma unroll
+                for (uint32_t offset = 16; offset; offset >>= 1)
+                    score += __shfl_down(score, offset, 32);
+
+                float alpha = 1.0f;
+                float beta = 0.0f;
+                if (lane == 0) {
+                    score *= scale;
+                    if (!have_score) {
+                        maximum = score;
+                        denominator = 1.0f;
+                        alpha = 0.0f;
+                        beta = 1.0f;
+                        have_score = 1;
+                    } else {
+                        float next_maximum = fmaxf(maximum, score);
+                        alpha = expf(maximum - next_maximum);
+                        beta = expf(score - next_maximum);
+                        denominator = denominator * alpha + beta;
+                        maximum = next_maximum;
+                    }
+                }
+                alpha = __shfl(alpha, 0, 32);
+                beta = __shfl(beta, 0, 32);
+#pragma unroll
+                for (uint32_t item = 0; item < 4; item++)
+                    accumulators[item] = fmaf(
+                        beta, static_cast<float>(
+                            value_tile[base + item * 32]),
+                        accumulators[item] * alpha);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inverse = lane == 0 ? 1.0f / denominator : 0.0f;
+        inverse = __shfl(inverse, 0, 32);
+#pragma unroll
+        for (uint32_t item = 0; item < 4; item++)
+            output[query_base + lane + item * 32] = hip_bfloat16(
+                accumulators[item] * inverse);
+    }
+}
+
+__global__ static void h3_hip_sdpa_bf16_scores_softmax_kernel(
+        hip_bfloat16 *scores, uint32_t sequence, float scale) {
+    uint32_t query_row = blockIdx.x;
+    uint32_t lane = threadIdx.x;
+    if (query_row >= sequence) return;
+    extern __shared__ float reduction[];
+    hip_bfloat16 *row = scores + (size_t)query_row * sequence;
+    float maximum = -INFINITY;
+    for (uint32_t key = lane; key < sequence; key += blockDim.x)
+        maximum = fmaxf(maximum, static_cast<float>(row[key]) * scale);
+    reduction[lane] = maximum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride)
+            reduction[lane] = fmaxf(reduction[lane],
+                                    reduction[lane + stride]);
+        __syncthreads();
+    }
+    maximum = reduction[0];
+    float denominator = 0.0f;
+    for (uint32_t key = lane; key < sequence; key += blockDim.x)
+        denominator += expf(static_cast<float>(row[key]) * scale - maximum);
+    reduction[lane] = denominator;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    float inverse = 1.0f / reduction[0];
+    for (uint32_t key = lane; key < sequence; key += blockDim.x)
+        row[key] = hip_bfloat16(
+            expf(static_cast<float>(row[key]) * scale - maximum) * inverse);
+}
+
+static int h3_gpu_sdpa_bf16_d128_rocblas(
+        h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *query,
+        const h3_gpu_tensor *key, const h3_gpu_tensor *value,
+        uint32_t sequence, uint32_t heads, float scale) {
+    if (sequence > static_cast<uint32_t>(std::numeric_limits<rocblas_int>::max()) ||
+        static_cast<uint64_t>(heads) * 128u >
+            static_cast<uint64_t>(std::numeric_limits<rocblas_int>::max()) ||
+        static_cast<size_t>(sequence) > SIZE_MAX / sequence ||
+        static_cast<size_t>(sequence) * sequence >
+            SIZE_MAX / sizeof(hip_bfloat16)) {
+        h3_gpu_set_error(gpu, "BF16 matrix SDPA geometry overflows");
+        return 0;
+    }
+    size_t score_bytes = static_cast<size_t>(sequence) * sequence *
+                         sizeof(hip_bfloat16);
+    if (!h3_gpu_ensure_bf16_sdpa_score_workspace(gpu, score_bytes)) return 0;
+    auto *scores = static_cast<hip_bfloat16 *>(
+        gpu->bf16_sdpa_score_workspace);
+    auto *query_data = static_cast<const hip_bfloat16 *>(query->data);
+    auto *key_data = static_cast<const hip_bfloat16 *>(key->data);
+    auto *value_data = static_cast<const hip_bfloat16 *>(value->data);
+    auto *output_data = static_cast<hip_bfloat16 *>(output->data);
+    rocblas_int n = static_cast<rocblas_int>(sequence);
+    rocblas_int stride = static_cast<rocblas_int>(heads * 128u);
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    for (uint32_t head = 0; head < heads; head++) {
+        size_t offset = static_cast<size_t>(head) * 128;
+        rocblas_status status = rocblas_gemm_ex(
+            gpu->blas, rocblas_operation_transpose, rocblas_operation_none,
+            n, n, 128, &alpha, key_data + offset, rocblas_datatype_bf16_r,
+            stride, query_data + offset, rocblas_datatype_bf16_r, stride,
+            &beta, scores, rocblas_datatype_bf16_r, n, scores,
+            rocblas_datatype_bf16_r, n, rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard, 0, 0);
+        if (!h3_gpu_check_blas(gpu, status, "rocBLAS H3 full-attention QK"))
+            return 0;
+        hipLaunchKernelGGL(h3_hip_sdpa_bf16_scores_softmax_kernel,
+                           dim3(sequence), dim3(H3_HIP_THREADS),
+                           H3_HIP_THREADS * sizeof(float), gpu->stream,
+                           scores, sequence, scale);
+        if (!h3_gpu_kernel_enqueued(gpu, "H3 BF16 score softmax")) return 0;
+        status = rocblas_gemm_ex(
+            gpu->blas, rocblas_operation_none, rocblas_operation_none,
+            128, n, n, &alpha, value_data + offset, rocblas_datatype_bf16_r,
+            stride, scores, rocblas_datatype_bf16_r, n, &beta,
+            output_data + offset, rocblas_datatype_bf16_r, stride,
+            output_data + offset, rocblas_datatype_bf16_r, stride,
+            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        if (!h3_gpu_check_blas(gpu, status, "rocBLAS H3 full-attention PV"))
+            return 0;
+    }
+    return 1;
+}
+
 /* QK and PV are rocBLAS BF16 GEMMs below.  This kernel preserves the two
  * materialization boundaries between them: BF16 scaling and F32 softmax
  * followed by BF16 probabilities, exactly as Transformers eager specifies. */
@@ -3254,6 +3489,25 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
         heads == 32 && !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
     int split_scores = use_f32_d64_wave32 && !split_disabled &&
                        (registered_split_shape || split_forced);
+    const char *bf16_matrix_value = std::getenv("H3_BF16_SDPA_ROCBLAS");
+    int bf16_matrix_forced = bf16_matrix_value && *bf16_matrix_value &&
+                             std::strcmp(bf16_matrix_value, "0");
+    int bf16_matrix_disabled = bf16_matrix_value && *bf16_matrix_value &&
+                               !std::strcmp(bf16_matrix_value, "0");
+    int bf16_matrix_registered = head_dim == 128 && batch == 1 && !causal &&
+        !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
+    const char *bf16_scalar_value = std::getenv("H3_BF16_SDPA_SCALAR");
+    int bf16_scalar = bf16_scalar_value && *bf16_scalar_value &&
+                      std::strcmp(bf16_scalar_value, "0");
+    if (bf16_matrix_forced &&
+        std::strncmp(gpu->gcn_arch_name, "gfx1201", 7)) {
+        h3_gpu_set_error(gpu,
+            "H3_BF16_SDPA_ROCBLAS is only validated on gfx1201");
+        return 0;
+    }
+    int use_bf16_matrix = head_dim == 128 && batch == 1 && !causal &&
+        !bf16_scalar && (bf16_matrix_forced ||
+                         (bf16_matrix_registered && !bf16_matrix_disabled));
     if (use_f32_d64_wave32) {
         if (split_scores) {
             size_t pairs = static_cast<size_t>(batch) * heads * sequence;
@@ -3299,6 +3553,25 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                            static_cast<const float *>(value->data),
                            static_cast<float *>(output->data), batch, sequence,
                            heads, head_dim, scale, causal);
+    } else if (use_bf16_matrix) {
+        if (!h3_gpu_sdpa_bf16_d128_rocblas(
+                gpu, output, query, key, value, sequence, heads, scale))
+            return 0;
+    } else if (head_dim == 128 && gpu->warp_size == 32 && !causal &&
+               !bf16_scalar) {
+        constexpr uint32_t waves_per_block = 8;
+        constexpr uint32_t tile_rows = 64;
+        dim3 tiled_grid((sequence + waves_per_block - 1) / waves_per_block,
+                        batch * heads);
+        size_t tiled_shared = static_cast<size_t>(tile_rows) * 128 * 2 *
+                              sizeof(hip_bfloat16);
+        hipLaunchKernelGGL(h3_hip_sdpa_bf16_d128_tiled_kernel, tiled_grid,
+                           dim3(256), tiled_shared, gpu->stream,
+                           static_cast<const hip_bfloat16 *>(query->data),
+                           static_cast<const hip_bfloat16 *>(key->data),
+                           static_cast<const hip_bfloat16 *>(value->data),
+                           static_cast<hip_bfloat16 *>(output->data), batch,
+                           sequence, heads, scale);
     } else {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(h3_hip_sdpa_kernel<hip_bfloat16>), grid,
@@ -3324,7 +3597,7 @@ static int h3_gpu_qkv_rope(h3_gpu *gpu, h3_gpu_tensor *query,
                            uint32_t sequence, uint32_t heads,
                            uint32_t head_dim, uint32_t rope_half,
                            int grouped, float epsilon) {
-    size_t inner, elements, rope_elements;
+    size_t inner, elements, rope_elements = 0;
     if (!h3_gpu_require_compute(gpu, "QKV/RoPE") || !heads || !head_dim ||
         rope_half > head_dim / 2 || epsilon < 0.0f ||
         !h3_gpu_count_2d(gpu, heads, head_dim, &inner, "QKV inner") ||
@@ -3332,18 +3605,20 @@ static int h3_gpu_qkv_rope(h3_gpu *gpu, h3_gpu_tensor *query,
         !h3_gpu_count_2d(gpu, sequence, static_cast<uint32_t>(inner),
                          &elements, "QKV output") ||
         elements > SIZE_MAX / 3 ||
-        !h3_gpu_count_2d(gpu, sequence, rope_half, &rope_elements,
-                         "RoPE table") ||
+        (rope_half &&
+         !h3_gpu_count_2d(gpu, sequence, rope_half, &rope_elements,
+                          "RoPE table")) ||
         !h3_gpu_require_tensor(gpu, qkv, elements * 3, H3_GPU_BF16,
                                "QKV input") ||
         !h3_gpu_require_tensor(gpu, q_norm, head_dim, H3_GPU_BF16,
                                "Q norm") ||
         !h3_gpu_require_tensor(gpu, k_norm, head_dim, H3_GPU_BF16,
                                "K norm") ||
-        !h3_gpu_require_tensor(gpu, rope_cos, rope_elements, H3_GPU_BF16,
-                               "RoPE cosine") ||
-        !h3_gpu_require_tensor(gpu, rope_sin, rope_elements, H3_GPU_BF16,
-                               "RoPE sine") ||
+        (rope_half &&
+         (!h3_gpu_require_tensor(gpu, rope_cos, rope_elements, H3_GPU_BF16,
+                                 "RoPE cosine") ||
+          !h3_gpu_require_tensor(gpu, rope_sin, rope_elements, H3_GPU_BF16,
+                                 "RoPE sine"))) ||
         !h3_gpu_require_tensor(gpu, query, elements, H3_GPU_BF16,
                                "query") ||
         !h3_gpu_require_tensor(gpu, key, elements, H3_GPU_BF16, "key") ||
@@ -3452,6 +3727,7 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
     (void)hipFree(gpu->f32_sdpa_split_workspace);
+    (void)hipFree(gpu->bf16_sdpa_score_workspace);
     (void)hipFree(gpu->int8_accumulator_workspace);
     (void)hipFree(gpu->sage_workspace);
     (void)rocblas_destroy_handle(gpu->blas);
@@ -3536,8 +3812,16 @@ extern "C" int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor,
                                              size_t elements,
                                              char *error,
                                              size_t error_size) {
-    return h3_gpu_read_file(tensor, path, file_offset, elements,
+    return h3_gpu_read_file(tensor, path, 0, file_offset, elements,
                             H3_GPU_BF16, error, error_size);
+}
+
+extern "C" int h3_gpu_tensor_read_file_bf16_range(
+        h3_gpu_tensor *tensor, size_t destination_offset, const char *path,
+        uint64_t file_offset, size_t elements, char *error,
+        size_t error_size) {
+    return h3_gpu_read_file(tensor, path, destination_offset, file_offset,
+                            elements, H3_GPU_BF16, error, error_size);
 }
 
 extern "C" int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor,
@@ -3546,8 +3830,16 @@ extern "C" int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor,
                                                size_t elements,
                                                char *error,
                                                size_t error_size) {
-    return h3_gpu_read_file(tensor, path, file_offset, elements,
+    return h3_gpu_read_file(tensor, path, 0, file_offset, elements,
                             H3_GPU_BF16, error, error_size);
+}
+
+extern "C" int h3_gpu_tensor_stream_file_bf16_range(
+        h3_gpu_tensor *tensor, size_t destination_offset, const char *path,
+        uint64_t file_offset, size_t elements, char *error,
+        size_t error_size) {
+    return h3_gpu_read_file(tensor, path, destination_offset, file_offset,
+                            elements, H3_GPU_BF16, error, error_size);
 }
 
 extern "C" void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {

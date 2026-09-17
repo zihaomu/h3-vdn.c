@@ -2,60 +2,74 @@
 
 ## OpenVDN MiniMax-H3 on AMD ROCm — semantic correctness recovery
 
-> **Release warning (2026-09-16):** the native ROCm path completes 8-NFE,
-> both VAEs, and MP4 mux, but visual inspection proved that both the former
-> 512×512/56-frame acceptance artifact and the newer 640×384 renders are
-> colored block noise. The old gates established execution, determinism, and
-> container validity—not correspondence with the OpenVDN model. The v0.1.0
-> stable claim is withdrawn while upstream PyTorch layer-by-layer parity is
-> being established. Do not treat the current output as a valid generated
-> sample or the historical timings as correct-model performance.
+> **Release warning (2026-09-18):** this repository has two distinct paths.
+> The original MiniMax-H3 BF16 path now loads the official modern Diffusers
+> checkpoint and has passed a native C/HIP 640×384, 124-frame, 50-NFE visual
+> and A/V gate. The OpenVDN 8-NFE path still lacks an upstream model-level
+> oracle, and its historical 512×512 output is colored block noise. The old
+> OpenVDN v0.1.0 stable claim remains withdrawn; do not use its historical
+> timings as correct-model performance.
 
 ## Original MiniMax-H3 on ROCm — correctness status
 
-The branch now also carries a correctness-first HIP bring-up of the original
-MiniMax-H3 path, independently of OpenVDN. The frozen model revision is
-`42ed227ee7df40d41602854ae760620d6eb651fe`; the default formal AMD regression
-device remains physical GPU 4 (`gfx1201`, PCI `0000:e3:00.0`), while the latest
-user-authorized isolated diagnosis ran on physical GPU 1 (PCI
-`0000:43:00.0`). The modern official Diffusers checkpoint is installed and now
-has upstream 320×192 diagnostic and 640×384 semantic E2E reference runs;
-the native C loader still cannot consume that 14-shard modern layout because it
-expects the older 13-shard `FL2VA/transformer` names.
+The branch now also carries a correctness-first HIP implementation of the
+original MiniMax-H3 path, independently of OpenVDN. The frozen model revision
+is `42ed227ee7df40d41602854ae760620d6eb651fe`. The latest isolated native gate
+used one `gfx1201` card only: physical card 2, PCI `0000:43:00.0` (HIP ordinal 1
+on that host). The loader accepts both the released legacy `FL2VA/` layout and
+the official modern Diffusers root layout, including its 14-shard Transformer,
+split Q/K/V projections, runtime RoPE frequencies, and converted Video VAE FFN
+ordering.
 
 | Original H3 subsystem | Current HIP result |
 |---|---|
 | Tokenizer + Qwen text | Official token IDs exact; layer-50 relative-L2 `0.000554077` in the latest regression |
 | Qwen vision | Official 64×64 merged/deepstack oracle passes |
 | FL2VA multimodal conditioner | Official Diffusers all-ones attention-mask contract fixed; real GQA is bitwise exact and layer-50 relative-L2 is `0.001003644` |
-| Video/Audio VAE + mux | Official encoder/decoder tensor oracles and strict H.264/AAC A/V-sync contract pass |
+| Video/Audio VAE + mux | Legacy and modern Video VAE decode match the official RGB oracle at relative-L2 `5.40566e-7`; modern Audio VAE PCM relative-L2 is `2.028145e-5`; strict H.264/AAC A/V-sync contract passes |
 | HIP reference API coverage | `0` required gaps; 10 optional optimized DiT kernels remain unavailable |
-| Original DiT and E2E | Official BF16 Diffusers T2VA completed at 320×192 and 640×384, 124 frames and 50 NFE; 640×384 removes the low-resolution color/block artifacts and produces a coherent fox-in-snow video; native C remains blocked on old-to-modern Transformer layout adaptation |
+| Modern Transformer loader | All 14 shards and 638 required tensor aliases pass; modern split-QKV works in resident and SSD-streamed paths |
+| Original DiT oracle | Refiner, all 50 blocks, first velocity and 2-NFE final latent pass frozen BF16 relative-error bounds; tiled and matrix D=128 SDPA are repeatable and retain the scalar oracle fallback |
+| Original native E2E | 640×384, 124 frames, 50 NFE, dual VAE and H.264/AAC mux complete; 124/124 frame hashes are unique and visual inspection confirms that the former full-frame checkerboard artifact is gone |
 
-The first full upstream reference generated a playable 5.1667-second H.264/AAC
-file from the released H3-Base weights with seed 42. The deliberately tiny
-320×192 diagnostic was deterministic but retained chromatic and block-texture
-artifacts. A controlled follow-up kept 50 NFE and independently isolated VAE
-tiling, native versus `_native_math` SDPA, and resolution. Tiled and untiled
-VAE decodes and both SDPA modes retained the same artifact class, while native
-640×384 removed it: the result shows a clear fox moving coherently through a
-snowy forest. This identifies the earlier artifact as an out-of-distribution
-low-resolution failure rather than insufficient steps, VAE seams, or broken
-default SDPA.
+The native modern-checkpoint bring-up found two independent layout issues. The
+Diffusers Transformer stores each block as three contiguous Q/K/V tensors,
+whereas the legacy fused tensor is grouped per head. The converted Video VAE
+also stores its SwiGLU projection as `[up; gate]`, while the native released
+kernel consumes `[gate; up]`. The loader now adapts both formats without
+rewriting model files. Before the VAE correction, the modern decoder missed
+the official RGB oracle by relative-L2 `0.33242` and produced a regular
+full-frame checkerboard. After load-time FFN-half restoration it matches the
+legacy decoder at `5.40566e-7`, and the corrected production video is clean.
 
-The 640×384 call took 345.610 seconds, used 16.197 GiB peak Torch allocation,
-and produced H.264/AAC streams with MP4 SHA-256
-`fa179519f8aeb4587254c914f8c1b7867f123eada2ddd29807ffd39f42faa50b`.
-It ran exclusively on physical GPU 1; both contention guards were empty. This
-is an upstream semantic pass, not yet the final release-quality gate at the
-model's intended 768-pixel short edge. Evidence is under
-`outputs/h3-artifact-diagnosis-20260917-r4/`; the reproducible runners are
-`scripts/run_h3_artifact_diagnosis.py` and
-`scripts/decode_h3_saved_video_latent.py`. The code-only frozen contract,
-official model revision link, local evidence hashes, and pinned Diffusers
-patches are documented in
-[`doc/H3_BF16_640X384_BASELINE.md`](doc/H3_BF16_640X384_BASELINE.md). No model
-or generated output is tracked by Git.
+The frozen upstream Diffusers 640×384 reference took `345.610 s` with
+`16.197 GiB` peak Torch allocation. The first corrected native C/HIP run took
+`1:18:00`; profiling then attributed `78.095 s` of an `86.333 s` production
+NFE to the original full-attention kernel. The validated gfx1201 matrix path
+uses rocBLAS BF16 QK/PV with F32 accumulation, a parallel F32 softmax, and one
+reused per-head score workspace. It reduced that NFE to `14.046 s` (`6.15×`).
+With 20 explicitly resident DiT blocks the NFE reached `11.811 s`, and the
+complete 50-NFE/dual-VAE/mux run completed in `14:09.46`: `5.51×` faster than
+the corrected tiled baseline without changing prompt, seed, resolution,
+frames, layers, or NFE count.
+
+The optimized run produced 124 unique frames, H.264 640×384 video at 24 fps
+and AAC-LC stereo at 32 kHz; container duration was `5.175 s`. Its full-video
+SSIM/PSNR against the prior accepted native BF16 render were `0.933314` and
+`31.089467 dB`, decoded-audio PSNR exceeded `164 dB` per channel, and visual
+inspection passed. BF16/D128 full attention selects the matrix path by default
+only on the validated `gfx1201` domain; set
+`H3_BF16_SDPA_ROCBLAS=0` to restore tiled wave32 or
+`H3_BF16_SDPA_SCALAR=1` for the scalar oracle. `H3_DIT_RESIDENT_BLOCKS=20` is
+opt-in because it raises peak GPU allocation to about `18.1 GiB`; it reduced
+stream traffic from `36.606` to `22.251 GiB/NFE` on the tested 31.9 GiB card.
+
+Native correctness and the measured performance gain are established for this
+gate, but this is not yet a stable-release claim or validation at the model's
+intended 768-pixel short edge. The code-only frozen contract and official model
+revision are documented in
+[`doc/H3_BF16_640X384_BASELINE.md`](doc/H3_BF16_640X384_BASELINE.md). Model,
+oracle, latent, image, audio, video, and `outputs/` files are never tracked.
 
 The canonical multimodal gate is:
 
@@ -957,6 +971,23 @@ make BACKEND=hip \
 make BACKEND=hip vdn-sage-test sage-upstream-contract-test \
   sage-upstream-isa-test
 ```
+
+The original-H3 modern Diffusers loader and DiT gates are separate from the
+OpenVDN suite. They never install or commit a model or oracle:
+
+```sh
+make BACKEND=hip h3-modern-loader-test
+HIP_VISIBLE_DEVICES=1 make BACKEND=hip h3-diffusers-dit-test \
+  H3_DIFFUSERS_DIT_ORACLE=/tmp/h3-diffusers-diagnostic.safetensors
+HIP_VISIBLE_DEVICES=1 ./h3_gpu_dit_ops_tests
+```
+
+The DiT oracle is produced locally with
+`scripts/export_h3_diffusers_dit_oracle.py` from the pinned official revision
+and remains outside Git. The operator gate exercises scalar, tiled wave32, and
+matrix BF16/D128 attention, including repeatability. Use the HIP ordinal that
+maps to the one idle physical GPU selected for the run; do not copy the example
+ordinal without checking its PCI BDF.
 
 `vdn-sage-test` covers H3's dispatch-mode policy. The upstream targets cover
 SageAttention-AMD registry/tool/CPU contracts and the gfx12 WMMA ISA; GPU

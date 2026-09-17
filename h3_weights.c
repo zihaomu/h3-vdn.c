@@ -126,11 +126,9 @@ size_t h3_weight_store_shards(const h3_weight_store *store) {
     return store ? store->count : 0;
 }
 
-const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
-                                   const char *name,
-                                   const h3_st_header **header) {
-    if (header) *header = NULL;
-    if (!store || !name) return NULL;
+static const h3_st_tensor *find_exact(const h3_weight_store *store,
+                                      const char *name,
+                                      const h3_st_header **header) {
     for (size_t index = 0; index < store->count; index++) {
         const h3_st_tensor *tensor = h3_st_find(&store->headers[index], name);
         if (tensor) {
@@ -139,6 +137,97 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
         }
     }
     return NULL;
+}
+
+static int replace_once(char *destination, size_t capacity,
+                        const char *source, const char *old,
+                        const char *replacement) {
+    const char *match = strstr(source, old);
+    if (!match) return snprintf(destination, capacity, "%s", source) >= 0 &&
+                       strlen(source) < capacity;
+    size_t prefix = (size_t)(match - source);
+    size_t old_length = strlen(old);
+    size_t replacement_length = strlen(replacement);
+    size_t suffix = strlen(match + old_length);
+    if (prefix + replacement_length + suffix + 1 > capacity) return 0;
+    memcpy(destination, source, prefix);
+    memcpy(destination + prefix, replacement, replacement_length);
+    memcpy(destination + prefix + replacement_length, match + old_length,
+           suffix + 1);
+    return 1;
+}
+
+/* The first public MiniMax-H3 checkpoint used the original FL2VA module
+ * names. The Diffusers release preserves the tensors but adopts standard
+ * Diffusers names. Keep callers and the legacy checkpoint stable by resolving
+ * the old names only after an exact lookup misses. Split Q/K/V projections
+ * are handled by the DiT loader because they represent three payloads rather
+ * than a simple alias. */
+static int diffusers_alias(const char *name, char *alias, size_t capacity) {
+    struct exact_alias { const char *old; const char *modern; };
+    static const struct exact_alias exact[] = {
+        {"condition_proj.", "context_embedder."},
+        {"video_patch_proj.", "proj_in."},
+        {"audio_patch_proj.", "audio_proj_in."},
+        {"time_embedder.proj_in.", "time_embedder.linear_1."},
+        {"time_embedder.proj_out.", "time_embedder.linear_2."},
+        {"final_layer.adaln_proj.linear.", "norm_out.linear."},
+        {"final_layer.norm.", "norm_out.norm."},
+        {"final_layer.video_out.", "proj_out."},
+        {"final_layer.audio_out.", "audio_proj_out."},
+    };
+    for (size_t index = 0; index < sizeof(exact) / sizeof(*exact); index++) {
+        size_t length = strlen(exact[index].old);
+        if (!strncmp(name, exact[index].old, length))
+            return snprintf(alias, capacity, "%s%s", exact[index].modern,
+                            name + length) >= 0 &&
+                   strlen(exact[index].modern) + strlen(name + length) <
+                       capacity;
+    }
+
+    char first[256];
+    if (!strncmp(name, "token_refiner.blocks.", 21)) {
+        if (snprintf(first, sizeof(first), "token_refiner.refiner_blocks.%s",
+                     name + 21) < 0 ||
+            strlen("token_refiner.refiner_blocks.") + strlen(name + 21) >=
+                sizeof(first)) return 0;
+    } else if (!strncmp(name, "blocks.", 7)) {
+        if (snprintf(first, sizeof(first), "transformer_blocks.%s",
+                     name + 7) < 0 ||
+            strlen("transformer_blocks.") + strlen(name + 7) >= sizeof(first))
+            return 0;
+    } else {
+        return 0;
+    }
+
+    struct suffix_alias { const char *old; const char *modern; };
+    static const struct suffix_alias suffixes[] = {
+        {".attn.q_norm.", ".attn.norm_q."},
+        {".attn.k_norm.", ".attn.norm_k."},
+        {".attn.out_proj.", ".attn.to_out.0."},
+        {".mlp.fc1.", ".ff.net.0.proj."},
+        {".mlp.fc2.", ".ff.net.2."},
+    };
+    for (size_t index = 0; index < sizeof(suffixes) / sizeof(*suffixes);
+         index++) {
+        if (strstr(first, suffixes[index].old))
+            return replace_once(alias, capacity, first, suffixes[index].old,
+                                suffixes[index].modern);
+    }
+    return snprintf(alias, capacity, "%s", first) >= 0 &&
+           strlen(first) < capacity;
+}
+
+const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
+                                   const char *name,
+                                   const h3_st_header **header) {
+    if (header) *header = NULL;
+    if (!store || !name) return NULL;
+    const h3_st_tensor *tensor = find_exact(store, name, header);
+    if (tensor) return tensor;
+    char alias[256];
+    return diffusers_alias(name, alias, sizeof(alias)) ?
+        find_exact(store, alias, header) : NULL;
 }
 
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,

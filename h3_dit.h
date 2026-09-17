@@ -19,7 +19,9 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
 
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
  * happen before the persistent core is loaded. SSD streaming retains only the
- * small block norms and two alternating BF16 matrix slots. */
+ * small block norms and two alternating BF16 matrix slots by default.
+ * H3_DIT_RESIDENT_BLOCKS=N may additionally retain the first N active blocks
+ * when the caller has measured sufficient device-memory headroom. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
@@ -125,6 +127,15 @@ int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
                           size_t selected_count);
 
 int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
+
+/* Test/diagnostic readback of the text stream after the two token-refiner
+ * blocks. This is a synchronization point and is not used by generation. */
+int h3_dit_read_refined_text(const h3_dit *dit, uint16_t *values,
+                             size_t elements);
+int h3_dit_read_captured_block0(const h3_dit *dit, uint16_t *values,
+                                size_t elements);
+int h3_dit_read_captured_block(const h3_dit *dit, unsigned block,
+                               uint16_t *values, size_t elements);
 
 /* Exact row-order conversions, public internally so they can be pinned by
  * cheap tests independently of the 62 GiB checkpoint. */

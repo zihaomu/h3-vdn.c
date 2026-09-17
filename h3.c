@@ -15,6 +15,7 @@
 #include "h3_vdn_pipeline.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,6 +24,24 @@
 #include <sys/stat.h>
 
 static char h3_global_error[512];
+
+static int h3_has_safetensors(const char *directory) {
+    DIR *stream = opendir(directory);
+    if (!stream) return 0;
+    int found = 0;
+    struct dirent *entry;
+    static const char suffix[] = ".safetensors";
+    while ((entry = readdir(stream)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length > sizeof(suffix) - 1 &&
+            !strcmp(entry->d_name + length - (sizeof(suffix) - 1), suffix)) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(stream);
+    return found;
+}
 
 typedef struct {
     char *text;
@@ -454,12 +473,34 @@ h3_ctx *h3_load_dir_device(const char *model_dir, int device_index) {
         h3_free(ctx);
         return NULL;
     }
-    if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
-        !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
-        !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
-        !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
-        !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
+    char *diffusers_config = h3_path(ctx->model_dir,
+                                      "transformer/config.json");
+    if (!diffusers_config) {
+        h3_set_error(ctx, "out of memory resolving model layout");
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    ctx->diffusers_layout = h3_is_file(diffusers_config);
+    free(diffusers_config);
+    const char *transformer_config = ctx->diffusers_layout ?
+        "transformer/config.json" : "FL2VA/transformer/config.json";
+    const char *tokenizer = ctx->diffusers_layout ?
+        "tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json";
+    const char *text_encoder = ctx->diffusers_layout ?
+        "text_encoder" : "FL2VA/text_encoder";
+    const char *transformer = ctx->diffusers_layout ?
+        "transformer" : "FL2VA/transformer";
+    const char *video_vae = ctx->diffusers_layout ?
+        "vae" : "FL2VA/video_vae/source";
+    const char *audio_vae = ctx->diffusers_layout ?
+        "audio_vae" : "FL2VA/audio_vae";
+    if (!h3_require_file(ctx, transformer_config) ||
+        !h3_require_file(ctx, tokenizer) ||
+        !h3_inventory(ctx, text_encoder, &ctx->model.text_encoder) ||
+        !h3_inventory(ctx, transformer, &ctx->model.fl2va_transformer) ||
+        !h3_inventory(ctx, video_vae, &ctx->model.video_vae) ||
+        !h3_inventory(ctx, audio_vae, &ctx->model.audio_vae)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
         return NULL;
@@ -476,6 +517,17 @@ h3_ctx *h3_load_dir_device(const char *model_dir, int device_index) {
     }
     int has_ref2va = h3_is_file(ref_index);
     free(ref_index);
+    if (has_ref2va) {
+        char *ref_directory = h3_path(ctx->model_dir, "Ref2VA/transformer");
+        if (!ref_directory) {
+            h3_set_error(ctx, "out of memory resolving optional Ref2VA directory");
+            snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+            h3_free(ctx);
+            return NULL;
+        }
+        has_ref2va = h3_has_safetensors(ref_directory);
+        free(ref_directory);
+    }
     if (has_ref2va && !h3_inventory(
             ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
@@ -994,16 +1046,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int conditioned = 0;
     int dit_is_cached = 0;
     int decoder_is_cached = 0;
-    char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
-    char *text_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/transformer" : "FL2VA/transformer");
-    char *vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
-    char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    const char *tokenizer_relative = ref2va ?
+        "Ref2VA/tokenizer/tokenizer.json" :
+        (ctx->diffusers_layout ? "tokenizer/tokenizer.json" :
+                                 "FL2VA/tokenizer/tokenizer.json");
+    const char *text_relative = ref2va ? "Ref2VA/text_encoder" :
+        (ctx->diffusers_layout ? "text_encoder" : "FL2VA/text_encoder");
+    const char *dit_relative = ref2va ? "Ref2VA/transformer" :
+        (ctx->diffusers_layout ? "transformer" : "FL2VA/transformer");
+    const char *vae_relative = ref2va ? "Ref2VA/video_vae/source" :
+        (ctx->diffusers_layout ? "vae" : "FL2VA/video_vae/source");
+    const char *audio_vae_relative = ref2va ? "Ref2VA/audio_vae" :
+        (ctx->diffusers_layout ? "audio_vae" : "FL2VA/audio_vae");
+    char *tokenizer_path = h3_path(ctx->model_dir, tokenizer_relative);
+    char *text_path = h3_path(ctx->model_dir, text_relative);
+    char *dit_path = h3_path(ctx->model_dir, dit_relative);
+    char *vae_path = h3_path(ctx->model_dir, vae_relative);
+    char *audio_vae_path = h3_path(ctx->model_dir, audio_vae_relative);
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
