@@ -188,6 +188,8 @@ int main(void) {
     uint16_t full_value[FULL_ELEMENTS], full_scalar[FULL_ELEMENTS];
     uint16_t full_tiled[FULL_ELEMENTS], full_repeat[FULL_ELEMENTS];
     uint16_t full_matrix[FULL_ELEMENTS], full_matrix_repeat[FULL_ELEMENTS];
+    uint16_t full_auto[FULL_ELEMENTS];
+    uint16_t full_sage[FULL_ELEMENTS], full_sage_repeat[FULL_ELEMENTS];
     for (size_t index = 0; index < FULL_ELEMENTS; index++) {
         int centered = (int)(index % 37) - 18;
         full_query[index] = bf16((float)centered / 23.0f);
@@ -393,7 +395,59 @@ int main(void) {
         goto done;
     }
 
+    setenv("H3_BF16_SDPA", "auto", 1);
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_output_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_output_t, full_auto, FULL_ELEMENTS));
+    unsetenv("H3_BF16_SDPA");
+    if (memcmp(full_auto, full_matrix, sizeof(full_auto))) {
+        fprintf(stderr, "D=128 auto SDPA did not preserve matrix default\n");
+        ok = 0;
+        goto done;
+    }
+    printf("D=128 auto SDPA preserves matrix output bytes\n");
+
+    setenv("H3_BF16_SDPA", "sage-e33", 1);
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_output_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_sdpa_bf16(
+        gpu, full_repeat_t, full_query_t, full_key_t, full_value_t,
+        FULL_SEQUENCE, FULL_HEADS, FULL_DIMENSION,
+        1.0f / sqrtf((float)FULL_DIMENSION)));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_output_t, full_sage, FULL_ELEMENTS));
+    CHECK(h3_gpu_tensor_read_bf16(
+        full_repeat_t, full_sage_repeat, FULL_ELEMENTS));
+    unsetenv("H3_BF16_SDPA");
+    if (memcmp(full_sage, full_sage_repeat, sizeof(full_sage))) {
+        fprintf(stderr, "D=128 Sage E33 SDPA is not repeatable\n");
+        ok = 0;
+        goto done;
+    }
+    double sage_maximum = 0.0;
+    double sage_relative = relative_l2_bf16(
+        full_sage, full_scalar, FULL_ELEMENTS, &sage_maximum);
+    printf("D=128 Sage-E33/scalar SDPA: max-abs %.8g rel-L2 %.8g; "
+           "repeat bitwise\n", sage_maximum, sage_relative);
+    if (sage_relative >= 0.02) {
+        fprintf(stderr, "D=128 Sage E33 SDPA exceeds scalar tolerance\n");
+        ok = 0;
+        goto done;
+    }
+
 done:
+    unsetenv("H3_BF16_SDPA");
+    unsetenv("H3_BF16_SDPA_ROCBLAS");
+    unsetenv("H3_BF16_SDPA_SCALAR");
     free(large_patch_output);
     free(large_patch_input);
     for (size_t index = owned_count; index; index--)

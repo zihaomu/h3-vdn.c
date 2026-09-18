@@ -49,12 +49,13 @@ LDLIBS := -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
 	-lm -lpthread -ldl
 LIB_C += h3_tokenizer.c
 LIB_C += h3_vdn_weights.c h3_vdn_prompt.c h3_vdn_dit.c
-LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp h3_vdn_sage_bridge.cpp
+LIB_CPP := h3_hip.cpp h3_gpu_hip.cpp h3_vdn_sage_bridge.cpp \
+	h3_sage_dense_bridge.cpp
 SAGEATTENTION_OBJ := $(SAGEATTENTION_BUILD_DIR)/sage_attention.o \
 	$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage.o \
 	$(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage_gfx12.o
 BACKEND_PROBE_OBJ := h3_hip.o h3_vdn_sdpa_mode.o \
-	h3_vdn_sage_bridge.o $(SAGEATTENTION_OBJ)
+	h3_vdn_sage_bridge.o h3_sage_dense_bridge.o $(SAGEATTENTION_OBJ)
 else
 $(error unsupported BACKEND=$(BACKEND); use metal or hip)
 endif
@@ -305,6 +306,11 @@ h3_vdn_sage_sdpa_bench: tests/bench_vdn_sage_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
 	$(LINK) -o $@ $^ $(LDLIBS)
 
+h3_dense_sage_sdpa_bench: tests/bench_h3_dense_sage_sdpa.o \
+		$(BACKEND_PROBE_OBJ) \
+		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
+	$(LINK) -o $@ $^ $(LDLIBS)
+
 sageattention-check:
 	@if [ ! -f "$(SAGEATTENTION_DIR)/include/sage_attention.hpp" ]; then \
 		echo "SageAttention-AMD submodule is missing; run: git submodule update --init --recursive" >&2; \
@@ -317,13 +323,13 @@ sage-upstream-contract-test: sageattention-check
 		HIP_ARCHS=$(HIP_ARCHS) metadata-check tool-test contract-test
 
 sage-upstream-gpu-test: sageattention-check
-	@if [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
-		echo "sage-upstream-gpu-test requires H3_PHYSICAL_GPU=4" >&2; \
+	@if ! printf '%s' "$(H3_PHYSICAL_GPU)" | grep -Eq '^[0-9]+$$'; then \
+		echo "sage-upstream-gpu-test requires numeric H3_PHYSICAL_GPU" >&2; \
 		exit 2; \
 	fi
 	$(MAKE) -C $(SAGEATTENTION_DIR) \
 		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
-		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=4 gpu-test
+		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=$(H3_PHYSICAL_GPU) gpu-test
 
 sage-upstream-isa-test: sageattention-check
 	$(MAKE) -C $(SAGEATTENTION_DIR) \
@@ -331,13 +337,13 @@ sage-upstream-isa-test: sageattention-check
 		HIP_ARCHS=$(HIP_ARCHS) isa
 
 sage-upstream-bench: sageattention-check
-	@if [ "$(H3_PHYSICAL_GPU)" != "4" ]; then \
-		echo "sage-upstream-bench requires H3_PHYSICAL_GPU=4" >&2; \
+	@if ! printf '%s' "$(H3_PHYSICAL_GPU)" | grep -Eq '^[0-9]+$$'; then \
+		echo "sage-upstream-bench requires numeric H3_PHYSICAL_GPU" >&2; \
 		exit 2; \
 	fi
 	$(MAKE) -C $(SAGEATTENTION_DIR) \
 		BUILD_DIR=$(abspath $(SAGEATTENTION_TEST_BUILD_DIR)) \
-		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=4 bench
+		HIP_ARCHS=$(HIP_ARCHS) H3_PHYSICAL_GPU=$(H3_PHYSICAL_GPU) bench
 
 h3_f32_sdpa_bench: tests/bench_f32_sdpa.o $(BACKEND_PROBE_OBJ) \
 		$(if $(filter hip,$(BACKEND)),h3_gpu_hip.o,h3_gpu.o)
@@ -843,6 +849,7 @@ $(SAGEATTENTION_BUILD_DIR)/h3_vdn_sage_gfx12.o: \
 		-x hip -c $< -o $@
 
 h3_vdn_sage_bridge.o: CXXFLAGS += -I$(SAGEATTENTION_DIR)/include
+h3_sage_dense_bridge.o: CXXFLAGS += -I$(SAGEATTENTION_DIR)/include
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
@@ -869,6 +876,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_backend_tests h3_gpu_storage_tests h3_gpu_ops_tests \
 		h3_gpu_dit_ops_tests h3_gpu_h3_reference_ops_tests \
+		h3_dense_sage_sdpa_bench \
 		h3_diffusers_weights_tests h3_diffusers_dit_tests \
 		h3_json_tests h3_sha256_tests h3_vdn_metadata_tests \
 		h3_vdn_block0_oracle_tests h3_vdn_forward_oracle_tests \

@@ -30,6 +30,7 @@ ordering.
 | HIP reference API coverage | `0` required gaps; 10 optional optimized DiT kernels remain unavailable |
 | Modern Transformer loader | All 14 shards and 638 required tensor aliases pass; modern split-QKV works in resident and SSD-streamed paths |
 | Original DiT oracle | Refiner, all 50 blocks, first velocity and 2-NFE final latent pass frozen BF16 relative-error bounds; tiled and matrix D=128 SDPA are repeatable and retain the scalar oracle fallback |
+| SageAttention-AMD for original H3 | Generic dense E33 bridge passes the official 50-block/2-NFE oracle and three complete deterministic 640×384 runs; explicit opt-in is faster, but it remains non-default because frozen-render SSIM/PSNR failed |
 | Original native E2E | 640×384, 124 frames, 50 NFE, dual VAE and H.264/AAC mux complete; 124/124 frame hashes are unique and visual inspection confirms that the former full-frame checkerboard artifact is gone |
 
 The native modern-checkpoint bring-up found two independent layout issues. The
@@ -53,16 +54,46 @@ complete 50-NFE/dual-VAE/mux run completed in `14:09.46`: `5.51×` faster than
 the corrected tiled baseline without changing prompt, seed, resolution,
 frames, layers, or NFE count.
 
+Stage 3 also integrates the SageAttention-AMD E33 BF16-QK kernel through its
+generic dense-plan API. On the same card, production same-QKV attention fell
+from a three-session rocBLAS range of `105.888–108.585 ms` to
+`68.316–70.372 ms` (median speedup `1.546×`). A 20-resident-block NFE fell from
+`11.799 s` to a three-run median of `9.799 s`, while cumulative SDPA fell from
+`5.295 s` to `3.461 s`. Three full 640×384/124-frame/50-NFE runs completed in
+`12:41`, `12:52`, and `12:54`; the median `12:52` is `9.12%` below the frozen
+`14:09.46` matrix baseline. All three produced identical raw-frame and MP4
+hashes, and manual review found a coherent fox, motion, snow, and forest with
+no blocks or checkerboard artifacts.
+
+E33 is nevertheless **not the default**. Its full-video SSIM/PSNR against the
+frozen matrix render was `0.378892 / 13.944662 dB`, below the immutable
+`0.933314 / 31.089467 dB` promotion threshold because subject position and
+pose drifted over 50 denoising passes. Use it only as an explicit research
+backend:
+
+```sh
+H3_BF16_SDPA=sage-e33 H3_DIT_RESIDENT_BLOCKS=20 ./h3 ...
+```
+
+`H3_BF16_SDPA=auto` and an unset mode continue to select the validated rocBLAS
+matrix path on gfx1201. Explicit `rocblas`, `tiled`, and `scalar` modes remain
+available for A/B and recovery. Unsupported explicit Sage shapes fail instead
+of silently falling back. The dense Sage workspace is independent from the
+VDN sparse workspace, and the profiled asynchronous weight loader now uses
+per-read HIP timing events so concurrent prefetch lanes cannot overwrite one
+another.
+
 The optimized run produced 124 unique frames, H.264 640×384 video at 24 fps
 and AAC-LC stereo at 32 kHz; container duration was `5.175 s`. Its full-video
 SSIM/PSNR against the prior accepted native BF16 render were `0.933314` and
 `31.089467 dB`, decoded-audio PSNR exceeded `164 dB` per channel, and visual
 inspection passed. BF16/D128 full attention selects the matrix path by default
-only on the validated `gfx1201` domain; set
-`H3_BF16_SDPA_ROCBLAS=0` to restore tiled wave32 or
-`H3_BF16_SDPA_SCALAR=1` for the scalar oracle. `H3_DIT_RESIDENT_BLOCKS=20` is
-opt-in because it raises peak GPU allocation to about `18.1 GiB`; it reduced
-stream traffic from `36.606` to `22.251 GiB/NFE` on the tested 31.9 GiB card.
+only on the validated `gfx1201` domain. Prefer the canonical
+`H3_BF16_SDPA=rocblas|tiled|scalar|sage-e33|auto` switch; the legacy
+`H3_BF16_SDPA_ROCBLAS=0` and `H3_BF16_SDPA_SCALAR=1` controls remain compatible
+when the canonical switch is unset. `H3_DIT_RESIDENT_BLOCKS=20` is opt-in
+because it raises peak GPU allocation to about `18.1 GiB`; it reduced stream
+traffic from `36.606` to `22.251 GiB/NFE` on the tested 31.9 GiB card.
 
 Native correctness and the measured performance gain are established for this
 gate, but this is not yet a stable-release claim or validation at the model's

@@ -1,4 +1,5 @@
 #include "h3_gpu.h"
+#include "h3_sage_dense_bridge.h"
 #include "h3_vdn_sage_bridge.h"
 #include "h3_vdn_sdpa_mode.h"
 
@@ -82,13 +83,14 @@ struct h3_gpu {
     size_t staging_ready_count;
     uint64_t staging_hits;
     uint64_t staging_misses;
-    hipEvent_t staging_copy_start[2];
-    hipEvent_t staging_copy_end[2];
-    int staging_events_initialized;
     void *sage_workspace;
     size_t sage_workspace_bytes;
     h3_vdn_sage_bridge_geometry sage_geometry;
     int sage_workspace_prepared;
+    void *dense_sage_workspace;
+    size_t dense_sage_workspace_bytes;
+    h3_sage_dense_geometry dense_sage_geometry;
+    int dense_sage_workspace_prepared;
     void *int8_accumulator_workspace;
     size_t int8_accumulator_workspace_bytes;
     void *f32_sdpa_split_workspace;
@@ -198,60 +200,43 @@ static void h3_gpu_purge_staging(h3_gpu *gpu) {
     }
 }
 
-static int h3_gpu_init_staging_events(h3_gpu *gpu) {
-    if (gpu->staging_events_initialized) return 1;
-    for (unsigned slot = 0; slot < 2; slot++) {
-        if (!h3_gpu_check(gpu, hipEventCreate(&gpu->staging_copy_start[slot]),
-                          "hipEventCreate staging start") ||
-            !h3_gpu_check(gpu, hipEventCreate(&gpu->staging_copy_end[slot]),
-                          "hipEventCreate staging end")) {
-            for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
-                if (gpu->staging_copy_start[cleanup])
-                    (void)hipEventDestroy(gpu->staging_copy_start[cleanup]);
-                if (gpu->staging_copy_end[cleanup])
-                    (void)hipEventDestroy(gpu->staging_copy_end[cleanup]);
-                gpu->staging_copy_start[cleanup] = nullptr;
-                gpu->staging_copy_end[cleanup] = nullptr;
-            }
-            return 0;
-        }
-    }
-    gpu->staging_events_initialized = 1;
-    return 1;
-}
-
-static void h3_gpu_destroy_staging_events(h3_gpu *gpu) {
-    if (!gpu) return;
-    for (unsigned slot = 0; slot < 2; slot++) {
-        if (gpu->staging_copy_start[slot])
-            (void)hipEventDestroy(gpu->staging_copy_start[slot]);
-        if (gpu->staging_copy_end[slot])
-            (void)hipEventDestroy(gpu->staging_copy_end[slot]);
-    }
-    gpu->staging_events_initialized = 0;
-}
-
 static double h3_gpu_now(void);
 
-static int h3_gpu_finish_staging_copy(h3_gpu *gpu, unsigned slot,
+static void h3_gpu_profile_add_weight_read(h3_gpu *gpu, double seconds,
+                                           uint64_t bytes) {
+    (void)pthread_mutex_lock(&gpu->staging_lock);
+    gpu->profile_totals.weight_read_seconds += seconds;
+    gpu->profile_totals.weight_read_bytes += bytes;
+    (void)pthread_mutex_unlock(&gpu->staging_lock);
+}
+
+static void h3_gpu_profile_add_weight_upload(h3_gpu *gpu,
+                                             double wait_seconds,
+                                             double upload_seconds,
+                                             uint64_t bytes) {
+    (void)pthread_mutex_lock(&gpu->staging_lock);
+    gpu->profile_totals.weight_staging_wait_seconds += wait_seconds;
+    gpu->profile_totals.weight_upload_seconds += upload_seconds;
+    gpu->profile_totals.weight_upload_bytes += bytes;
+    (void)pthread_mutex_unlock(&gpu->staging_lock);
+}
+
+static int h3_gpu_finish_staging_copy(h3_gpu *gpu, hipEvent_t copy_start,
+                                      hipEvent_t copy_end,
                                       size_t *pending_bytes, int profile) {
     if (!*pending_bytes) return 1;
     double wait_start = profile ? h3_gpu_now() : 0.0;
-    if (!h3_gpu_check(gpu, hipEventSynchronize(gpu->staging_copy_end[slot]),
+    if (!h3_gpu_check(gpu, hipEventSynchronize(copy_end),
                       "hipEventSynchronize weight upload")) return 0;
     if (profile) {
-        gpu->profile_totals.weight_staging_wait_seconds +=
-            h3_gpu_now() - wait_start;
+        const double wait_seconds = h3_gpu_now() - wait_start;
         float milliseconds = 0.0f;
         if (!h3_gpu_check(
-                gpu, hipEventElapsedTime(&milliseconds,
-                                         gpu->staging_copy_start[slot],
-                                         gpu->staging_copy_end[slot]),
+                gpu, hipEventElapsedTime(&milliseconds, copy_start, copy_end),
                 "hipEventElapsedTime weight upload")) return 0;
-        gpu->profile_totals.weight_upload_seconds +=
-            static_cast<double>(milliseconds) / 1000.0;
-        gpu->profile_totals.weight_upload_bytes +=
-            static_cast<uint64_t>(*pending_bytes);
+        h3_gpu_profile_add_weight_upload(
+            gpu, wait_seconds, static_cast<double>(milliseconds) / 1000.0,
+            static_cast<uint64_t>(*pending_bytes));
     }
     *pending_bytes = 0;
     return 1;
@@ -630,6 +615,29 @@ static int h3_gpu_ensure_sage_workspace(h3_gpu *gpu, size_t bytes) {
     return 1;
 }
 
+static int h3_gpu_ensure_dense_sage_workspace(h3_gpu *gpu, size_t bytes) {
+    if (gpu->dense_sage_workspace_bytes >= bytes) return 1;
+    void *replacement = nullptr;
+    if (!h3_gpu_check(gpu, hipMalloc(&replacement, bytes ? bytes : 1),
+                      "hipMalloc dense Sage workspace")) return 0;
+    if (gpu->dense_sage_workspace) {
+        if (!h3_gpu_check(gpu, hipFree(gpu->dense_sage_workspace),
+                          "hipFree old dense Sage workspace")) {
+            (void)hipFree(replacement);
+            return 0;
+        }
+        gpu->stats.live_bytes -= gpu->dense_sage_workspace_bytes;
+    }
+    gpu->dense_sage_workspace = replacement;
+    gpu->dense_sage_workspace_bytes = bytes;
+    gpu->dense_sage_workspace_prepared = 0;
+    gpu->stats.allocated_bytes += bytes;
+    gpu->stats.live_bytes += bytes;
+    if (gpu->stats.live_bytes > gpu->stats.peak_live_bytes)
+        gpu->stats.peak_live_bytes = gpu->stats.live_bytes;
+    return 1;
+}
+
 static int h3_gpu_ensure_int8_accumulator_workspace(h3_gpu *gpu,
                                                      size_t elements) {
     if (elements > SIZE_MAX / sizeof(int32_t)) {
@@ -715,6 +723,14 @@ static int h3_gpu_same_sage_geometry(
         left->tokens_per_frame == right->tokens_per_frame &&
         left->radius == right->radius && left->chunk == right->chunk &&
         left->anchor_both == right->anchor_both;
+}
+
+static int h3_gpu_same_dense_sage_geometry(
+        const h3_sage_dense_geometry *left,
+        const h3_sage_dense_geometry *right) {
+    return left->sequence == right->sequence &&
+        left->heads == right->heads &&
+        left->head_dim == right->head_dim;
 }
 
 static int h3_gpu_valid_range(const h3_gpu_tensor *tensor,
@@ -807,12 +823,23 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
         void *staging_pair[2] = {
             staging, h3_gpu_acquire_staging(gpu, chunk_capacity)
         };
+        hipEvent_t copy_start[2] = {nullptr, nullptr};
+        hipEvent_t copy_end[2] = {nullptr, nullptr};
         size_t pending_bytes[2] = {0, 0};
-        int ok = staging_pair[1] && h3_gpu_init_staging_events(gpu);
+        int ok = staging_pair[1] != nullptr;
+        for (unsigned event_slot = 0; ok && event_slot < 2; event_slot++) {
+            ok = h3_gpu_check(
+                     gpu, hipEventCreate(&copy_start[event_slot]),
+                     "hipEventCreate staging start") &&
+                 h3_gpu_check(
+                     gpu, hipEventCreate(&copy_end[event_slot]),
+                     "hipEventCreate staging end");
+        }
         unsigned slot = 0;
         while (ok && completed < bytes) {
             ok = h3_gpu_finish_staging_copy(
-                gpu, slot, &pending_bytes[slot], profile);
+                gpu, copy_start[slot], copy_end[slot],
+                &pending_bytes[slot], profile);
             if (!ok) break;
             size_t request = bytes - completed;
             if (request > chunk_capacity) request = chunk_capacity;
@@ -823,10 +850,9 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                             static_cast<off_t>(file_offset + completed));
             } while (got < 0 && errno == EINTR);
             if (profile && got > 0) {
-                gpu->profile_totals.weight_read_seconds +=
-                    h3_gpu_now() - read_start;
-                gpu->profile_totals.weight_read_bytes +=
-                    static_cast<uint64_t>(got);
+                h3_gpu_profile_add_weight_read(
+                    gpu, h3_gpu_now() - read_start,
+                    static_cast<uint64_t>(got));
             }
             if (got <= 0) {
                 if (error && error_size)
@@ -840,8 +866,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                 static_cast<unsigned char *>(tensor->data) +
                 destination_bytes + completed;
             ok = h3_gpu_check(
-                     gpu, hipEventRecord(gpu->staging_copy_start[slot],
-                                         gpu->stream),
+                     gpu, hipEventRecord(copy_start[slot], gpu->stream),
                      "hipEventRecord weight upload start") &&
                  h3_gpu_check(
                      gpu, hipMemcpyAsync(destination, staging_pair[slot],
@@ -849,8 +874,7 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                                          hipMemcpyHostToDevice, gpu->stream),
                      "hipMemcpyAsync file-to-device") &&
                  h3_gpu_check(
-                     gpu, hipEventRecord(gpu->staging_copy_end[slot],
-                                         gpu->stream),
+                     gpu, hipEventRecord(copy_end[slot], gpu->stream),
                      "hipEventRecord weight upload end");
             if (!ok) break;
             pending_bytes[slot] = static_cast<size_t>(got);
@@ -859,8 +883,15 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
         }
         for (unsigned finish = 0; finish < 2; finish++)
             if (!h3_gpu_finish_staging_copy(
-                    gpu, finish, &pending_bytes[finish], profile)) ok = 0;
+                    gpu, copy_start[finish], copy_end[finish],
+                    &pending_bytes[finish], profile)) ok = 0;
         if (!ok) (void)hipStreamSynchronize(gpu->stream);
+        for (unsigned event_slot = 0; event_slot < 2; event_slot++) {
+            if (copy_start[event_slot])
+                (void)hipEventDestroy(copy_start[event_slot]);
+            if (copy_end[event_slot])
+                (void)hipEventDestroy(copy_end[event_slot]);
+        }
         h3_gpu_release_staging(gpu, staging_pair[1]);
         h3_gpu_release_staging(gpu, staging_pair[0]);
         close(descriptor);
@@ -878,10 +909,9 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
                         static_cast<off_t>(file_offset + completed));
         } while (got < 0 && errno == EINTR);
         if (profile && got > 0) {
-            gpu->profile_totals.weight_read_seconds +=
-                h3_gpu_now() - read_start;
-            gpu->profile_totals.weight_read_bytes +=
-                static_cast<uint64_t>(got);
+            h3_gpu_profile_add_weight_read(
+                gpu, h3_gpu_now() - read_start,
+                static_cast<uint64_t>(got));
         }
         if (got <= 0) {
             if (error && error_size) {
@@ -918,12 +948,10 @@ static int h3_gpu_read_file(h3_gpu_tensor *tensor, const char *path,
             return 0;
         }
         if (profile) {
-            gpu->profile_totals.weight_staging_wait_seconds +=
-                h3_gpu_now() - wait_start;
-            gpu->profile_totals.weight_upload_seconds +=
-                h3_gpu_now() - upload_start;
-            gpu->profile_totals.weight_upload_bytes +=
-                static_cast<uint64_t>(got);
+            h3_gpu_profile_add_weight_upload(
+                gpu, h3_gpu_now() - wait_start,
+                h3_gpu_now() - upload_start,
+                static_cast<uint64_t>(got));
         }
         completed += static_cast<size_t>(got);
     }
@@ -3105,6 +3133,43 @@ static int h3_gpu_sdpa_bf16_d128_rocblas(
     return 1;
 }
 
+static int h3_gpu_sdpa_bf16_d128_sage(
+        h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *query,
+        const h3_gpu_tensor *key, const h3_gpu_tensor *value,
+        uint32_t sequence, uint32_t heads, float scale) {
+    const h3_sage_dense_geometry geometry = {sequence, heads, 128};
+    size_t workspace_bytes = 0;
+    if (!h3_gpu_check(gpu, hipSetDevice(gpu->device),
+                      "select HIP device for dense SageAttention") ||
+        !h3_gpu_check(gpu,
+                      h3_sage_dense_workspace_size(
+                          &geometry, &workspace_bytes),
+                      "dense SageAttention workspace query") ||
+        !h3_gpu_ensure_dense_sage_workspace(gpu, workspace_bytes))
+        return 0;
+    if (!gpu->dense_sage_workspace_prepared ||
+        !h3_gpu_same_dense_sage_geometry(
+            &gpu->dense_sage_geometry, &geometry)) {
+        if (!h3_gpu_check(gpu,
+                          h3_sage_dense_prepare(
+                              &geometry, gpu->dense_sage_workspace,
+                              gpu->dense_sage_workspace_bytes, gpu->stream),
+                          "prepare dense SageAttention workspace"))
+            return 0;
+        gpu->dense_sage_geometry = geometry;
+        gpu->dense_sage_workspace_prepared = 1;
+    }
+    const h3_sage_dense_params params = {
+        query->data, key->data, value->data, output->data, geometry, scale,
+        gpu->dense_sage_workspace, gpu->dense_sage_workspace_bytes,
+        gpu->stream};
+    if (!h3_gpu_check(gpu, h3_sage_dense_launch_prepared(&params),
+                      "launch dense SageAttention-AMD E33"))
+        return 0;
+    gpu->stats.direct_dispatches++;
+    return 1;
+}
+
 /* QK and PV are rocBLAS BF16 GEMMs below.  This kernel preserves the two
  * materialization boundaries between them: BF16 scaling and F32 softmax
  * followed by BF16 probabilities, exactly as Transformers eager specifies. */
@@ -3456,20 +3521,24 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
         !h3_gpu_require_tensor(gpu, value, elements, dtype, "SDPA value") ||
         !h3_gpu_require_tensor(gpu, output, elements, dtype, "SDPA output"))
         return 0;
-    size_t shared_bytes = (static_cast<size_t>(sequence) + H3_HIP_THREADS) *
-                          sizeof(float);
-    int max_shared = 0;
-    if (!h3_gpu_check(gpu,
-                      hipDeviceGetAttribute(&max_shared,
-                          hipDeviceAttributeMaxSharedMemoryPerBlock,
-                          gpu->device),
-                      "hipDeviceGetAttribute shared memory") ||
-        shared_bytes > static_cast<size_t>(max_shared)) {
-        h3_gpu_set_error(gpu,
-                         "SDPA sequence %u needs %zu shared bytes; device has %d",
-                         sequence, shared_bytes, max_shared);
-        return 0;
-    }
+    const auto require_shared_memory =
+        [gpu, sequence](size_t bytes) -> int {
+            int max_shared = 0;
+            if (!h3_gpu_check(
+                    gpu,
+                    hipDeviceGetAttribute(
+                        &max_shared,
+                        hipDeviceAttributeMaxSharedMemoryPerBlock,
+                        gpu->device),
+                    "hipDeviceGetAttribute shared memory"))
+                return 0;
+            if (bytes <= static_cast<size_t>(max_shared)) return 1;
+            h3_gpu_set_error(
+                gpu,
+                "SDPA sequence %u needs %zu shared bytes; device has %d",
+                sequence, bytes, max_shared);
+            return 0;
+        };
     h3_gpu_profile_scope profile(gpu, H3_HIP_PROFILE_SDPA);
     dim3 grid(sequence, batch * heads);
     const char *wave_value = std::getenv("H3_F32_SDPA_WAVE32");
@@ -3499,14 +3568,77 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
     const char *bf16_scalar_value = std::getenv("H3_BF16_SDPA_SCALAR");
     int bf16_scalar = bf16_scalar_value && *bf16_scalar_value &&
                       std::strcmp(bf16_scalar_value, "0");
+    const char *bf16_mode_value = std::getenv("H3_BF16_SDPA");
+    int bf16_mode_set = dtype == H3_GPU_BF16 && bf16_mode_value &&
+                        *bf16_mode_value;
+    int use_bf16_sage = 0;
+    int force_bf16_tiled = 0;
+    if (bf16_mode_set &&
+        ((bf16_matrix_value && *bf16_matrix_value) ||
+         (bf16_scalar_value && *bf16_scalar_value))) {
+        h3_gpu_set_error(
+            gpu, "H3_BF16_SDPA conflicts with legacy BF16 SDPA controls");
+        return 0;
+    }
+    if (bf16_mode_set) {
+        bf16_matrix_forced = 0;
+        bf16_matrix_disabled = 0;
+        bf16_scalar = 0;
+        if (!std::strcmp(bf16_mode_value, "auto")) {
+            /* Sage remains explicit until the complete model/media gates pass. */
+        } else if (!std::strcmp(bf16_mode_value, "sage-e33")) {
+            use_bf16_sage = 1;
+        } else if (!std::strcmp(bf16_mode_value, "rocblas")) {
+            bf16_matrix_forced = 1;
+        } else if (!std::strcmp(bf16_mode_value, "tiled")) {
+            bf16_matrix_disabled = 1;
+            force_bf16_tiled = 1;
+        } else if (!std::strcmp(bf16_mode_value, "scalar")) {
+            bf16_matrix_disabled = 1;
+            bf16_scalar = 1;
+        } else {
+            h3_gpu_set_error(
+                gpu,
+                "invalid H3_BF16_SDPA '%s'; use auto, sage-e33, rocblas, "
+                "tiled, or scalar",
+                bf16_mode_value);
+            return 0;
+        }
+    }
     if (bf16_matrix_forced &&
         std::strncmp(gpu->gcn_arch_name, "gfx1201", 7)) {
         h3_gpu_set_error(gpu,
             "H3_BF16_SDPA_ROCBLAS is only validated on gfx1201");
         return 0;
     }
+    const int bf16_sage_domain = dtype == H3_GPU_BF16 && head_dim == 128 &&
+        batch == 1 && !causal && gpu->warp_size == 32 &&
+        !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
+    if (use_bf16_sage && !bf16_sage_domain) {
+        h3_gpu_set_error(
+            gpu,
+            "H3_BF16_SDPA=sage-e33 requires gfx1201 wave32 batch1 BF16 "
+            "D=128 non-causal self-attention");
+        return 0;
+    }
+    if (bf16_mode_set && !std::strcmp(bf16_mode_value, "rocblas") &&
+        !(dtype == H3_GPU_BF16 && head_dim == 128 && batch == 1 &&
+          !causal)) {
+        h3_gpu_set_error(gpu,
+                         "H3_BF16_SDPA=rocblas requires BF16 D=128 "
+                         "batch1 non-causal attention");
+        return 0;
+    }
+    if (force_bf16_tiled &&
+        !(dtype == H3_GPU_BF16 && head_dim == 128 && batch == 1 &&
+          !causal && gpu->warp_size == 32)) {
+        h3_gpu_set_error(gpu,
+                         "H3_BF16_SDPA=tiled requires BF16 D=128 "
+                         "batch1 wave32 non-causal attention");
+        return 0;
+    }
     int use_bf16_matrix = head_dim == 128 && batch == 1 && !causal &&
-        !bf16_scalar && (bf16_matrix_forced ||
+        !bf16_scalar && !use_bf16_sage && (bf16_matrix_forced ||
                          (bf16_matrix_registered && !bf16_matrix_disabled));
     if (use_f32_d64_wave32) {
         if (split_scores) {
@@ -3537,8 +3669,11 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                 split_inverses, static_cast<float *>(output->data), batch,
                 sequence, heads);
         } else {
+            const size_t f32_wave_shared =
+                static_cast<size_t>(sequence) * sizeof(float);
+            if (!require_shared_memory(f32_wave_shared)) return 0;
             hipLaunchKernelGGL(h3_hip_sdpa_f32_d64_wave32_kernel, grid,
-                dim3(32), static_cast<size_t>(sequence) * sizeof(float),
+                dim3(32), f32_wave_shared,
                 gpu->stream, static_cast<const float *>(query->data),
                 static_cast<const float *>(key->data),
                 static_cast<const float *>(value->data),
@@ -3546,6 +3681,9 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                 scale, causal);
         }
     } else if (dtype == H3_GPU_F32) {
+        const size_t shared_bytes =
+            (static_cast<size_t>(sequence) + H3_HIP_THREADS) * sizeof(float);
+        if (!require_shared_memory(shared_bytes)) return 0;
         hipLaunchKernelGGL(HIP_KERNEL_NAME(h3_hip_sdpa_kernel<float>), grid,
                            dim3(H3_HIP_THREADS), shared_bytes, gpu->stream,
                            static_cast<const float *>(query->data),
@@ -3553,6 +3691,10 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                            static_cast<const float *>(value->data),
                            static_cast<float *>(output->data), batch, sequence,
                            heads, head_dim, scale, causal);
+    } else if (use_bf16_sage) {
+        if (!h3_gpu_sdpa_bf16_d128_sage(
+                gpu, output, query, key, value, sequence, heads, scale))
+            return 0;
     } else if (use_bf16_matrix) {
         if (!h3_gpu_sdpa_bf16_d128_rocblas(
                 gpu, output, query, key, value, sequence, heads, scale))
@@ -3565,6 +3707,7 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                         batch * heads);
         size_t tiled_shared = static_cast<size_t>(tile_rows) * 128 * 2 *
                               sizeof(hip_bfloat16);
+        if (!require_shared_memory(tiled_shared)) return 0;
         hipLaunchKernelGGL(h3_hip_sdpa_bf16_d128_tiled_kernel, tiled_grid,
                            dim3(256), tiled_shared, gpu->stream,
                            static_cast<const hip_bfloat16 *>(query->data),
@@ -3573,6 +3716,9 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                            static_cast<hip_bfloat16 *>(output->data), batch,
                            sequence, heads, scale);
     } else {
+        const size_t shared_bytes =
+            (static_cast<size_t>(sequence) + H3_HIP_THREADS) * sizeof(float);
+        if (!require_shared_memory(shared_bytes)) return 0;
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(h3_hip_sdpa_kernel<hip_bfloat16>), grid,
             dim3(H3_HIP_THREADS), shared_bytes, gpu->stream,
@@ -3724,12 +3870,12 @@ extern "C" void h3_gpu_free(h3_gpu *gpu) {
     h3_gpu_profile_emit_load(gpu);
     h3_gpu_profile_emit_linear_shapes(gpu);
     h3_gpu_profile_destroy_events(gpu);
-    h3_gpu_destroy_staging_events(gpu);
     h3_gpu_purge_staging(gpu);
     (void)hipFree(gpu->f32_sdpa_split_workspace);
     (void)hipFree(gpu->bf16_sdpa_score_workspace);
     (void)hipFree(gpu->int8_accumulator_workspace);
     (void)hipFree(gpu->sage_workspace);
+    (void)hipFree(gpu->dense_sage_workspace);
     (void)rocblas_destroy_handle(gpu->blas);
     (void)hipStreamDestroy(gpu->stream);
     if (gpu->staging_lock_initialized)
