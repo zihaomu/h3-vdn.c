@@ -145,6 +145,17 @@ static void test_dit_reuse_schedule(void) {
     CHECK(h3_dit_reuse_schedule(20, 3, selected, 19) == -1);
 }
 
+static void test_dit_auto_resident_blocks(void) {
+    const uint64_t gib = UINT64_C(1024) * 1024 * 1024;
+    CHECK(h3_dit_auto_resident_blocks(0, 50) == 0);
+    CHECK(h3_dit_auto_resident_blocks(8 * gib, 50) == 0);
+    CHECK(h3_dit_auto_resident_blocks(16 * gib, 50) == 11);
+    CHECK(h3_dit_auto_resident_blocks(24 * gib, 50) == 23);
+    CHECK(h3_dit_auto_resident_blocks(32 * gib, 50) == 32);
+    CHECK(h3_dit_auto_resident_blocks(UINT64_MAX, 20) == 19);
+    CHECK(h3_dit_auto_resident_blocks(32 * gib, 1) == 0);
+}
+
 static void check_segments(const h3_layout *layout,
                            const size_t (*bounds)[2],
                            const h3_segment_kind *kinds, size_t count) {
@@ -410,6 +421,7 @@ int main(void) {
     test_temporal_and_canvas();
     test_schedule();
     test_dit_reuse_schedule();
+    test_dit_auto_resident_blocks();
     test_layout_tiny();
     test_layout_fl2va();
     test_layout_ref2va();

@@ -69,6 +69,18 @@ static int run_path(h3_gpu *gpu, h3_gpu_tensor *output,
                seconds) && h3_gpu_tensor_read_f32(output, result, elements);
 }
 
+static int run_auto_path(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *query,
+                         const h3_gpu_tensor *key,
+                         const h3_gpu_tensor *value, uint32_t sequence,
+                         uint32_t heads, uint32_t iterations,
+                         double *seconds, float *result, size_t elements) {
+    unsetenv("H3_F32_SDPA_WAVE32");
+    unsetenv("H3_F32_SDPA_SPLIT_SCORES");
+    return run(gpu, output, query, key, value, sequence, heads, iterations,
+               seconds) && h3_gpu_tensor_read_f32(output, result, elements);
+}
+
 int main(int argc, char **argv) {
     uint32_t sequence = 2273;
     uint32_t heads = 32;
@@ -93,9 +105,10 @@ int main(int argc, char **argv) {
     float *scalar = malloc(elements * sizeof(*scalar));
     float *wave = malloc(elements * sizeof(*wave));
     float *split = malloc(elements * sizeof(*split));
-    if (!input || !scalar || !wave || !split) {
+    float *automatic = malloc(elements * sizeof(*automatic));
+    if (!input || !scalar || !wave || !split || !automatic) {
         fprintf(stderr, "out of host memory for F32 SDPA benchmark\n");
-        free(split); free(wave); free(scalar); free(input);
+        free(automatic); free(split); free(wave); free(scalar); free(input);
         return 1;
     }
     for (size_t index = 0; index < elements; index++) {
@@ -114,7 +127,7 @@ int main(int argc, char **argv) {
         output = h3_gpu_tensor_new_f32(gpu, elements);
         ok = query && key && value && output;
     }
-    double scalar_seconds = 0.0, wave_seconds = 0.0;
+    double scalar_seconds = 0.0, wave_seconds = 0.0, auto_seconds = 0.0;
     const char *wave_first_value = getenv("H3_SDPA_BENCH_WAVE_FIRST");
     int wave_first = wave_first_value && *wave_first_value &&
                      strcmp(wave_first_value, "0");
@@ -138,37 +151,44 @@ int main(int argc, char **argv) {
     if (ok && !split_first)
         ok = run_path(gpu, output, query, key, value, sequence, heads,
                       iterations, 1, 1, &split_seconds, split, elements);
-    size_t mismatches = 0, split_mismatches = 0;
+    if (ok)
+        ok = run_auto_path(gpu, output, query, key, value, sequence, heads,
+                           iterations, &auto_seconds, automatic, elements);
+    size_t mismatches = 0, split_mismatches = 0, auto_mismatches = 0;
     float max_abs = 0.0f;
     double squared_error = 0.0;
     if (ok) for (size_t index = 0; index < elements; index++) {
         if (memcmp(&scalar[index], &wave[index], sizeof(float))) mismatches++;
         if (memcmp(&scalar[index], &split[index], sizeof(float)))
             split_mismatches++;
+        if (memcmp(&wave[index], &automatic[index], sizeof(float)))
+            auto_mismatches++;
         float difference = fabsf(scalar[index] - wave[index]);
         if (difference > max_abs) max_abs = difference;
         squared_error += (double)difference * difference;
     }
     if (ok) {
         printf("F32 D64 SDPA: sequence=%u heads=%u iterations=%u "
-               "scalar=%.6fs wave32=%.6fs split_scores=%.6fs "
+               "scalar=%.6fs wave32=%.6fs split_scores=%.6fs auto=%.6fs "
                "wave_speedup=%.3fx split_vs_wave=%.3fx mismatches=%zu "
-               "split_mismatches=%zu "
+               "split_mismatches=%zu auto_mismatches=%zu "
                "max_abs=%.9g rmse=%.9g scalar_hash=%016llx "
-               "wave_hash=%016llx split_hash=%016llx\n",
+               "wave_hash=%016llx split_hash=%016llx auto_hash=%016llx\n",
                sequence, heads, iterations,
                scalar_seconds / iterations, wave_seconds / iterations,
-               split_seconds / iterations,
+               split_seconds / iterations, auto_seconds / iterations,
                wave_seconds > 0.0 ? scalar_seconds / wave_seconds : 0.0,
                split_seconds > 0.0 ? wave_seconds / split_seconds : 0.0,
-               mismatches, split_mismatches, max_abs,
+               mismatches, split_mismatches, auto_mismatches, max_abs,
                sqrt(squared_error / (double)elements),
                (unsigned long long)hash_bytes(
                    scalar, elements * sizeof(*scalar)),
                (unsigned long long)hash_bytes(wave, elements * sizeof(*wave)),
                (unsigned long long)hash_bytes(
-                   split, elements * sizeof(*split)));
-        if (mismatches || split_mismatches) ok = 0;
+                   split, elements * sizeof(*split)),
+               (unsigned long long)hash_bytes(
+                   automatic, elements * sizeof(*automatic)));
+        if (mismatches || split_mismatches || auto_mismatches) ok = 0;
     } else {
         fprintf(stderr, "F32 SDPA benchmark failed: %s\n",
                 error[0] ? error : h3_gpu_error(gpu));
@@ -180,6 +200,6 @@ int main(int argc, char **argv) {
     h3_gpu_tensor_free(key);
     h3_gpu_tensor_free(query);
     h3_gpu_free(gpu);
-    free(split); free(wave); free(scalar); free(input);
+    free(automatic); free(split); free(wave); free(scalar); free(input);
     return ok ? 0 : 1;
 }

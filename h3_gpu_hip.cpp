@@ -3554,7 +3554,8 @@ static int h3_gpu_sdpa(h3_gpu *gpu, h3_gpu_tensor *output,
                          !std::strcmp(split_value, "0");
     int split_forced = split_value && *split_value &&
                        std::strcmp(split_value, "0");
-    int registered_split_shape = batch == 1 && sequence == 2273 &&
+    int registered_split_shape = batch == 1 &&
+        (sequence == 1797 || sequence == 2273) &&
         heads == 32 && !std::strncmp(gpu->gcn_arch_name, "gfx1201", 7);
     int split_scores = use_f32_d64_wave32 && !split_disabled &&
                        (registered_split_shape || split_forced);

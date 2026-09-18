@@ -33,6 +33,29 @@ ordering.
 | SageAttention-AMD for original H3 | Generic dense E33 bridge passes the official 50-block/2-NFE oracle and three complete deterministic 640×384 runs; explicit opt-in is faster, but it remains non-default because frozen-render SSIM/PSNR failed |
 | Original native E2E | 640×384, 124 frames, 50 NFE, dual VAE and H.264/AAC mux complete; 124/124 frame hashes are unique and visual inspection confirms that the former full-frame checkerboard artifact is gone |
 
+The latest exact-only integration adds the original H3 Video VAE production
+shape `batch=1, sequence=1797, heads=32, D=64, F32` to the gfx1201 split-score
+SDPA auto route. Three independent 640×384, 124-frame, 50-NFE E2E sessions
+completed in `715/715/714 s`; all 124 raw frames, decoded F32 PCM, and final
+MP4 remained byte-identical to the frozen wave32 run. Median Video VAE SDPA
+fell from `89.713` to `48.756 s` (`1.840×`), Video VAE wall fell from
+`241.430` to `202.421 s`, and complete E2E fell by `6.02%`. S1797/H31 and
+S509/H3 retain the wave32 fallback, and `H3_F32_SDPA_SPLIT_SCORES=0` restores
+the prior path for diagnosis. SSD-stream profiling now also reports block
+reads, source ranges, 8 MiB pread requests, resident blocks, and stream slots
+through both the profile log and `h3_dit_get_stream_stats()`.
+
+For SSD-streamed original H3, `H3_DIT_RESIDENT_BLOCKS=auto` now applies a
+capacity-gated policy instead of assuming every GPU can hold the validated
+32-block configuration. It queries free VRAM after device setup, reserves
+6 GiB plus two complete streaming slots, never makes every active block
+resident, and caps admission at 32. Unset, empty, and `0` preserve the prior
+streaming behavior; a numeric value remains an explicit override. Three full
+resident-32 runs completed in `672/663/661 s` with byte-identical frames, PCM,
+and MP4 and a `29138 MiB` telemetry peak. Their median was `7.27%` faster than
+resident 20 and `12.86%` faster than the frozen `760.826 s` wave32 run; a
+same-card pair reproduced the gain (`721 -> 661 s`).
+
 The native modern-checkpoint bring-up found two independent layout issues. The
 Diffusers Transformer stores each block as three contiguous Q/K/V tensors,
 whereas the legacy fused tensor is grouped per head. The converted Video VAE
@@ -77,7 +100,7 @@ pose drifted over 50 denoising passes. Use it only as an explicit research
 backend:
 
 ```sh
-H3_BF16_SDPA=sage-e33 H3_DIT_RESIDENT_BLOCKS=20 ./h3 ...
+H3_BF16_SDPA=sage-e33 H3_DIT_RESIDENT_BLOCKS=auto ./h3 ...
 ```
 
 `H3_BF16_SDPA=auto` and an unset mode continue to select the validated rocBLAS
@@ -96,9 +119,12 @@ inspection passed. BF16/D128 full attention selects the matrix path by default
 only on the validated `gfx1201` domain. Prefer the canonical
 `H3_BF16_SDPA=rocblas|tiled|scalar|sage-e33|auto` switch; the legacy
 `H3_BF16_SDPA_ROCBLAS=0` and `H3_BF16_SDPA_SCALAR=1` controls remain compatible
-when the canonical switch is unset. `H3_DIT_RESIDENT_BLOCKS=20` is opt-in
-because it raises peak GPU allocation to about `18.1 GiB`; it reduced stream
-traffic from `36.606` to `22.251 GiB/NFE` on the tested 31.9 GiB card.
+when the canonical switch is unset. `H3_DIT_RESIDENT_BLOCKS=auto` is the
+capacity-aware opt-in for SSD streaming; numeric values such as `20` or `32`
+remain available for controlled experiments. On the tested 31.9 GiB card,
+resident 20 raised peak GPU allocation to about `18.1 GiB` and reduced stream
+traffic from `36.606` to `22.251 GiB/NFE`; validated resident 32 reached a
+`29138 MiB` telemetry peak and cut total stream traffic by another `39.97%`.
 
 Native correctness and the measured performance gain are established for this
 gate, but this is not yet a stable-release claim or validation at the model's

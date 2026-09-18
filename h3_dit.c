@@ -151,6 +151,9 @@ struct h3_dit {
     unsigned stream_ready_layer;
     unsigned stream_ready_slot;
     uint64_t stream_bytes;
+    uint64_t stream_block_reads;
+    uint64_t stream_source_ranges;
+    uint64_t stream_pread_requests;
     double stream_read_seconds;
     double stream_wait_seconds;
     h3_gpu_tensor *final_norm;
@@ -777,6 +780,8 @@ typedef struct {
     unsigned slot;
     int ok;
     uint64_t bytes;
+    uint64_t source_ranges;
+    uint64_t pread_requests;
     double seconds;
     char error[512];
 } h3_dit_stream_job;
@@ -787,6 +792,8 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     double started = stream_now();
     job->ok = 1;
     job->bytes = 0;
+    job->source_ranges = 0;
+    job->pread_requests = 0;
     job->error[0] = '\0';
     for (unsigned index = 0; index < layer->count; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
@@ -802,6 +809,12 @@ static int read_stream_layer(h3_dit_stream_job *job) {
             break;
         }
         job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        job->source_ranges++;
+        uint64_t source_bytes =
+            (uint64_t)source->elements * sizeof(uint16_t);
+        job->pread_requests +=
+            (source_bytes + UINT64_C(8) * 1024 * 1024 - 1) /
+            (UINT64_C(8) * 1024 * 1024);
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -1347,6 +1360,32 @@ static unsigned next_streamed_block(const h3_dit *dit, unsigned current) {
     return H3_DIT_BLOCKS;
 }
 
+#define H3_DIT_AUTO_RESIDENT_RESERVE_BYTES \
+    (UINT64_C(6) * 1024 * 1024 * 1024)
+
+enum { H3_DIT_AUTO_RESIDENT_MAX = 32 };
+
+static uint64_t resident_block_bytes(void) {
+    uint64_t elements = (uint64_t)INNER * 3 * HIDDEN +
+        (uint64_t)HIDDEN * INNER + (uint64_t)FFN * 2 * HIDDEN +
+        (uint64_t)HIDDEN * FFN;
+    return elements * sizeof(uint16_t);
+}
+
+unsigned h3_dit_auto_resident_blocks(uint64_t free_bytes,
+                                     unsigned active_blocks) {
+    if (active_blocks < 2) return 0;
+    uint64_t block_bytes = resident_block_bytes();
+    uint64_t fixed_bytes = H3_DIT_AUTO_RESIDENT_RESERVE_BYTES +
+        UINT64_C(2) * block_bytes;
+    if (free_bytes <= fixed_bytes) return 0;
+    uint64_t admitted = (free_bytes - fixed_bytes) / block_bytes;
+    if (admitted > H3_DIT_AUTO_RESIDENT_MAX)
+        admitted = H3_DIT_AUTO_RESIDENT_MAX;
+    if (admitted >= active_blocks) admitted = active_blocks - 1;
+    return (unsigned)admitted;
+}
+
 static int should_capture_block(unsigned block) {
     return getenv("H3_DIT_CAPTURE_BLOCKS") ||
            (block == 0 && getenv("H3_DIT_CAPTURE_BLOCK0"));
@@ -1374,14 +1413,38 @@ static int configure_resident_blocks(h3_dit *dit, char *error,
     if (!dit->ssd_streaming) return 1;
     const char *value = getenv("H3_DIT_RESIDENT_BLOCKS");
     if (!value || !*value || !strcmp(value, "0")) return 1;
-    char *end = NULL;
-    errno = 0;
-    unsigned long requested = strtoul(value, &end, 10);
-    if (errno || !end || *end || requested >= dit->active_block_count) {
-        fail(error, error_size,
-             "H3_DIT_RESIDENT_BLOCKS must be between 0 and %u for this run",
-             dit->active_block_count - 1);
-        return 0;
+    unsigned long requested = 0;
+    if (!strcmp(value, "auto")) {
+        uint64_t free_bytes = 0;
+        uint64_t total_bytes = 0;
+        if (!h3_gpu_get_memory_info(dit->gpu, &free_bytes, &total_bytes)) {
+            fail(error, error_size,
+                 "cannot query device memory for H3_DIT_RESIDENT_BLOCKS=auto");
+            return 0;
+        }
+        requested = h3_dit_auto_resident_blocks(
+            free_bytes, dit->active_block_count);
+        if (getenv("H3_PROFILE")) {
+            fprintf(stderr,
+                    "h3: auto DiT resident blocks=%lu free=%.3f GiB "
+                    "total=%.3f GiB reserve=6.000 GiB cap=%u\n",
+                    requested,
+                    (double)free_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
+                    H3_DIT_AUTO_RESIDENT_MAX);
+        }
+    } else {
+        char *end = NULL;
+        errno = 0;
+        requested = strtoul(value, &end, 10);
+        if (errno || !end || *end ||
+            requested >= dit->active_block_count) {
+            fail(error, error_size,
+                 "H3_DIT_RESIDENT_BLOCKS must be auto or between 0 and %u "
+                 "for this run",
+                 dit->active_block_count - 1);
+            return 0;
+        }
     }
     for (unsigned block = 0; block < H3_DIT_BLOCKS &&
          dit->resident_block_count < requested; block++) {
@@ -1485,6 +1548,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->stream_ready_layer = first;
         dit->stream_ready_slot = 0;
         dit->stream_bytes += job.bytes;
+        dit->stream_block_reads++;
+        dit->stream_source_ranges += job.source_ranges;
+        dit->stream_pread_requests += job.pread_requests;
         dit->stream_read_seconds += job.seconds;
     }
     dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
@@ -2495,6 +2561,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                     return 0;
                 }
                 dit->stream_bytes += stream_job.bytes;
+                dit->stream_block_reads++;
+                dit->stream_source_ranges += stream_job.source_ranges;
+                dit->stream_pread_requests += stream_job.pread_requests;
                 dit->stream_read_seconds += stream_job.seconds;
                 if (!stream_job.ok) {
                     fail(error, error_size,
@@ -3226,6 +3295,22 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 
+int h3_dit_get_stream_stats(const h3_dit *dit,
+                            h3_dit_stream_stats *stats) {
+    if (!dit || !stats) return 0;
+    *stats = (h3_dit_stream_stats){
+        .bytes = dit->stream_bytes,
+        .block_reads = dit->stream_block_reads,
+        .source_ranges = dit->stream_source_ranges,
+        .pread_requests = dit->stream_pread_requests,
+        .read_seconds = dit->stream_read_seconds,
+        .wait_seconds = dit->stream_wait_seconds,
+        .resident_blocks = dit->resident_block_count,
+        .stream_slots = dit->ssd_streaming ? 2u : 0u
+    };
+    return 1;
+}
+
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
     int steps = h3_dit_schedule_steps(dit->schedule);
@@ -3283,20 +3368,23 @@ void h3_dit_free(h3_dit *dit) {
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
-        size_t resident_elements_per_block =
-            (size_t)INNER * 3 * HIDDEN + (size_t)HIDDEN * INNER +
-            (size_t)FFN * 2 * HIDDEN + (size_t)HIDDEN * FFN;
         double resident_gib = (double)dit->resident_block_count *
-            (double)resident_elements_per_block * sizeof(uint16_t) /
+            (double)resident_block_bytes() /
             (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
                 "h3: BF16 SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
-                "unhidden wait %.3fs; resident blocks=%u (%.3f GiB)\n",
+                "unhidden wait %.3fs; resident blocks=%u (%.3f GiB); "
+                "block reads=%llu source ranges=%llu pread requests=%llu "
+                "stream slots=%u\n",
                 gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds, dit->resident_block_count,
-                resident_gib);
+                resident_gib,
+                (unsigned long long)dit->stream_block_reads,
+                (unsigned long long)dit->stream_source_ranges,
+                (unsigned long long)dit->stream_pread_requests,
+                dit->ssd_streaming ? 2u : 0u);
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);

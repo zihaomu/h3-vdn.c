@@ -19,6 +19,7 @@ command=("$@")
 physical_gpu=${H3_PHYSICAL_GPU:-4}
 sample_interval=${H3_TELEMETRY_INTERVAL:-1}
 telemetry_disabled=${H3_TELEMETRY_DISABLE:-0}
+contention_min_vram_bytes=${H3_CONTENTION_MIN_VRAM_BYTES:-4194304}
 amd_smi=${AMD_SMI:-/opt/rocm/bin/amd-smi}
 device_probe=${H3_DEVICE_PROBE:-./h3}
 
@@ -32,6 +33,10 @@ if [[ ! $sample_interval =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ $telemetry_disabled != 0 && $telemetry_disabled != 1 ]]; then
     echo "invalid H3_TELEMETRY_DISABLE=$telemetry_disabled; use 0 or 1" >&2
+    exit 2
+fi
+if [[ ! $contention_min_vram_bytes =~ ^[0-9]+$ ]]; then
+    echo "invalid H3_CONTENTION_MIN_VRAM_BYTES=$contention_min_vram_bytes; use a non-negative byte count" >&2
     exit 2
 fi
 if [[ ! -x $amd_smi ]]; then
@@ -115,6 +120,7 @@ export H3_AMD_SMI_GPU=$amd_smi_gpu
     echo "hip_visible_devices=$HIP_VISIBLE_DEVICES"
     echo "sample_interval_seconds=$sample_interval"
     echo "telemetry_enabled=$((1 - telemetry_disabled))"
+    echo "contention_min_vram_bytes=$contention_min_vram_bytes"
     echo "working_directory=$PWD"
     echo "hostname=$(hostname)"
     echo "kernel=$(uname -srmo)"
@@ -146,6 +152,25 @@ stop_sampler() {
     fi
 }
 
+pid_is_in_workload_tree() {
+    local candidate_pid=$1
+    local root_pid=$2
+    local current_pid=$candidate_pid
+    local parent_pid
+    local depth=0
+    while (( depth < 64 )); do
+        [[ $current_pid == "$root_pid" ]] && return 0
+        [[ -r /proc/$current_pid/status ]] || return 1
+        parent_pid=$(awk '$1 == "PPid:" {print $2}' \
+            "/proc/$current_pid/status" 2>/dev/null || true)
+        [[ $parent_pid =~ ^[0-9]+$ && $parent_pid != 0 &&
+           $parent_pid != "$current_pid" ]] || return 1
+        current_pid=$parent_pid
+        ((depth += 1))
+    done
+    return 1
+}
+
 cleanup() {
     stop_sampler "$gpu_sampler_pid"
     stop_sampler "$disk_sampler_pid"
@@ -173,7 +198,7 @@ echo "workload_pid=$workload_pid" >>"$output_directory/run.meta"
     while kill -0 "$workload_pid" 2>/dev/null; do
         for process_directory in /proc/[0-9]*; do
             process_pid=${process_directory##*/}
-            [[ $process_pid == "$workload_pid" ]] && continue
+            pid_is_in_workload_tree "$process_pid" "$workload_pid" && continue
             process_executable=$(readlink "$process_directory/exe" 2>/dev/null || true)
             case $process_executable in
                 "$PWD/h3"|"$PWD"/h3_*)
@@ -189,18 +214,38 @@ echo "workload_pid=$workload_pid" >>"$output_directory/run.meta"
 workspace_guard_pid=$!
 
 # The workspace-wide h3 guard above cannot see unrelated Python/ROCm jobs.
-# Reject any process that begins using the selected physical card after this
-# workload starts. We terminate only our own PID and leave the external job
-# untouched; a contended run is not valid benchmark or correctness evidence.
+# Reject any process that materially allocates on the selected physical card
+# after this workload starts. HIP enumeration and amd-smi can leave tiny
+# contexts on every card, so the recorded byte threshold excludes those while
+# still failing closed on real allocations. We terminate only our own PID and
+# leave the external job untouched; a contended run is not valid evidence.
 (
     while kill -0 "$workload_pid" 2>/dev/null; do
         if process_json=$($amd_smi process --gpu "$amd_smi_gpu" --json 2>/dev/null); then
-            contender=$(jq -r --argjson workload_pid "$workload_pid" '
+            contender=
+            while IFS=$'\t' read -r contender_pid contender_vram contender_name; do
+                [[ -n $contender_pid && -d /proc/$contender_pid ]] || continue
+                pid_is_in_workload_tree "$contender_pid" "$workload_pid" &&
+                    continue
+                contender_command=$(tr '\0' ' ' \
+                    <"/proc/$contender_pid/cmdline" 2>/dev/null || true)
+                # amd-smi is a Python CLI and may briefly report its own tiny
+                # ROCm context in the process snapshot it just collected. It
+                # is telemetry, not a competing workload. The liveness check
+                # above also drops already-exited query helpers.
+                case $contender_command in
+                    *amd-smi*|*amdsmi_cli*) continue ;;
+                esac
+                contender="pid=$contender_pid vram_bytes=$contender_vram name=$contender_name"
+                break
+            done < <(jq -r --argjson workload_pid "$workload_pid" \
+                    --argjson min_vram_bytes "$contention_min_vram_bytes" '
                 .[]?.process_list[]?.process_info |
                 select((.pid | tonumber) != $workload_pid and
-                       ((.memory_usage.vram_mem.value // 0) | tonumber) > 0) |
-                "pid=\(.pid) vram_bytes=\(.memory_usage.vram_mem.value) name=\(.name)"' \
-                <<<"$process_json" | head -n 1)
+                       ((.memory_usage.vram_mem.value // 0) | tonumber) >
+                           $min_vram_bytes) |
+                [.pid, .memory_usage.vram_mem.value, .name] | @tsv' \
+                <<<"$process_json")
             if [[ -n $contender ]]; then
                 echo "detected external target-GPU contention ($contender); terminating guarded PID=$workload_pid"
                 kill -TERM "$workload_pid" 2>/dev/null || true

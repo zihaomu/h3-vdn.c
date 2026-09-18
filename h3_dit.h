@@ -21,7 +21,9 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
  * happen before the persistent core is loaded. SSD streaming retains only the
  * small block norms and two alternating BF16 matrix slots by default.
  * H3_DIT_RESIDENT_BLOCKS=N may additionally retain the first N active blocks
- * when the caller has measured sufficient device-memory headroom. */
+ * when the caller has measured sufficient device-memory headroom. The value
+ * "auto" applies the bounded free-memory admission policy; unset/0 preserves
+ * the streaming-only default. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
@@ -126,7 +128,28 @@ int h3_dit_denoise_euler_preview(
 int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
                           size_t selected_count);
 
+/* Pure capacity policy used by H3_DIT_RESIDENT_BLOCKS=auto. It retains two
+ * stream slots and 6 GiB of runtime headroom, never admits every active block,
+ * and caps the result at the validated 32-block production configuration. */
+unsigned h3_dit_auto_resident_blocks(uint64_t free_bytes,
+                                     unsigned active_blocks);
+
 int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
+
+/* Read-only SSD-stream counters for correctness/performance harnesses. */
+typedef struct {
+    uint64_t bytes;
+    uint64_t block_reads;
+    uint64_t source_ranges;
+    uint64_t pread_requests;
+    double read_seconds;
+    double wait_seconds;
+    unsigned resident_blocks;
+    unsigned stream_slots;
+} h3_dit_stream_stats;
+
+int h3_dit_get_stream_stats(const h3_dit *dit,
+                            h3_dit_stream_stats *stats);
 
 /* Test/diagnostic readback of the text stream after the two token-refiner
  * blocks. This is a synchronization point and is not used by generation. */
