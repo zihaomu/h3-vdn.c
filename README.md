@@ -63,7 +63,12 @@ from a three-session rocBLAS range of `105.888–108.585 ms` to
 `12:41`, `12:52`, and `12:54`; the median `12:52` is `9.12%` below the frozen
 `14:09.46` matrix baseline. All three produced identical raw-frame and MP4
 hashes, and manual review found a coherent fox, motion, snow, and forest with
-no blocks or checkerboard artifacts.
+no blocks or checkerboard artifacts. The first formal render's exact media
+metadata, phase timing, hashes, visual assessment, and failed matrix-parity
+gate are frozen in
+[`doc/H3_SAGE_E33_640X384_EXPERIMENTAL_BASELINE.md`](doc/H3_SAGE_E33_640X384_EXPERIMENTAL_BASELINE.md)
+for comparison with subsequent optimizations; generated media and logs remain
+untracked.
 
 E33 is nevertheless **not the default**. Its full-video SSIM/PSNR against the
 frozen matrix render was `0.378892 / 13.944662 dB`, below the immutable
